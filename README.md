@@ -1,12 +1,13 @@
 <p align="center">
+  <img src="turbito.png" width="200" alt="Turbito — TurboDB mascot">
   <h1 align="center">TurboDB</h1>
   <p align="center">
     <strong>A blazing-fast NoSQL document database. Zig storage core.</strong>
   </p>
   <p align="center">
+    <a href="https://pypi.org/project/turbodatabase/"><img src="https://img.shields.io/pypi/v/turbodatabase?color=3776AB&logo=python&label=PyPI" alt="PyPI"></a>
+    <a href="https://www.npmjs.com/package/turbodatabase"><img src="https://img.shields.io/npm/v/turbodatabase?color=339933&logo=npm&label=npm" alt="npm"></a>
     <img src="https://img.shields.io/badge/zig-0.15-F7A41D?logo=zig" alt="Zig 0.15">
-    <img src="https://img.shields.io/badge/python-3.8+-3776AB?logo=python" alt="Python 3.8+">
-    <img src="https://img.shields.io/badge/node-18+-339933?logo=node.js" alt="Node 18+">
     <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
     <img src="https://img.shields.io/badge/status-alpha-orange" alt="Alpha">
   </p>
@@ -18,6 +19,11 @@ TurboDB is a document database written from scratch in Zig with **mmap + WAL + B
 
 It exposes a **MongoDB-compatible REST API** and ships with **Python** and **Node.js** FFI bindings that call directly into the Zig storage engine (no HTTP overhead).
 
+```bash
+pip install turbodatabase     # Python
+npm install turbodatabase     # Node.js
+```
+
 ## Status
 
 | Feature | Status | Notes |
@@ -28,8 +34,8 @@ It exposes a **MongoDB-compatible REST API** and ships with **Python** and **Nod
 | MVCC version chains | ✅ Working | Zero read locks |
 | mmap storage | ✅ Working | Zero-copy reads, 256 MiB growth |
 | JSON REST API | ✅ Working | MongoDB-inspired routes on :27017 |
-| Python FFI (ctypes) | ✅ Working | Zero-dep, calls libturbodb directly |
-| Node.js FFI (koffi) | ✅ Working | Single dep, calls libturbodb directly |
+| Python FFI (ctypes) | ✅ Working | `pip install turbodatabase` |
+| Node.js FFI (koffi) | ✅ Working | `npm install turbodatabase` |
 | Collection scan | ✅ Working | Limit/offset pagination |
 | Sharding | 🔜 Planned | Consistent hash ring |
 | Replication | 🔜 Planned | WAL-based leader-follower |
@@ -45,7 +51,7 @@ It exposes a **MongoDB-compatible REST API** and ships with **Python** and **Nod
 Single connection, 256B documents, Apple M3, Zig 0.15 (Debug build):
 
 | Operation | TurboDB | MongoDB 8.2 (ref) | Speedup |
-|-----------|---------|-------------------|---------|
+|-----------|---------|-------------------|---------| 
 | **Insert** | 14,379 ops/s | ~18,000 ops/s | 0.8x |
 | **Get** | 15,099 ops/s | ~12,000 ops/s | **1.3x** |
 | **Update** | 18,105 ops/s | ~16,000 ops/s | **1.1x** |
@@ -53,7 +59,7 @@ Single connection, 256B documents, Apple M3, Zig 0.15 (Debug build):
 
 > **Note**: TurboDB is compiled in Debug mode. Release builds are 3-5x faster.
 > MongoDB reference numbers are single-node localhost with default config.
-> Run `python3 bench/bench.py` for a full head-to-head comparison (idealo/mongodb-benchmarking style).
+> Run `python3 bench/bench.py` for a full head-to-head comparison ([idealo/mongodb-benchmarking](https://github.com/idealo/mongodb-benchmarking) style).
 
 ### Why faster reads?
 
@@ -108,6 +114,10 @@ curl http://localhost:27017/health
 
 ### Python (FFI — no HTTP overhead)
 
+```bash
+pip install turbodatabase
+```
+
 ```python
 from turbodb import Database
 
@@ -142,8 +152,12 @@ db.close()
 
 ### Node.js (FFI — no HTTP overhead)
 
+```bash
+npm install turbodatabase
+```
+
 ```javascript
-const { Database } = require('turbodb');
+const { Database } = require('turbodatabase');
 
 const db = new Database('./mydata');
 const users = db.collection('users');
@@ -185,7 +199,7 @@ db.close();
                                    │
                               ┌────▼────┐
                               │  Disk   │
-                              │ .pages  │
+                              │ .tdb    │
                               │ .wal    │
                               └─────────┘
 ```
@@ -216,6 +230,7 @@ db.close();
 turbodb/
 ├── build.zig              # Zig build — exe + shared library
 ├── build.zig.zon          # Package manifest
+├── turbito.png            # Turbito — the TurboDB mascot
 ├── src/
 │   ├── main.zig           # Server entry point
 │   ├── server.zig         # HTTP REST API

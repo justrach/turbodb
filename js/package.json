@@ -1,5 +1,5 @@
 {
-  "name": "turbodb",
+  "name": "turbodatabase",
   "version": "0.1.0",
   "description": "Node.js bindings for TurboDB — a fast NoSQL document database in Zig",
   "main": "index.js",
