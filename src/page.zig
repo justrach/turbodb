@@ -8,10 +8,11 @@ pub const PAGE_USABLE: usize = PAGE_SIZE - PAGE_HEADER_SIZE;
 // ─── PageHeader (32 bytes) ────────────────────────────────────────────────
 
 pub const PageType = enum(u8) {
-    free      = 0,
-    leaf      = 1,  // document storage
-    internal  = 2,  // B-tree internal node
-    overflow  = 3,  // large document continuation
+    free       = 0,
+    leaf       = 1,  // document storage
+    internal   = 2,  // B-tree internal node
+    overflow   = 3,  // large document continuation
+    btree_leaf = 4,  // B-tree leaf node (NOT for document storage)
 };
 
 pub const PageHeader = extern struct {

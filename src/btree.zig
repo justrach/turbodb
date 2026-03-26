@@ -56,7 +56,7 @@ pub const BTree = struct {
     fn searchPage(self: *BTree, pno: u32, key_hash: u64) ?BTreeEntry {
         const ph = self.pf.pageHeader(pno);
         const data = self.pf.pageData(pno);
-        if (@as(page_mod.PageType, @enumFromInt(ph.page_type)) == .leaf) {
+        if (@as(page_mod.PageType, @enumFromInt(ph.page_type)) == .btree_leaf) {
             return searchLeaf(data, key_hash);
         }
         // Internal: find child.
@@ -73,8 +73,8 @@ pub const BTree = struct {
         defer self.mu.unlock();
 
         if (self.root == 0) {
-            // Create first root leaf.
-            self.root = try self.pf.allocPage(.leaf);
+            // Create first root leaf (btree_leaf, NOT document leaf).
+            self.root = try self.pf.allocPage(.btree_leaf);
             leafSetCount(self.pf.pageData(self.root), 0);
         }
 
@@ -92,8 +92,7 @@ pub const BTree = struct {
     fn insertPage(self: *BTree, pno: u32, entry: BTreeEntry) !?SplitResult {
         const ph = self.pf.pageHeader(pno);
         const data = self.pf.pageData(pno);
-
-        if (@as(page_mod.PageType, @enumFromInt(ph.page_type)) == .leaf) {
+        if (@as(page_mod.PageType, @enumFromInt(ph.page_type)) == .btree_leaf) {
             return self.leafInsert(pno, data, entry);
         }
         // Internal node.
@@ -133,7 +132,7 @@ pub const BTree = struct {
             return null;
         }
         // Leaf is full — split.
-        const right_pno = try self.pf.allocPage(.leaf);
+        const right_pno = try self.pf.allocPage(.btree_leaf);
         const rdata = self.pf.pageData(right_pno);
         const mid = n / 2;
         // Copy right half to new leaf.
@@ -184,7 +183,7 @@ pub const BTree = struct {
     fn deletePage(self: *BTree, pno: u32, key_hash: u64) bool {
         const ph = self.pf.pageHeader(pno);
         const data = self.pf.pageData(pno);
-        if (@as(page_mod.PageType, @enumFromInt(ph.page_type)) == .leaf) {
+        if (@as(page_mod.PageType, @enumFromInt(ph.page_type)) == .btree_leaf) {
             return leafDelete(data, key_hash);
         }
         const child_idx = internalFindChildIdx(data, key_hash);
@@ -215,7 +214,6 @@ fn leafEntriesMut(data: []u8, n: usize) []align(1) BTreeEntry {
     const bytes = data[2..][0 .. n * BTreeEntry.size];
     return std.mem.bytesAsSlice(BTreeEntry, bytes);
 }
-
 fn searchLeaf(data: []const u8, key_hash: u64) ?BTreeEntry {
     const n = leafCount(data);
     const entries = leafEntries(data, n);

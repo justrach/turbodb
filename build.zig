@@ -26,6 +26,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // ── Helper: wire storage imports into a module ──────────────────────────
+    const wireStorage = struct {
+        fn f(mod: *std.Build.Module, mmap: *std.Build.Module, wal: *std.Build.Module, epoch: *std.Build.Module, seqlock: *std.Build.Module) void {
+            mod.addImport("mmap", mmap);
+            mod.addImport("wal", wal);
+            mod.addImport("epoch", epoch);
+            mod.addImport("seqlock", seqlock);
+        }
+    }.f;
+
     // ── TurboDB executable ──────────────────────────────────────────────────
     const turbodb_mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -33,16 +43,32 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    turbodb_mod.addImport("mmap", mmap_mod);
-    turbodb_mod.addImport("wal", wal_mod);
-    turbodb_mod.addImport("epoch", epoch_mod);
-    turbodb_mod.addImport("seqlock", seqlock_mod);
+    wireStorage(turbodb_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
 
     const turbodb = b.addExecutable(.{
         .name = "turbodb",
         .root_module = turbodb_mod,
     });
     b.installArtifact(turbodb);
+
+    // ── Shared library (FFI for Python/JS) ──────────────────────────────────
+    const ffi_mod = b.createModule(.{
+        .root_source_file = b.path("src/ffi.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    wireStorage(ffi_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+
+    const lib = b.addLibrary(.{
+        .linkage = .dynamic,
+        .name = "turbodb",
+        .root_module = ffi_mod,
+    });
+    b.installArtifact(lib);
+
+    const lib_step = b.step("lib", "Build libturbodb shared library");
+    lib_step.dependOn(&lib.step);
 
     // ── Run step ────────────────────────────────────────────────────────────
     const run_cmd = b.addRunArtifact(turbodb);
