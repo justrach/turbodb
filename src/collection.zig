@@ -3,6 +3,7 @@ const std = @import("std");
 const doc_mod   = @import("doc.zig");
 const page_mod  = @import("page.zig");
 const btree_mod = @import("btree.zig");
+const trigram   = @import("trigram.zig");
 const wal_mod   = @import("wal");
 const epoch_mod = @import("epoch");
 const Doc = doc_mod.Doc;
@@ -12,6 +13,7 @@ const BTree = btree_mod.BTree;
 const BTreeEntry = btree_mod.BTreeEntry;
 const WAL = wal_mod.WAL;
 const EpochManager = epoch_mod.EpochManager;
+const TrigramIndex = trigram.TrigramIndex;
 
 
 // ─── Collection ──────────────────────────────────────────────────────────
@@ -21,6 +23,7 @@ pub const Collection = struct {
     name_len: u8,
     pf: PageFile,
     idx: BTree,
+    tri: TrigramIndex,
     wal_log: *WAL,
     epochs: *EpochManager,
     next_doc_id: std.atomic.Value(u64),
@@ -42,6 +45,7 @@ pub const Collection = struct {
         col.pf = try PageFile.open(page_path);
 
         col.idx = BTree.init(&col.pf, 0);
+        col.tri = TrigramIndex.init(alloc);
         col.wal_log = wal_log;
         col.epochs = epochs;
         col.next_doc_id = std.atomic.Value(u64).init(1);
@@ -54,8 +58,8 @@ pub const Collection = struct {
 
         return col;
     }
-
     pub fn close(self: *Collection) void {
+        self.tri.deinit();
         self.pf.close();
         self.alloc.destroy(self);
     }
@@ -96,6 +100,9 @@ pub const Collection = struct {
             .page_off = page_off,
         };
         try self.idx.insert(entry);
+
+        // Trigram index for full-text search
+        self.tri.indexDoc(doc_id, value) catch {};
 
         return doc_id;
     }
@@ -168,6 +175,11 @@ pub const Collection = struct {
             .page_off = page_off,
         };
         try self.idx.insert(new_entry); // overwrites old entry in B-tree
+
+        // Update trigram index
+        self.tri.removeDoc(doc_id, old_doc.value);
+        self.tri.indexDoc(doc_id, new_value) catch {};
+
         return true;
     }
 
@@ -193,6 +205,77 @@ pub const Collection = struct {
         }
         self.idx.delete(key_hash);
         return true;
+    }
+
+    // ─── search (trigram-indexed) ─────────────────────────────────────
+
+    pub const TextSearchResult = struct {
+        docs: []Doc,
+        candidates: u64,
+        total_docs: u64,
+        trigrams_used: u32,
+        alloc: std.mem.Allocator,
+        pub fn deinit(self: TextSearchResult) void { self.alloc.free(self.docs); }
+    };
+
+    /// Full-text substring search using the trigram index.
+    /// Returns only documents whose value contains `query` (case-insensitive).
+    pub fn searchText(
+        self: *Collection,
+        query: []const u8,
+        limit: u32,
+        alloc: std.mem.Allocator,
+    ) !TextSearchResult {
+        // Phase 1: trigram index narrows candidates
+        var sr = try self.tri.search(query, alloc);
+        defer sr.deinit(alloc);
+
+        // Phase 2: verify candidates by loading docs and checking substring
+        var results: std.ArrayList(Doc) = .empty;
+        errdefer results.deinit(alloc);
+
+        // Lowercase query for comparison
+        var q_lower_buf: [1024]u8 = undefined;
+        const q_len = @min(query.len, q_lower_buf.len);
+        for (0..q_len) |i| {
+            q_lower_buf[i] = if (query[i] >= 'A' and query[i] <= 'Z') query[i] + 32 else query[i];
+        }
+        const q_lower = q_lower_buf[0..q_len];
+
+        for (sr.candidates) |doc_id| {
+            if (results.items.len >= limit) break;
+            const doc = self.getById(doc_id) orelse continue;
+            // Case-insensitive substring match on value
+            if (containsLower(doc.value, q_lower)) {
+                try results.append(alloc, doc);
+            }
+        }
+
+        return TextSearchResult{
+            .docs = try results.toOwnedSlice(alloc),
+            .candidates = @intCast(sr.candidates.len),
+            .total_docs = sr.total_docs,
+            .trigrams_used = sr.trigrams_used,
+            .alloc = alloc,
+        };
+    }
+
+    fn containsLower(haystack: []const u8, needle_lower: []const u8) bool {
+        if (needle_lower.len == 0) return true;
+        if (haystack.len < needle_lower.len) return false;
+        for (0..haystack.len - needle_lower.len + 1) |i| {
+            var match = true;
+            for (0..needle_lower.len) |j| {
+                const hc = haystack[i + j];
+                const h_lower = if (hc >= 'A' and hc <= 'Z') hc + 32 else hc;
+                if (h_lower != needle_lower[j]) {
+                    match = false;
+                    break;
+                }
+            }
+            if (match) return true;
+        }
+        return false;
     }
 
     // ─── scan ────────────────────────────────────────────────────────────

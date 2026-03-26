@@ -194,6 +194,25 @@ fn docToResult(d: Doc) TurboDocResult {
     };
 }
 
+// ── Search (trigram-indexed) ─────────────────────────────────────────────────
+
+/// Search documents by substring using trigram index.
+/// Returns scan handle with matching docs. Free with turbodb_scan_free.
+export fn turbodb_search(
+    col_handle: *anyopaque,
+    query_ptr: [*]const u8,
+    query_len: usize,
+    limit: u32,
+    out: *TurboScanHandle,
+) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const query = query_ptr[0..query_len];
+    const result = col.searchText(query, limit, alloc) catch return -1;
+    out.docs_ptr = result.docs.ptr;
+    out.count = @intCast(result.docs.len);
+    return 0;
+}
+
 // ── Version info ────────────────────────────────────────────────────────────
 
 export fn turbodb_version() [*:0]const u8 {

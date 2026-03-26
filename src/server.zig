@@ -137,6 +137,14 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
     if (std.mem.eql(u8, path, "/collections") and std.mem.eql(u8, method, "GET"))
         return handleListCollections(srv, alloc);
 
+    // Route: /search/:col?q=...
+    if (std.mem.startsWith(u8, path, "/search/") and std.mem.eql(u8, method, "GET")) {
+        const col_name = path[8..];
+        const q = qparam(query, "q") orelse return err(400, "missing q parameter");
+        const limit_val: u32 = qparamInt(query, "limit") orelse 50;
+        return handleSearch(srv, col_name, q, limit_val, alloc);
+    }
+
     // Routes under /db/:col
     if (std.mem.startsWith(u8, path, "/db/")) {
         const rest = path[4..];
@@ -211,8 +219,8 @@ fn handleDelete(srv: *Server, col_name: []const u8, key: []const u8) usize {
 }
 
 fn handleScan(srv: *Server, col_name: []const u8, query_str: []const u8, alloc: std.mem.Allocator) usize {
-    const limit: u32 = qparam(query_str, "limit") orelse 20;
-    const offset: u32 = qparam(query_str, "offset") orelse 0;
+    const limit: u32 = qparamInt(query_str, "limit") orelse 20;
+    const offset: u32 = qparamInt(query_str, "offset") orelse 0;
     const col = srv.db.collection(col_name) catch return err(500, "open collection failed");
     const result = col.scan(limit, offset, alloc) catch return err(500, "scan failed");
     defer result.deinit();
@@ -237,6 +245,27 @@ fn handleDrop(srv: *Server, col_name: []const u8) usize {
     return ok("{\"dropped\":true}");
 }
 
+fn handleSearch(srv: *Server, col_name: []const u8, query: []const u8, limit: u32, alloc: std.mem.Allocator) usize {
+    const col = srv.db.collection(col_name) catch return err(500, "open collection failed");
+    const result = col.searchText(query, limit, alloc) catch return err(500, "search failed");
+    defer result.deinit();
+
+    var fbs = std.io.fixedBufferStream(getBodyBuf());
+    const w = fbs.writer();
+    std.fmt.format(w,
+        "{{\"query\":\"{s}\",\"hits\":{d},\"candidates\":{d},\"total_docs\":{d},\"trigrams\":{d},\"results\":[",
+        .{ query, result.docs.len, result.candidates, result.total_docs, result.trigrams_used }) catch {};
+    for (result.docs, 0..) |d, i| {
+        if (i > 0) w.writeByte(',') catch {};
+        std.fmt.format(w,
+            "{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":{s}}}",
+            .{ d.header.doc_id, d.key,
+               if (d.value.len > 0) d.value else "{}" }) catch {};
+    }
+    w.writeAll("]}") catch {};
+    return ok(getBodyBuf()[0..fbs.pos]);
+}
+
 fn handleListCollections(srv: *Server, alloc: std.mem.Allocator) usize {
     _ = alloc;
     var fbs = std.io.fixedBufferStream(getBodyBuf());
@@ -253,6 +282,7 @@ fn handleListCollections(srv: *Server, alloc: std.mem.Allocator) usize {
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 
+// ─── response helpers ────────────────────────────────────────────────────
 // ─── response helpers ────────────────────────────────────────────────────
 
 fn ok(body: []const u8) usize {
@@ -289,7 +319,7 @@ fn jsonStr(json: []const u8, key: []const u8) ?[]const u8 {
     return json[start..end];
 }
 
-fn qparam(query: []const u8, key: []const u8) ?u32 {
+fn qparamInt(query: []const u8, key: []const u8) ?u32 {
     var kbuf: [64]u8 = undefined;
     const needle = std.fmt.bufPrint(&kbuf, "{s}=", .{key}) catch return null;
     const pos = std.mem.indexOf(u8, query, needle) orelse return null;
@@ -298,4 +328,15 @@ fn qparam(query: []const u8, key: []const u8) ?u32 {
     while (end < query.len and query[end] >= '0' and query[end] <= '9') end += 1;
     if (end == start) return null;
     return std.fmt.parseInt(u32, query[start..end], 10) catch null;
+}
+
+fn qparam(query: []const u8, key: []const u8) ?[]const u8 {
+    var kbuf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&kbuf, "{s}=", .{key}) catch return null;
+    const pos = std.mem.indexOf(u8, query, needle) orelse return null;
+    const start = pos + needle.len;
+    var end = start;
+    while (end < query.len and query[end] != '&') end += 1;
+    if (end == start) return null;
+    return query[start..end];
 }
