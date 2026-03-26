@@ -13,9 +13,8 @@ const BTreeEntry = btree_mod.BTreeEntry;
 const WAL = wal_mod.WAL;
 const EpochManager = epoch_mod.EpochManager;
 
-// ─── Thread-local encode buffer (avoids 64KB stack alloc per insert/update) ─
-threadlocal var tl_enc_buf: [65536]u8 = undefined;
 
+// ─── Collection ──────────────────────────────────────────────────────────
 // ─── Collection ──────────────────────────────────────────────────────────
 pub const Collection = struct {
     name_buf: [64]u8,
@@ -76,7 +75,8 @@ pub const Collection = struct {
         const hdr = doc_mod.newHeader(doc_id, key, value);
         const d = Doc{ .header = hdr, .key = key, .value = value };
 
-        const enc = try d.encodeBuf(&tl_enc_buf);
+        var enc_buf: [65536]u8 = undefined;
+        const enc = try d.encodeBuf(&enc_buf);
 
         // Write to WAL first.
         const txn = self.wal_log.next_lsn.load(.monotonic);
@@ -152,7 +152,8 @@ pub const Collection = struct {
         new_hdr.next_ver = (@as(u64, old_entry.page_no) << 16) | old_entry.page_off;
 
         const d = Doc{ .header = new_hdr, .key = key, .value = new_value };
-        const enc = try d.encodeBuf(&tl_enc_buf);
+        var enc_buf: [65536]u8 = undefined;
+        const enc = try d.encodeBuf(&enc_buf);
 
         const txn = self.wal_log.next_lsn.load(.monotonic);
         _ = try self.wal_log.write(txn, .doc_update, 0, 0, enc);

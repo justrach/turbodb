@@ -13,12 +13,21 @@ const std = @import("std");
 const collection = @import("collection.zig");
 const Database = collection.Database;
 
-const MAX_REQ  = 1048576; // 1 MiB
-const MAX_RESP = 2097152; // 2 MiB
-const MAX_BODY = 1048576; // 1 MiB
-threadlocal var req_buf:  [MAX_REQ]u8  = undefined;
-threadlocal var resp_buf: [MAX_RESP]u8 = undefined;
-threadlocal var body_buf: [MAX_BODY]u8 = undefined;
+const MAX_REQ  = 65536;  // 64 KiB
+const MAX_RESP = 131072; // 128 KiB
+const MAX_BODY = 65536;  // 64 KiB
+
+// Heap-allocated per-connection buffers (threadlocal pointers set in handleConn).
+// This avoids large threadlocal TLS segments that break in Release mode on macOS.
+const ConnBufs = struct {
+    req:  [MAX_REQ]u8,
+    resp: [MAX_RESP]u8,
+    body: [MAX_BODY]u8,
+};
+threadlocal var tl_bufs: ?*ConnBufs = null;
+
+fn getRespBuf() *[MAX_RESP]u8 { return &tl_bufs.?.resp; }
+fn getBodyBuf() *[MAX_BODY]u8 { return &tl_bufs.?.body; }
 
 pub const Server = struct {
     db: *Database,
@@ -70,22 +79,23 @@ pub const Server = struct {
 
 fn handleConn(srv: *Server, conn: std.net.Server.Connection) void {
     defer conn.stream.close();
-    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
-    defer arena.deinit();
+
+    const bufs = std.heap.page_allocator.create(ConnBufs) catch {
+        return;
+    };
+    defer std.heap.page_allocator.destroy(bufs);
+    tl_bufs = bufs;
+    defer tl_bufs = null;
 
     while (true) {
-        _ = arena.reset(.retain_capacity);
-        const alloc = arena.allocator();
-
-        const n = conn.stream.read(&req_buf) catch return;
+        const n = conn.stream.read(&bufs.req) catch return;
         if (n == 0) return;
         _ = srv.req_count.fetchAdd(1, .monotonic);
 
-        const resp_len = dispatch(srv, req_buf[0..n], alloc);
-        conn.stream.writeAll(resp_buf[0..resp_len]) catch return;
+        const resp_len = dispatch(srv, bufs.req[0..n], std.heap.page_allocator);
+        conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
     }
 }
-
 fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
     // Parse request line.
     const nl = std.mem.indexOfScalar(u8, raw, '\n') orelse return err(400, "bad request");
@@ -116,11 +126,11 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
 
     // Route: /metrics
     if (std.mem.eql(u8, path, "/metrics")) {
-        var fbs = std.io.fixedBufferStream(&body_buf);
+        var fbs = std.io.fixedBufferStream(getBodyBuf());
         std.fmt.format(fbs.writer(),
             "{{\"requests\":{d},\"errors\":{d}}}",
             .{ srv.req_count.load(.acquire), srv.err_count.load(.acquire) }) catch {};
-        return ok(body_buf[0..fbs.pos]);
+        return ok(getBodyBuf()[0..fbs.pos]);
     }
 
     // Route: /collections
@@ -167,22 +177,22 @@ fn handleInsert(srv: *Server, col_name: []const u8, body: []const u8, alloc: std
 fn doInsert(srv: *Server, col_name: []const u8, key: []const u8, value: []const u8) usize {
     const col = srv.db.collection(col_name) catch return err(500, "open collection failed");
     const doc_id = col.insert(key, value) catch return err(500, "insert failed");
-    var fbs = std.io.fixedBufferStream(&body_buf);
+    var fbs = std.io.fixedBufferStream(getBodyBuf());
     std.fmt.format(fbs.writer(),
         "{{\"doc_id\":{d},\"key\":\"{s}\",\"collection\":\"{s}\"}}",
         .{ doc_id, key, col_name }) catch {};
-    return ok(body_buf[0..fbs.pos]);
+    return ok(getBodyBuf()[0..fbs.pos]);
 }
 
 fn handleGet(srv: *Server, col_name: []const u8, key: []const u8) usize {
     const col = srv.db.collection(col_name) catch return err(500, "open collection failed");
     const d = col.get(key) orelse return err(404, "not found");
-    var fbs = std.io.fixedBufferStream(&body_buf);
+    var fbs = std.io.fixedBufferStream(getBodyBuf());
     std.fmt.format(fbs.writer(),
         "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}",
         .{ d.header.doc_id, d.key, d.header.version,
            if (d.value.len > 0) d.value else "{}" }) catch {};
-    return ok(body_buf[0..fbs.pos]);
+    return ok(getBodyBuf()[0..fbs.pos]);
 }
 
 fn handleUpdate(srv: *Server, col_name: []const u8, key: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
@@ -207,7 +217,7 @@ fn handleScan(srv: *Server, col_name: []const u8, query_str: []const u8, alloc: 
     const result = col.scan(limit, offset, alloc) catch return err(500, "scan failed");
     defer result.deinit();
 
-    var fbs = std.io.fixedBufferStream(&body_buf);
+    var fbs = std.io.fixedBufferStream(getBodyBuf());
     const w = fbs.writer();
     std.fmt.format(w, "{{\"collection\":\"{s}\",\"count\":{d},\"docs\":[",
         .{ col_name, result.docs.len }) catch {};
@@ -219,7 +229,7 @@ fn handleScan(srv: *Server, col_name: []const u8, query_str: []const u8, alloc: 
                if (d.value.len > 0) d.value else "{}" }) catch {};
     }
     w.writeAll("]}") catch {};
-    return ok(body_buf[0..fbs.pos]);
+    return ok(getBodyBuf()[0..fbs.pos]);
 }
 
 fn handleDrop(srv: *Server, col_name: []const u8) usize {
@@ -229,7 +239,7 @@ fn handleDrop(srv: *Server, col_name: []const u8) usize {
 
 fn handleListCollections(srv: *Server, alloc: std.mem.Allocator) usize {
     _ = alloc;
-    var fbs = std.io.fixedBufferStream(&body_buf);
+    var fbs = std.io.fixedBufferStream(getBodyBuf());
     const w = fbs.writer();
     w.writeAll("{\"collections\":[") catch {};
     var it = srv.db.collections.keyIterator();
@@ -240,7 +250,7 @@ fn handleListCollections(srv: *Server, alloc: std.mem.Allocator) usize {
         std.fmt.format(w, "\"{s}\"", .{k.*}) catch {};
     }
     w.writeAll("]}") catch {};
-    return ok(body_buf[0..fbs.pos]);
+    return ok(getBodyBuf()[0..fbs.pos]);
 }
 
 // ─── response helpers ────────────────────────────────────────────────────
@@ -261,7 +271,7 @@ fn err(code: u16, msg: []const u8) usize {
 }
 
 fn respond(code: u16, status: []const u8, body: []const u8) usize {
-    var fbs = std.io.fixedBufferStream(&resp_buf);
+    var fbs = std.io.fixedBufferStream(getRespBuf());
     std.fmt.format(fbs.writer(),
         "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
         .{ code, status, body.len, body }) catch {};
