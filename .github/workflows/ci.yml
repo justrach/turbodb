@@ -91,6 +91,7 @@ jobs:
           python-version: '3.12'
 
       - name: Run benchmark (TurboDB only)
+        timeout-minutes: 5
         run: |
           python3 bench/bench.py --turbodb-only --docs 5000 --threads 4 --binary ./zig-out/bin/turbodb --csv bench_results.csv
 
