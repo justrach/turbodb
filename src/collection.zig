@@ -13,8 +13,10 @@ const BTreeEntry = btree_mod.BTreeEntry;
 const WAL = wal_mod.WAL;
 const EpochManager = epoch_mod.EpochManager;
 
-// ─── Collection ──────────────────────────────────────────────────────────
+// ─── Thread-local encode buffer (avoids 64KB stack alloc per insert/update) ─
+threadlocal var tl_enc_buf: [65536]u8 = undefined;
 
+// ─── Collection ──────────────────────────────────────────────────────────
 pub const Collection = struct {
     name_buf: [64]u8,
     name_len: u8,
@@ -70,13 +72,11 @@ pub const Collection = struct {
         self.write_mu.lock();
         defer self.write_mu.unlock();
 
-        const doc_id = self.next_doc_id.fetchAdd(1, .seq_cst);
+        const doc_id = self.next_doc_id.fetchAdd(1, .monotonic); // under write_mu
         const hdr = doc_mod.newHeader(doc_id, key, value);
         const d = Doc{ .header = hdr, .key = key, .value = value };
 
-        // Encode to temp buffer.
-        var enc_buf: [65536]u8 = undefined;
-        const enc = try d.encodeBuf(&enc_buf);
+        const enc = try d.encodeBuf(&tl_enc_buf);
 
         // Write to WAL first.
         const txn = self.wal_log.next_lsn.load(.monotonic);
@@ -152,8 +152,7 @@ pub const Collection = struct {
         new_hdr.next_ver = (@as(u64, old_entry.page_no) << 16) | old_entry.page_off;
 
         const d = Doc{ .header = new_hdr, .key = key, .value = new_value };
-        var enc_buf: [65536]u8 = undefined;
-        const enc = try d.encodeBuf(&enc_buf);
+        const enc = try d.encodeBuf(&tl_enc_buf);
 
         const txn = self.wal_log.next_lsn.load(.monotonic);
         _ = try self.wal_log.write(txn, .doc_update, 0, 0, enc);
@@ -258,7 +257,7 @@ pub const Collection = struct {
         const total = self.pf.next_alloc.load(.acquire);
         var pno = if (total > 0) total - 1 else 0;
         var checked: u32 = 0;
-        while (checked < 8 and pno > 0) : ({ pno -= 1; checked += 1; }) {
+        while (checked < 32 and pno > 0) : ({ pno -= 1; checked += 1; }) {
             const ph = self.pf.pageHeader(pno);
             if (@as(page_mod.PageType, @enumFromInt(ph.page_type)) != .leaf) continue;
             if (page_mod.PAGE_USABLE - ph.used_bytes >= needed) return pno;

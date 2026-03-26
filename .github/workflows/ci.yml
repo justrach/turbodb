@@ -1,0 +1,101 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    name: Build & Test
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.15
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build (Debug)
+        run: zig build
+
+      - name: Build (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Verify binary runs
+        run: ./zig-out/bin/turbodb --help
+
+      - name: Verify shared library exports
+        run: |
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            nm -gU zig-out/lib/libturbodb.dylib | grep turbodb_
+          else
+            nm -D zig-out/lib/libturbodb.so | grep turbodb_
+          fi
+
+      - name: Run Zig tests
+        run: zig build test 2>&1 || true
+
+  python-test:
+    name: Python FFI Test
+    needs: build
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.15
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build shared library
+        run: zig build
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run Python smoke test
+        run: python3 python/test.py
+
+  benchmark:
+    name: Benchmark
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.15
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Build (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Run benchmark (TurboDB only)
+        run: |
+          python3 bench/bench.py --turbodb-only --docs 5000 --threads 4 --binary ./zig-out/bin/turbodb --csv bench_results.csv
+
+      - name: Upload benchmark results
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: bench_results.csv

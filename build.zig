@@ -76,4 +76,18 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Run TurboDB server");
     run_step.dependOn(&run_cmd.step);
+
+    // ── Test step ───────────────────────────────────────────────────────────
+    const test_mod = b.createModule(.{
+        .root_source_file = b.path("src/doc.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const unit_tests = b.addTest(.{
+        .name = "turbodb-tests",
+        .root_module = test_mod,
+    });
+    const run_tests = b.addRunArtifact(unit_tests);
+    const test_step = b.step("test", "Run unit tests");
+    test_step.dependOn(&run_tests.step);
 }
