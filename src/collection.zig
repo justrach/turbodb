@@ -78,10 +78,10 @@ pub const Collection = struct {
         var enc_buf: [65536]u8 = undefined;
         const enc = try d.encodeBuf(&enc_buf);
 
-        // Write to WAL first.
+        // Write to WAL buffer (background flusher will commit periodically).
         const txn = self.wal_log.next_lsn.load(.monotonic);
         _ = try self.wal_log.write(txn, .doc_insert, 0, 0, enc);
-        try self.wal_log.commit(txn, 0);
+        // NOTE: no commit() here — background flusher batches fsyncs every ~1ms
 
         // Find (or allocate) a leaf page with enough space.
         const pno = try self.findOrAllocLeaf(enc.len);
@@ -157,7 +157,6 @@ pub const Collection = struct {
 
         const txn = self.wal_log.next_lsn.load(.monotonic);
         _ = try self.wal_log.write(txn, .doc_update, 0, 0, enc);
-        try self.wal_log.commit(txn, 0);
 
         const pno = try self.findOrAllocLeaf(enc.len);
         const page_off = self.pf.leafAppend(pno, enc) orelse return error.PageFull;
@@ -187,7 +186,6 @@ pub const Collection = struct {
         tomb_hdr.flags = DocHeader.DELETED;
         const txn = self.wal_log.next_lsn.load(.monotonic);
         _ = try self.wal_log.write(txn, .doc_delete, 0, 0, std.mem.asBytes(&tomb_hdr));
-        try self.wal_log.commit(txn, 0);
 
         // Mark the stored document as deleted.
         if (self.readEntryMut(entry)) |mut_hdr| {
@@ -285,6 +283,8 @@ pub const Database = struct {
         var path_buf: [512]u8 = undefined;
         const wal_path = try std.fmt.bufPrintZ(&path_buf, "{s}/doc.wal", .{data_dir});
         db.wal_log = try WAL.open(wal_path, alloc);
+        // Start background WAL flusher (batches fsyncs every ~1ms like MongoDB's w:1)
+        try db.wal_log.startFlusher();
         db.epochs = try EpochManager.init(alloc);
         db.collections = std.StringHashMap(*Collection).init(alloc);
         db.alloc = alloc;

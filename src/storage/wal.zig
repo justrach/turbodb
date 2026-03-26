@@ -114,6 +114,10 @@ pub const WAL = struct {
     synced_lsn:   u64,
     flushing:     bool,
 
+    // Background flusher
+    flush_thread: ?std.Thread,
+    flush_running: std.atomic.Value(bool),
+
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     pub fn open(path: [:0]const u8, allocator: std.mem.Allocator) !WAL {
@@ -130,13 +134,65 @@ pub const WAL = struct {
             .cond          = .{},
             .synced_lsn    = 0,
             .flushing      = false,
+            .flush_thread  = null,
+            .flush_running = std.atomic.Value(bool).init(false),
         };
         // Seek to end (append mode)
         try wal.file.seekFromEnd(0);
         return wal;
     }
 
+    /// Start background flusher that commits every ~1ms.
+    /// Call this after open() for high-throughput write mode.
+    pub fn startFlusher(self: *WAL) !void {
+        self.flush_running.store(true, .release);
+        self.flush_thread = try std.Thread.spawn(.{}, flushLoop, .{self});
+    }
+
+    fn flushLoop(self: *WAL) void {
+        while (self.flush_running.load(.acquire)) {
+            std.Thread.sleep(1_000_000); // 1ms
+            self.flushPending();
+        }
+        // Final flush on shutdown
+        self.flushPending();
+    }
+
+    /// Flush any pending WAL entries to disk (non-blocking for callers).
+    pub fn flushPending(self: *WAL) void {
+        self.mu.lock();
+        if (self.write_buf.items.len == 0) {
+            self.mu.unlock();
+            return;
+        }
+        if (self.flushing) {
+            self.mu.unlock();
+            return;
+        }
+        self.flushing = true;
+        var to_write = self.write_buf;
+        const target = self.next_lsn.load(.monotonic) -| 1;
+        self.write_buf = .empty;
+        self.mu.unlock();
+
+        self.file.writeAll(to_write.items) catch {};
+        to_write.deinit(self.allocator);
+        self.file.sync() catch {};
+
+        self.mu.lock();
+        self.synced_lsn = target;
+        self.flushing = false;
+        self.cond.broadcast();
+        self.mu.unlock();
+    }
+
     pub fn close(self: *WAL) void {
+        if (self.flush_running.load(.acquire)) {
+            self.flush_running.store(false, .release);
+            if (self.flush_thread) |t| t.join();
+        }
+        // Flush any remaining entries
+        self.flushPending();
         self.write_buf.deinit(self.allocator);
         self.file.close();
     }
