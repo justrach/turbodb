@@ -48,20 +48,19 @@ npm install turbodatabase     # Node.js
 
 ## Benchmarks
 
-Single connection, 256B documents, Apple M3, Zig 0.15 (Debug build):
+10 threads, 5K documents, 256B payload, Apple M3 Ultra, Zig 0.15 ReleaseFast:
 
-| Operation | TurboDB | MongoDB 8.2 (ref) | Speedup |
-|-----------|---------|-------------------|---------| 
-| **Insert** | 14,379 ops/s | ~18,000 ops/s | 0.8x |
-| **Get** | 15,099 ops/s | ~12,000 ops/s | **1.3x** |
-| **Update** | 18,105 ops/s | ~16,000 ops/s | **1.1x** |
-| **Delete** | 16,407 ops/s | ~20,000 ops/s | 0.8x |
+| Operation | TurboDB | MongoDB 8.2 (ref) | vs MongoDB |
+|-----------|---------|-------------------|------------|
+| **Insert** | 12,500 ops/s | ~18,000 ops/s | 0.7x |
+| **Get** | 13,700 ops/s | ~12,000 ops/s | **1.1x** |
+| **Update** | 10,500 ops/s | ~16,000 ops/s | 0.7x |
+| **Delete** | 13,600 ops/s | ~20,000 ops/s | 0.7x |
+| **Mixed** | 14,200 ops/s | ~12,000 ops/s | **1.2x** |
 
-> **Note**: TurboDB is compiled in Debug mode. Release builds are 3-5x faster.
+> **Note**: These numbers are over HTTP REST. The wire protocol and FFI bindings are significantly faster.
 > MongoDB reference numbers are single-node localhost with default config.
 > Run `python3 bench/bench.py` for a full head-to-head comparison ([idealo/mongodb-benchmarking](https://github.com/idealo/mongodb-benchmarking) style).
-
-### Why faster reads?
 
 - **Zero-copy**: `get()` returns a pointer directly into mmap'd memory — no deserialization
 - **FNV-1a 8-byte hash** vs MongoDB's 12-byte ObjectId — smaller index entries, better cache locality

@@ -431,7 +431,7 @@ def print_comparison(workload, turbo_s, mongo_s):
 def start_turbodb(binary, data_dir, port):
     os.makedirs(data_dir, exist_ok=True)
     p = subprocess.Popen(
-        [binary, "--data", data_dir, "--port", str(port)],
+        [binary, "--data", data_dir, "--port", str(port), "--http"],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE,
     )
     c = TurboClient("127.0.0.1", port)
@@ -445,7 +445,6 @@ def start_turbodb(binary, data_dir, port):
     p.terminate()
     print(f"{R}TurboDB didn't start:{Z}\n{err}")
     sys.exit(1)
-
 def check_mongo():
     try:
         import pymongo
