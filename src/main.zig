@@ -2,6 +2,7 @@
 const std = @import("std");
 const collection = @import("collection.zig");
 const server = @import("server.zig");
+const wire = @import("wire.zig");
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -13,38 +14,45 @@ pub fn main() !void {
     defer std.process.argsFree(alloc, args);
 
     var data_dir: []const u8 = "./turbodb_data";
-    var port: u16 = 27017; // same default as MongoDB
+    var port: u16 = 27017;
+    var use_wire: bool = true; // wire protocol by default
+    var use_http: bool = false;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--data") and i + 1 < args.len) {
             i += 1; data_dir = args[i];
         } else if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
             i += 1; port = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--wire")) {
+            use_wire = true;
+            use_http = false;
+        } else if (std.mem.eql(u8, args[i], "--http")) {
+            use_http = true;
+            use_wire = false;
+        } else if (std.mem.eql(u8, args[i], "--both")) {
+            use_wire = true;
+            use_http = true;
         } else if (std.mem.eql(u8, args[i], "--help")) {
             std.debug.print(
-                \\TurboDB — a fast document database in Zig
+                \\TurboDB — a fast NoSQL document database in Zig
                 \\
                 \\  --data <dir>   data directory (default: ./turbodb_data)
-                \\  --port <port>  HTTP listen port (default: 27017)
+                \\  --port <port>  listen port (default: 27017)
+                \\  --wire         binary wire protocol (default)
+                \\  --http         HTTP REST API
+                \\  --both         run wire + HTTP (wire on port, HTTP on port+1)
                 \\
-                \\API (MongoDB-inspired):
+                \\Wire protocol (default, fastest):
+                \\  Binary frame protocol with pipelining and batch support.
+                \\  Use Python/JS client: from turbodb import Database
+                \\
+                \\HTTP API (--http):
                 \\  POST   /db/:col              insert document
-                \\  GET    /db/:col/:key          get document by key
-                \\  PUT    /db/:col/:key          update document
-                \\  DELETE /db/:col/:key          delete document
-                \\  GET    /db/:col?limit=N&offset=M   scan collection
-                \\  DELETE /db/:col              drop collection
-                \\  GET    /collections           list collections
+                \\  GET    /db/:col/:key         get document by key
+                \\  PUT    /db/:col/:key         update document
+                \\  DELETE /db/:col/:key         delete document
+                \\  GET    /db/:col?limit=N      scan collection
                 \\  GET    /health               health check
-                \\  GET    /metrics              request/error counters
-                \\
-                \\Design highlights vs MongoDB:
-                \\  * FNV-1a 8-byte key hash (vs 12-byte ObjectId)
-                \\  * Compact binary page format (no BSON overhead)
-                \\  * 4KB page B-tree, branching factor 184, 3 levels = 6.2M docs
-                \\  * WAL group commit - single fsync per batch (same as PostgreSQL)
-                \\  * MVCC version chains - zero read locks, concurrent readers
-                \\  * Zero-alloc JSON field scanner (no serde per read)
                 \\
             , .{});
             return;
@@ -63,24 +71,38 @@ pub fn main() !void {
     defer db.close();
 
     // ── signal handler ────────────────────────────────────────────────────
-    var srv = server.Server.init(alloc, db, port);
+    var http_srv = server.Server.init(alloc, db, if (use_http and use_wire) port + 1 else port);
+    var wire_srv = wire.WireServer.init(db, port);
 
     const S = struct {
-        var g_srv: ?*server.Server = null;
+        var g_http: ?*server.Server = null;
+        var g_wire: ?*wire.WireServer = null;
         fn handler(_: c_int) callconv(.c) void {
-            if (g_srv) |s| s.stop();
+            if (g_http) |s| s.stop();
+            if (g_wire) |w| w.stop();
         }
     };
-    S.g_srv = &srv;
+    if (use_http) S.g_http = &http_srv;
+    if (use_wire) S.g_wire = &wire_srv;
+
     const sa = std.posix.Sigaction{
         .handler = .{ .handler = S.handler },
         .mask = std.mem.zeroes(std.posix.sigset_t),
         .flags = 0,
     };
-    std.posix.sigaction(std.posix.SIG.INT,  &sa, null);
+    std.posix.sigaction(std.posix.SIG.INT, &sa, null);
     std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
 
     // ── run ───────────────────────────────────────────────────────────────
-    try srv.run();
+    if (use_http and use_wire) {
+        // Run HTTP in a background thread, wire in foreground
+        const http_thread = try std.Thread.spawn(.{}, server.Server.run, .{&http_srv});
+        _ = http_thread;
+        try wire_srv.run();
+    } else if (use_wire) {
+        try wire_srv.run();
+    } else {
+        try http_srv.run();
+    }
     std.log.info("TurboDB stopped.", .{});
 }
