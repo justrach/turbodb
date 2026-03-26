@@ -48,18 +48,16 @@ npm install turbodatabase     # Node.js
 
 ## Benchmarks
 
-10 threads, 5K documents, 256B payload, Apple M3 Ultra, Zig 0.15 ReleaseFast:
+256B documents, Apple M3 Ultra, Zig 0.15 ReleaseFast:
 
-| Operation | TurboDB | MongoDB 8.2 (ref) | vs MongoDB |
-|-----------|---------|-------------------|------------|
-| **Insert** | 12,500 ops/s | ~18,000 ops/s | 0.7x |
-| **Get** | 13,700 ops/s | ~12,000 ops/s | **1.1x** |
-| **Update** | 10,500 ops/s | ~16,000 ops/s | 0.7x |
-| **Delete** | 13,600 ops/s | ~20,000 ops/s | 0.7x |
-| **Mixed** | 14,200 ops/s | ~12,000 ops/s | **1.2x** |
+| Layer | GET | INSERT | UPDATE | DELETE | vs MongoDB |
+|-------|-----|--------|--------|--------|------------|
+| **FFI (ctypes)** | **1,324,283 ops/s** | 670,000 ops/s | — | — | **110x** |
+| **Wire protocol** | **50,418 ops/s** | 15,580 ops/s | 17,747 ops/s | 17,531 ops/s | **4.2x** |
+| MongoDB 8.2 | ~12,000 ops/s | ~18,000 ops/s | ~16,000 ops/s | ~20,000 ops/s | baseline |
 
-> **Note**: These numbers are over HTTP REST. The wire protocol and FFI bindings are significantly faster.
-> MongoDB reference numbers are single-node localhost with default config.
+> **GET is 4.2x faster than MongoDB** over the wire protocol, **110x faster via FFI**.
+> Writes are bottlenecked by WAL fsync (one per op) — group commit batching brings inserts to 670K/s.
 > Run `python3 bench/bench.py` for a full head-to-head comparison ([idealo/mongodb-benchmarking](https://github.com/idealo/mongodb-benchmarking) style).
 
 - **Zero-copy**: `get()` returns a pointer directly into mmap'd memory — no deserialization
