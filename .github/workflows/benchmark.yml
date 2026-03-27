@@ -1,0 +1,135 @@
+name: Benchmark
+
+on:
+  schedule:
+    - cron: '0 6 */3 * *'  # every 3 days at 6am UTC
+  workflow_dispatch:  # manual trigger
+  push:
+    branches: [main]
+    paths:
+      - 'src/**'
+      - 'bench/**'
+      - 'build.zig'
+
+jobs:
+  benchmark:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    services:
+      mongodb:
+        image: mongo:8
+        ports:
+          - 27017:27017
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: turbodb_bench
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_HOST_AUTH_METHOD: trust
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Zig 0.15.2
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.15.2
+
+      - name: Install Python deps
+        run: pip install pymongo psycopg2-binary
+
+      - name: Build TurboDB (ReleaseFast)
+        run: zig build -Doptimize=ReleaseFast
+
+      - name: Run unit tests
+        run: zig test src/fast_index.zig && zig test src/roaring.zig && zig test src/disk_index.zig
+
+      - name: Run TurboDB-only benchmark
+        run: |
+          mkdir -p /tmp/turbodb_bench
+          ./zig-out/bin/turbodb --data /tmp/turbodb_bench --port 27018 --http &
+          sleep 2
+          python3 bench/triple_bench.py --docs 10000 --port 27018 2>&1 | tee bench_output.txt
+          pkill -f turbodb || true
+
+      - name: Extract benchmark results
+        id: bench
+        run: |
+          python3 -c "
+          import re, sys
+          text = open('bench_output.txt').read()
+          # Extract ops/sec for each engine/workload
+          results = {}
+          for line in text.split('\n'):
+              for wl in ['insert','get','update','delete','search']:
+                  for eng in ['TurboDB','MongoDB','Postgres']:
+                      if wl in line and eng in line:
+                          m = re.search(r'([\d.]+)K/s', line)
+                          if m:
+                              results[f'{eng}_{wl}'] = float(m.group(1))
+          # Write summary
+          with open('bench_results.json', 'w') as f:
+              import json; json.dump(results, f, indent=2)
+          print('Results:', results)
+          "
+
+      - name: Update README benchmarks
+        run: |
+          python3 -c "
+          import json, re
+
+          results = json.load(open('bench_results.json'))
+          
+          def get(eng, wl):
+              v = results.get(f'{eng}_{wl}', 0)
+              return f'{v:.1f}K' if v else 'N/A'
+
+          table = '''| Workload | TurboDB | MongoDB | PostgreSQL | vs Mongo | vs Postgres |
+          |----------|---------|---------|------------|----------|-------------|'''
+
+          for wl in ['insert','get','update','delete','search']:
+              t = results.get(f'TurboDB_{wl}', 0)
+              m = results.get(f'MongoDB_{wl}', 0)
+              p = results.get(f'Postgres_{wl}', 0)
+              vm = f'{t/m:.1f}x' if m else 'N/A'
+              vp = f'{t/p:.1f}x' if p else 'N/A'
+              table += f'\n| **{wl.upper()}** | **{get(\"TurboDB\",wl)}/s** | {get(\"MongoDB\",wl)}/s | {get(\"Postgres\",wl)}/s | {vm} | {vp} |'
+
+          readme = open('README.md').read()
+          # Replace between benchmark markers
+          marker_start = '<!-- BENCH_START -->'
+          marker_end = '<!-- BENCH_END -->'
+          if marker_start in readme:
+              before = readme[:readme.index(marker_start) + len(marker_start)]
+              after = readme[readme.index(marker_end):]
+              readme = before + '\n' + table + '\n' + after
+              open('README.md', 'w').write(readme)
+              print('README updated')
+          else:
+              print('No benchmark markers in README — skipping update')
+          "
+
+      - name: Commit updated README
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add README.md bench_results.json 2>/dev/null || true
+          git diff --cached --quiet || git commit -m "Update benchmark results [skip ci]"
+          git push || true
+
+      - name: Upload benchmark artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-results
+          path: |
+            bench_output.txt
+            bench_results.json

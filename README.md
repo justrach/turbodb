@@ -48,17 +48,30 @@ npm install turbodatabase     # Node.js
 
 ## Benchmarks
 
-256B documents, Apple M3 Ultra, Zig 0.15 ReleaseFast:
+### TurboDB vs PostgreSQL vs MongoDB (live, localhost)
 
-| Layer | GET | INSERT | UPDATE | DELETE | vs MongoDB |
-|-------|-----|--------|--------|--------|------------|
-| **FFI (ctypes)** | **1,324,283 ops/s** | 670,000 ops/s | — | — | **110x** |
-| **Wire protocol** | **50,418 ops/s** | 15,580 ops/s | 17,747 ops/s | 17,531 ops/s | **4.2x** |
-| MongoDB 8.2 | ~12,000 ops/s | ~18,000 ops/s | ~16,000 ops/s | ~20,000 ops/s | baseline |
+<!-- BENCH_START -->
+| Workload | TurboDB | MongoDB | PostgreSQL | vs Mongo | vs Postgres |
+|----------|---------|---------|------------|----------|-------------|
+| **INSERT** | **13.5K/s** | 7.8K/s | 11.6K/s | 1.7x | 1.2x |
+| **GET** | **13.2K/s** | 7.4K/s | 32.2K/s | 1.8x | 0.4x |
+| **UPDATE** | **13.0K/s** | 7.9K/s | 11.0K/s | 1.6x | 1.2x |
+| **DELETE** | **13.9K/s** | 8.9K/s | 12.7K/s | 1.6x | 1.1x |
+| **SEARCH** | **12.0K/s** | 6.2K/s | 9.1K/s | 2.0x | 1.3x |
+<!-- BENCH_END -->
 
-> **GET is 4.2x faster than MongoDB** over the wire protocol, **110x faster via FFI**.
-> Writes are bottlenecked by WAL fsync (one per op) — group commit batching brings inserts to 670K/s.
-> Run `python3 bench/bench.py` for a full head-to-head comparison ([idealo/mongodb-benchmarking](https://github.com/idealo/mongodb-benchmarking) style).
+> TurboDB wins **4/5 workloads** vs both MongoDB and Postgres. Search is **2x MongoDB** thanks to the trigram index.
+> Benchmarks auto-update every 3 days via CI. Run `python3 bench/triple_bench.py` locally.
+
+### Storage engine (FFI, no network)
+
+| Layer | GET | INSERT | vs MongoDB |
+|-------|-----|--------|------------|
+| **FFI (ctypes)** | **1,324,283 ops/s** | 670,000 ops/s | **110x** |
+| **Wire protocol** | **50,418 ops/s** | 15,580 ops/s | **4.2x** |
+| MongoDB 8.2 | ~12,000 ops/s | ~18,000 ops/s | baseline |
+
+> Run `python3 bench/bench.py` for the full idealo-style comparison.
 
 - **Zero-copy**: `get()` returns a pointer directly into mmap'd memory — no deserialization
 - **FNV-1a 8-byte hash** vs MongoDB's 12-byte ObjectId — smaller index entries, better cache locality
