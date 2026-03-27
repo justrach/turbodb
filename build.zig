@@ -118,6 +118,27 @@ pub fn build(b: *std.Build) void {
     const scale_step = b.step("scale-bench", "Run scale benchmark (20x codebase)");
     scale_step.dependOn(&scale_run.step);
 
+    // ── Profiler (always ReleaseSafe for safety + speed) ─────────────────────
+    const profile_mod = b.createModule(.{
+        .root_source_file = b.path("src/profile_index.zig"),
+        .target = target,
+        .optimize = .ReleaseSafe,  // ALWAYS safe — catches segfaults
+        .link_libc = true,
+    });
+    wireStorage(profile_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+
+    const profile_exe = b.addExecutable(.{
+        .name = "profile",
+        .root_module = profile_mod,
+    });
+    b.installArtifact(profile_exe);
+
+    const profile_run = b.addRunArtifact(profile_exe);
+    profile_run.step.dependOn(b.getInstallStep());
+    if (b.args) |a| profile_run.addArgs(a);
+    const profile_step = b.step("profile", "Profile indexing performance (ReleaseSafe)");
+    profile_step.dependOn(&profile_run.step);
+
     // ── Test step ───────────────────────────────────────────────────────────
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/doc.zig"),
