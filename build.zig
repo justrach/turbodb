@@ -51,6 +51,26 @@ pub fn build(b: *std.Build) void {
     });
     b.installArtifact(turbodb);
 
+    // ── tdb CLI (native, no network) ────────────────────────────────────────
+    const tdb_mod = b.createModule(.{
+        .root_source_file = b.path("src/tdb.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    wireStorage(tdb_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+
+    const tdb = b.addExecutable(.{
+        .name = "tdb",
+        .root_module = tdb_mod,
+    });
+    b.installArtifact(tdb);
+
+    const tdb_run = b.addRunArtifact(tdb);
+    tdb_run.step.dependOn(b.getInstallStep());
+    if (b.args) |a| tdb_run.addArgs(a);
+    const tdb_step = b.step("tdb", "Run tdb CLI");
+    tdb_step.dependOn(&tdb_run.step);
     // ── Shared library (FFI for Python/JS) ──────────────────────────────────
     const ffi_mod = b.createModule(.{
         .root_source_file = b.path("src/ffi.zig"),
