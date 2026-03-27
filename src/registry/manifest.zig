@@ -38,7 +38,8 @@ pub const Manifest = struct {
     dependencies: []const Dependency = &.{},
     dev_dependencies: []const Dependency = &.{},
     zig_version: []const u8 = "0.15.0",
-
+    visibility: []const u8 = "public", // "public" | "private"
+    org: ?[]const u8 = null, // optional org scope (@org/name)
     /// Serialize manifest to JSON for TurboDB storage.
     /// Returns a slice into buf.
     pub fn toJson(self: Manifest, buf: []u8) ![]const u8 {
@@ -54,7 +55,10 @@ pub const Manifest = struct {
         if (self.repository.len > 0) try w.print(",\"repository\":\"{s}\"", .{self.repository});
         if (self.license.len > 0) try w.print(",\"license\":\"{s}\"", .{self.license});
         if (self.zig_version.len > 0) try w.print(",\"zig_version\":\"{s}\"", .{self.zig_version});
-
+        try w.print(",\"visibility\":\"{s}\"", .{self.visibility});
+        if (self.org) |org| {
+            try w.print(",\"org\":\"{s}\"", .{org});
+        }
         // Tags
         if (self.tags.len > 0) {
             try w.writeAll(",\"tags\":[");
@@ -153,6 +157,8 @@ pub fn parse(alloc: std.mem.Allocator, source: []const u8) !Manifest {
         .repository = jsonGetStr(source, "repository") orelse "",
         .license = jsonGetStr(source, "license") orelse "",
         .zig_version = jsonGetStr(source, "zig_version") orelse "0.15.0",
+        .visibility = jsonGetStr(source, "visibility") orelse "public",
+        .org = jsonGetStr(source, "org"),
     };
 }
 

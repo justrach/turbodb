@@ -51,7 +51,7 @@ pub fn verify(message: []const u8, signature: [64]u8, public_key: [32]u8) bool {
 
 const hex_chars = "0123456789abcdef";
 
-fn hexEncode32(bytes: [32]u8, out: *[64]u8) void {
+pub fn hexEncode32(bytes: [32]u8, out: *[64]u8) void {
     for (bytes, 0..) |b, i| {
         out[i * 2] = hex_chars[b >> 4];
         out[i * 2 + 1] = hex_chars[b & 0x0f];

@@ -7,6 +7,8 @@
 /// Deduplication is automatic: same content → same hash → same file.
 const std = @import("std");
 const hash_mod = @import("hash.zig");
+const auth_mod = @import("auth.zig");
+const Visibility = auth_mod.Visibility;
 
 /// BlobStore manages content-addressed blob storage.
 /// Works standalone (filesystem only) — TurboDB integration happens in registry.zig.
@@ -15,10 +17,17 @@ pub const BlobStore = struct {
     alloc: std.mem.Allocator,
 
     pub fn init(alloc: std.mem.Allocator, data_dir: []const u8) !BlobStore {
-        // Ensure blobs directory exists
+        // Ensure both public and private blob directories exist
         var path_buf: [512]u8 = undefined;
-        const blobs_dir = try std.fmt.bufPrint(&path_buf, "{s}/blobs", .{data_dir});
-        try std.fs.cwd().makePath(blobs_dir);
+        const pub_dir = try std.fmt.bufPrint(&path_buf, "{s}/public/blobs", .{data_dir});
+        try std.fs.cwd().makePath(pub_dir);
+        var path_buf2: [512]u8 = undefined;
+        const priv_dir = try std.fmt.bufPrint(&path_buf2, "{s}/private/blobs", .{data_dir});
+        try std.fs.cwd().makePath(priv_dir);
+        // Also keep legacy flat blobs/ for backward compat
+        var path_buf3: [512]u8 = undefined;
+        const legacy_dir = try std.fmt.bufPrint(&path_buf3, "{s}/blobs", .{data_dir});
+        try std.fs.cwd().makePath(legacy_dir);
 
         return .{
             .data_dir = data_dir,
@@ -141,6 +150,77 @@ pub const BlobStore = struct {
         , .{ hash_hex, data_len, disk_path, now });
     }
 
+    // ─── Visibility-aware methods ────────────────────────────────────────────
+
+    /// Store a blob in the public or private directory.
+    pub fn putScoped(self: *BlobStore, data: []const u8, visibility: Visibility) ![32]u8 {
+        const content_hash = hash_mod.hashBytes(data);
+        var hex: [64]u8 = undefined;
+        hash_mod.hexEncode(content_hash, &hex);
+
+        const scope = visibility.toStr();
+        var dir_buf: [512]u8 = undefined;
+        const prefix_dir = try std.fmt.bufPrint(&dir_buf, "{s}/{s}/blobs/{s}", .{ self.data_dir, scope, hex[0..2] });
+
+        var file_buf: [512]u8 = undefined;
+        const file_path = try std.fmt.bufPrint(&file_buf, "{s}/{s}/blobs/{s}/{s}.tar.zst", .{ self.data_dir, scope, hex[0..2], hex[0..] });
+
+        if (self.existsPath(file_path)) return content_hash;
+
+        std.fs.cwd().makePath(prefix_dir) catch {};
+
+        var tmp_buf: [512]u8 = undefined;
+        const tmp_path = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{file_path});
+
+        {
+            const file = try std.fs.cwd().createFile(tmp_path, .{});
+            defer file.close();
+            try file.writeAll(data);
+        }
+
+        std.fs.cwd().rename(tmp_path, file_path) catch |err| {
+            std.fs.cwd().deleteFile(tmp_path) catch {};
+            return err;
+        };
+
+        return content_hash;
+    }
+
+    /// Check if a blob exists in a specific scope.
+    pub fn existsScoped(self: *BlobStore, hash_hex: []const u8, visibility: Visibility) bool {
+        if (hash_hex.len != 64) return false;
+        const scope = visibility.toStr();
+        var path_buf: [512]u8 = undefined;
+        const path = std.fmt.bufPrint(&path_buf, "{s}/{s}/blobs/{s}/{s}.tar.zst", .{
+            self.data_dir, scope, hash_hex[0..2], hash_hex[0..],
+        }) catch return false;
+        return self.existsPath(path);
+    }
+
+    /// Read a scoped blob. Caller owns returned slice.
+    pub fn readBlobScoped(self: *BlobStore, hash_hex: []const u8, visibility: Visibility) ![]u8 {
+        if (hash_hex.len != 64) return error.InvalidHash;
+        const scope = visibility.toStr();
+        var path_buf: [512]u8 = undefined;
+        const path = try std.fmt.bufPrint(&path_buf, "{s}/{s}/blobs/{s}/{s}.tar.zst", .{
+            self.data_dir, scope, hash_hex[0..2], hash_hex[0..],
+        });
+        return std.fs.cwd().readFileAlloc(self.alloc, path, 256 * 1024 * 1024);
+    }
+
+    /// Build metadata JSON with visibility field.
+    pub fn metadataJsonScoped(_: *BlobStore, hash_hex: []const u8, data_len: usize, visibility: Visibility, buf: []u8) ![]const u8 {
+        const scope = visibility.toStr();
+        var path_buf: [512]u8 = undefined;
+        const disk_path = try std.fmt.bufPrint(&path_buf, "{s}/blobs/{s}/{s}.tar.zst", .{
+            scope, hash_hex[0..2], hash_hex[0..],
+        });
+        const now = std.time.timestamp();
+        return std.fmt.bufPrint(buf,
+            \\{{"hash":"{s}","size":{d},"content_type":"application/zstd","disk_path":"{s}","visibility":"{s}","uploaded_at":{d},"ref_count":1}}
+        , .{ hash_hex, data_len, disk_path, scope, now });
+    }
+
     fn existsPath(_: *BlobStore, path: []const u8) bool {
         std.fs.cwd().access(path, .{}) catch return false;
         return true;
@@ -249,4 +329,61 @@ test "metadata json" {
     try std.testing.expect(std.mem.indexOf(u8, json, "\"size\":9") != null);
 
     std.fs.cwd().deleteTree(tmp_dir) catch {};
+}
+
+test "scoped put and read" {
+    const alloc = std.testing.allocator;
+    const tmp_dir = "/tmp/zagdb-store-scoped";
+    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    var store = try BlobStore.init(alloc, tmp_dir);
+
+    // Store a public blob
+    const pub_data = "public package content";
+    const pub_hash = try store.putScoped(pub_data, .public);
+    var pub_hex: [64]u8 = undefined;
+    hash_mod.hexEncode(pub_hash, &pub_hex);
+
+    // Store a private blob
+    const priv_data = "private secret content";
+    const priv_hash = try store.putScoped(priv_data, .private);
+    var priv_hex: [64]u8 = undefined;
+    hash_mod.hexEncode(priv_hash, &priv_hex);
+
+    // Public blob exists in public scope only
+    try std.testing.expect(store.existsScoped(&pub_hex, .public));
+    try std.testing.expect(!store.existsScoped(&pub_hex, .private));
+
+    // Private blob exists in private scope only
+    try std.testing.expect(store.existsScoped(&priv_hex, .private));
+    try std.testing.expect(!store.existsScoped(&priv_hex, .public));
+
+    // Read back
+    const read_pub = try store.readBlobScoped(&pub_hex, .public);
+    defer alloc.free(read_pub);
+    try std.testing.expectEqualStrings(pub_data, read_pub);
+
+    const read_priv = try store.readBlobScoped(&priv_hex, .private);
+    defer alloc.free(read_priv);
+    try std.testing.expectEqualStrings(priv_data, read_priv);
+}
+
+test "scoped metadata json" {
+    const alloc = std.testing.allocator;
+    const tmp_dir = "/tmp/zagdb-store-scoped-meta";
+    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    var store = try BlobStore.init(alloc, tmp_dir);
+
+    const data = "test content";
+    const h = try store.putScoped(data, .private);
+    var hex: [64]u8 = undefined;
+    hash_mod.hexEncode(h, &hex);
+
+    var buf: [1024]u8 = undefined;
+    const json = try store.metadataJsonScoped(&hex, data.len, .private, &buf);
+    try std.testing.expect(std.mem.indexOf(u8, json, "\"visibility\":\"private\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "private/blobs") != null);
 }
