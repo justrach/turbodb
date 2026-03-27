@@ -97,6 +97,27 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run TurboDB server");
     run_step.dependOn(&run_cmd.step);
 
+    // ── Scale benchmark ─────────────────────────────────────────────────────
+    const scale_mod = b.createModule(.{
+        .root_source_file = b.path("src/scale_bench.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    wireStorage(scale_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+
+    const scale_exe = b.addExecutable(.{
+        .name = "scale-bench",
+        .root_module = scale_mod,
+    });
+    b.installArtifact(scale_exe);
+
+    const scale_run = b.addRunArtifact(scale_exe);
+    scale_run.step.dependOn(b.getInstallStep());
+    if (b.args) |a| scale_run.addArgs(a);
+    const scale_step = b.step("scale-bench", "Run scale benchmark (20x codebase)");
+    scale_step.dependOn(&scale_run.step);
+
     // ── Test step ───────────────────────────────────────────────────────────
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/doc.zig"),
