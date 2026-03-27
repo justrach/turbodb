@@ -6,6 +6,7 @@ const btree_mod = @import("btree.zig");
 const codeindex = @import("codeindex.zig");
 const wal_mod   = @import("wal");
 const epoch_mod = @import("epoch");
+const hot_cache = @import("hot_cache.zig");
 const Doc = doc_mod.Doc;
 const DocHeader = doc_mod.DocHeader;
 const PageFile = page_mod.PageFile;
@@ -32,6 +33,7 @@ pub const Collection = struct {
     write_mu: std.Thread.Mutex,
     hash_idx: std.AutoHashMap(u64, BTreeEntry),
     alloc: std.mem.Allocator,
+    cache: hot_cache.HotCache,
 
     pub fn open(
         alloc: std.mem.Allocator,
@@ -56,6 +58,7 @@ pub const Collection = struct {
         col.write_mu = .{};
         col.hash_idx = std.AutoHashMap(u64, BTreeEntry).init(alloc);
         col.alloc = alloc;
+        col.cache = hot_cache.HotCache.init();
 
         const n = @min(col_name.len, 63);
         @memcpy(col.name_buf[0..n], col_name[0..n]);
@@ -121,13 +124,24 @@ pub const Collection = struct {
     /// The Doc's key/value slices are valid until the next write to this collection.
     pub fn get(self: *Collection, key: []const u8) ?Doc {
         const key_hash = doc_mod.fnv1a(key);
-        // O(1) hash lookup (fast path)
-        if (self.hash_idx.get(key_hash)) |entry| {
-            if (self.readEntry(entry)) |d| return d;
+
+        // L1: Hot cache (O(1), no hash table overhead)
+        if (self.cache.lookup(key_hash)) |loc| {
+            if (self.readLoc(loc.page_no, loc.page_off)) |d| return d;
         }
-        // Fallback to B-tree
+
+        // L2: Hash index (O(1), but hash table lookup)
+        if (self.hash_idx.get(key_hash)) |entry| {
+            if (self.readEntry(entry)) |d| {
+                self.cache.insert(key_hash, entry.page_no, entry.page_off);
+                return d;
+            }
+        }
+        // L3: B-tree (O(log n))
         const entry = self.idx.search(key_hash) orelse return null;
-        return self.readEntry(entry);
+        const d = self.readEntry(entry) orelse return null;
+        self.cache.insert(key_hash, entry.page_no, entry.page_off);
+        return d;
     }
 
     /// Look up a document by doc_id using a linear scan of the index.
@@ -189,6 +203,7 @@ pub const Collection = struct {
         };
         try self.idx.insert(new_entry); // overwrites old entry in B-tree
         self.hash_idx.put(key_hash, new_entry) catch {};
+        self.cache.invalidate(key_hash);
         // Update search indexes (remove old, index new)
         self.tri.removeFile(key);
         self.tri.indexFile(key, new_value) catch {};
@@ -220,6 +235,7 @@ pub const Collection = struct {
         }
         self.idx.delete(key_hash);
         _ = self.hash_idx.remove(key_hash);
+        self.cache.invalidate(key_hash);
         self.tri.removeFile(key);
         self.words.removeFile(key);
         return true;
@@ -360,6 +376,11 @@ pub const Collection = struct {
     }
 
     // ─── private helpers ─────────────────────────────────────────────────
+
+    fn readLoc(self: *Collection, page_no: u32, page_off: u16) ?Doc {
+        const entry = BTreeEntry{ .key_hash = 0, .doc_id = 0, .page_no = page_no, .page_off = page_off };
+        return self.readEntry(entry);
+    }
 
     fn readEntry(self: *Collection, entry: BTreeEntry) ?Doc {
         const raw = self.pf.leafRead(entry.page_no, entry.page_off,
