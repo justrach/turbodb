@@ -193,15 +193,32 @@ fn doInsert(srv: *Server, col_name: []const u8, key: []const u8, value: []const 
 }
 
 fn handleGet(srv: *Server, col_name: []const u8, key: []const u8) usize {
-    const col = srv.db.collection(col_name) catch return err(500, "open collection failed");
-    const d = col.get(key) orelse return err(404, "not found");
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    std.fmt.format(fbs.writer(),
-        "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}",
-        .{ d.header.doc_id, d.key, d.header.version,
-           if (d.value.len > 0) d.value else "{}" }) catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
-}
+        const col = srv.db.collection(col_name) catch return err(500, "open collection failed");
+        const d = col.get(key) orelse return err(404, "not found");
+
+        // Write JSON body directly into resp_buf at offset 256 (reserve space for headers)
+        const HEADER_RESERVE = 256;
+        var resp = getRespBuf();
+        var fbs = std.io.fixedBufferStream(resp[HEADER_RESERVE..]);
+        std.fmt.format(fbs.writer(),
+            "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}",
+            .{ d.header.doc_id, d.key, d.header.version,
+               if (d.value.len > 0) d.value else "{}" }) catch {};
+        const body_len = fbs.pos;
+
+        // Now write headers into the reserved space at the front
+        var hdr_fbs = std.io.fixedBufferStream(resp[0..HEADER_RESERVE]);
+        std.fmt.format(hdr_fbs.writer(),
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
+            .{body_len}) catch {};
+        const hdr_len = hdr_fbs.pos;
+
+        // Move body right after headers (memmove if needed)
+        if (hdr_len < HEADER_RESERVE) {
+            std.mem.copyForwards(u8, resp[hdr_len .. hdr_len + body_len], resp[HEADER_RESERVE .. HEADER_RESERVE + body_len]);
+        }
+        return hdr_len + body_len;
+    }
 
 fn handleUpdate(srv: *Server, col_name: []const u8, key: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
     _ = alloc;

@@ -30,6 +30,7 @@ pub const Collection = struct {
     epochs: *EpochManager,
     next_doc_id: std.atomic.Value(u64),
     write_mu: std.Thread.Mutex,
+    hash_idx: std.AutoHashMap(u64, BTreeEntry),
     alloc: std.mem.Allocator,
 
     pub fn open(
@@ -53,6 +54,7 @@ pub const Collection = struct {
         col.epochs = epochs;
         col.next_doc_id = std.atomic.Value(u64).init(1);
         col.write_mu = .{};
+        col.hash_idx = std.AutoHashMap(u64, BTreeEntry).init(alloc);
         col.alloc = alloc;
 
         const n = @min(col_name.len, 63);
@@ -64,6 +66,7 @@ pub const Collection = struct {
     pub fn close(self: *Collection) void {
         self.tri.deinit();
         self.words.deinit();
+        self.hash_idx.deinit();
         self.pf.close();
         self.alloc.destroy(self);
     }
@@ -104,7 +107,7 @@ pub const Collection = struct {
             .page_off = page_off,
         };
         try self.idx.insert(entry);
-
+        self.hash_idx.put(hdr.key_hash, entry) catch {};
         // codedb2-style trigram + word index (key = file path, value = content)
         self.tri.indexFile(key, value) catch {};
         self.words.indexFile(key, value) catch {};
@@ -118,6 +121,11 @@ pub const Collection = struct {
     /// The Doc's key/value slices are valid until the next write to this collection.
     pub fn get(self: *Collection, key: []const u8) ?Doc {
         const key_hash = doc_mod.fnv1a(key);
+        // O(1) hash lookup (fast path)
+        if (self.hash_idx.get(key_hash)) |entry| {
+            if (self.readEntry(entry)) |d| return d;
+        }
+        // Fallback to B-tree
         const entry = self.idx.search(key_hash) orelse return null;
         return self.readEntry(entry);
     }
@@ -180,7 +188,7 @@ pub const Collection = struct {
             .page_off = page_off,
         };
         try self.idx.insert(new_entry); // overwrites old entry in B-tree
-
+        self.hash_idx.put(key_hash, new_entry) catch {};
         // Update search indexes (remove old, index new)
         self.tri.removeFile(key);
         self.tri.indexFile(key, new_value) catch {};
@@ -211,6 +219,7 @@ pub const Collection = struct {
             mut_hdr.flags |= DocHeader.DELETED;
         }
         self.idx.delete(key_hash);
+        _ = self.hash_idx.remove(key_hash);
         self.tri.removeFile(key);
         self.words.removeFile(key);
         return true;
@@ -389,7 +398,7 @@ pub const Database = struct {
     data_dir_buf: [256]u8,
     data_dir_len: usize,
     alloc: std.mem.Allocator,
-    mu: std.Thread.Mutex,
+    mu: std.Thread.RwLock,
 
     pub fn open(alloc: std.mem.Allocator, data_dir: []const u8) !*Database {
         const db = try alloc.create(Database);
@@ -427,8 +436,18 @@ pub const Database = struct {
 
     /// Get or create a named collection.
     pub fn collection(self: *Database, name: []const u8) !*Collection {
+        // Fast path: read lock
+        self.mu.lockShared();
+        if (self.collections.get(name)) |c| {
+            self.mu.unlockShared();
+            return c;
+        }
+        self.mu.unlockShared();
+
+        // Slow path: write lock for creation
         self.mu.lock();
         defer self.mu.unlock();
+        // Double-check after acquiring write lock
         if (self.collections.get(name)) |c| return c;
 
         const col = try Collection.open(

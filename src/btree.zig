@@ -37,7 +37,7 @@ const MIN_KEYS: usize = MAX_KEYS_PER_INTERNAL / 2;
 pub const BTree = struct {
     pf: *PageFile,
     root: u32,   // root page number (0 = not yet created)
-    mu: std.Thread.Mutex,
+    mu: std.Thread.RwLock,
 
     pub fn init(pf: *PageFile, root_page: u32) BTree {
         return .{ .pf = pf, .root = root_page, .mu = .{} };
@@ -47,8 +47,8 @@ pub const BTree = struct {
 
     /// Find an entry by key_hash. Returns null if not found.
     pub fn search(self: *BTree, key_hash: u64) ?BTreeEntry {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
         if (self.root == 0) return null;
         return self.searchPage(self.root, key_hash);
     }
@@ -291,9 +291,17 @@ fn internalInit(data: []u8, left: u32, median: u64, right: u32) void {
 
 fn internalFindChildIdx(data: []const u8, key_hash: u64) usize {
     const n = internalKeyCount(data);
-    var i: usize = 0;
-    while (i < n and internalGetKey(data, i) <= key_hash) : (i += 1) {}
-    return i;
+    var lo: u32 = 0;
+    var hi: u32 = @intCast(n);
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (internalGetKey(data, mid) <= key_hash) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    return lo;
 }
 
 fn internalFindChild(data: []const u8, key_hash: u64) u32 {
