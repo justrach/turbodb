@@ -17,6 +17,7 @@ pub fn main() !void {
     var port: u16 = 27017;
     var use_wire: bool = true; // wire protocol by default
     var use_http: bool = false;
+    var unix_path: ?[]const u8 = null;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--data") and i + 1 < args.len) {
@@ -32,6 +33,9 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, args[i], "--both")) {
             use_wire = true;
             use_http = true;
+        } else if (std.mem.eql(u8, args[i], "--unix") and i + 1 < args.len) {
+            i += 1;
+            unix_path = args[i];
         } else if (std.mem.eql(u8, args[i], "--help")) {
             std.debug.print(
                 \\TurboDB — a fast NoSQL document database in Zig
@@ -41,6 +45,7 @@ pub fn main() !void {
                 \\  --wire         binary wire protocol (default)
                 \\  --http         HTTP REST API
                 \\  --both         run wire + HTTP (wire on port, HTTP on port+1)
+                \\  --unix <path>  also listen on a Unix domain socket
                 \\
                 \\Wire protocol (default, fastest):
                 \\  Binary frame protocol with pipelining and batch support.
@@ -94,6 +99,18 @@ pub fn main() !void {
     std.posix.sigaction(std.posix.SIG.TERM, &sa, null);
 
     // ── run ───────────────────────────────────────────────────────────────
+    // Spawn Unix socket listener in a background thread if requested
+    if (unix_path) |upath| {
+        if (use_wire) {
+            const unix_wire_t = try std.Thread.spawn(.{}, wire.WireServer.runUnix, .{ &wire_srv, upath });
+            _ = unix_wire_t;
+        }
+        if (use_http) {
+            const unix_http_t = try std.Thread.spawn(.{}, server.Server.runUnix, .{ &http_srv, upath });
+            _ = unix_http_t;
+        }
+    }
+
     if (use_http and use_wire) {
         // Run HTTP in a background thread, wire in foreground
         const http_thread = try std.Thread.spawn(.{}, server.Server.run, .{&http_srv});
@@ -104,5 +121,6 @@ pub fn main() !void {
     } else {
         try http_srv.run();
     }
+    std.log.info("TurboDB stopped.", .{});
     std.log.info("TurboDB stopped.", .{});
 }

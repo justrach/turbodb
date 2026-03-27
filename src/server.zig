@@ -72,6 +72,36 @@ pub const Server = struct {
         }
     }
 
+    pub fn runUnix(self: *Server, path: []const u8) !void {
+        // Remove any existing socket file
+        // Remove any existing socket file
+        std.posix.unlink(path) catch {};
+        const fd = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
+        defer std.posix.close(fd);
+
+        // Construct sockaddr_un
+        var addr: std.posix.sockaddr.un = .{ .family = std.posix.AF.UNIX, .path = undefined };
+        @memset(&addr.path, 0);
+        if (path.len >= addr.path.len) return error.PathTooLong;
+        @memcpy(addr.path[0..path.len], path);
+
+        try std.posix.bind(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
+        try std.posix.listen(fd, 256);
+
+        self.running.store(true, .release);
+        std.log.info("TurboDB HTTP on unix:{s}", .{path});
+
+        while (self.running.load(.acquire)) {
+            var client_addr: std.posix.sockaddr.un = undefined;
+            var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.un);
+            const client_fd = std.posix.accept(fd, @ptrCast(&client_addr), &addr_len, 0) catch continue;
+            const stream = std.net.Stream{ .handle = client_fd };
+            const conn = std.net.Server.Connection{ .stream = stream, .address = std.net.Address.initUnix(path) catch continue };
+            const t = std.Thread.spawn(.{}, handleConn, .{ self, conn }) catch continue;
+            t.detach();
+        }
+    }
+
     pub fn stop(self: *Server) void {
         self.running.store(false, .release);
     }

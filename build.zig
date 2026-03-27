@@ -191,6 +191,26 @@ pub fn build(b: *std.Build) void {
     const profile_step = b.step("profile", "Profile indexing performance (ReleaseSafe)");
     profile_step.dependOn(&profile_run.step);
 
+    // ── Native benchmark ────────────────────────────────────────────────────
+    const bench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench_native.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    wireStorage(bench_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+
+    const bench_exe = b.addExecutable(.{
+        .name = "bench-native",
+        .root_module = bench_mod,
+    });
+    b.installArtifact(bench_exe);
+
+    const bench_run = b.addRunArtifact(bench_exe);
+    bench_run.step.dependOn(b.getInstallStep());
+    const bench_step = b.step("bench", "Run native Zig benchmark");
+    bench_step.dependOn(&bench_run.step);
+
     // ── Test step ───────────────────────────────────────────────────────────
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/doc.zig"),
