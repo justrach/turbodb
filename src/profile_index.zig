@@ -8,6 +8,8 @@
 const std = @import("std");
 const collection_mod = @import("collection.zig");
 const codeindex = @import("codeindex.zig");
+const fast_index = @import("fast_index.zig");
+const parallel_index = @import("parallel_index.zig");
 const disk_index = @import("disk_index.zig");
 const Database = collection_mod.Database;
 
@@ -160,6 +162,48 @@ pub fn main() !void {
         std.debug.print("  File entries:    {d}\n\n", .{tri.file_trigrams.count()});
     }
 
+    // ── Phase 2b: Profile FastTrigramIndex (flat array, O(1)) ───────────
+    std.debug.print("Phase 2b: Profile FastTrigramIndex (flat array)\n", .{});
+    {
+        var t_fast = Timer{ .name = "fast_trigram" };
+
+        var fast = fast_index.FastTrigramIndex.init(alloc);
+        defer fast.deinit();
+
+        t_fast.begin();
+        for (files.items) |f| {
+            fast.indexFile(f.path, f.content) catch {};
+        }
+        t_fast.end();
+
+        const rate = @as(f64, @floatFromInt(files.items.len)) / (t_fast.totalMs() / 1e3);
+        std.debug.print("  Total:          {d:.1}ms  ({d:.0} files/s)\n", .{ t_fast.totalMs(), rate });
+        std.debug.print("  Unique trigrams: {d}\n", .{fast.trigramCount()});
+        std.debug.print("  File entries:    {d}\n\n", .{fast.fileCount()});
+    }
+
+    // ── Phase 2c: Profile Parallel indexing ──────────────────────────────
+    std.debug.print("Phase 2c: Profile Parallel indexing (4 threads)\n", .{});
+    {
+        var t_par = Timer{ .name = "parallel" };
+
+        // Convert to FileEntry slice
+        var entries: std.ArrayList(parallel_index.FileEntry) = .empty;
+        defer entries.deinit(alloc);
+        for (files.items) |f| {
+            try entries.append(alloc, .{ .path = f.path, .content = f.content });
+        }
+        t_par.begin();
+        var indexer = parallel_index.ParallelIndexer.init(alloc, 4);
+        var result = try indexer.indexFiles(entries.items);
+        t_par.end();
+        defer result.deinit();
+
+        const rate = @as(f64, @floatFromInt(files.items.len)) / (t_par.totalMs() / 1e3);
+        std.debug.print("  Total:          {d:.1}ms  ({d:.0} files/s)\n", .{ t_par.totalMs(), rate });
+        std.debug.print("  Files indexed:   {d}\n", .{result.files_indexed});
+        std.debug.print("  Total trigrams:  {d}\n\n", .{result.total_trigrams});
+    }
     // ── Phase 3: Profile on-disk DiskIndexBuilder ───────────────────────
     std.debug.print("Phase 3: Profile DiskIndexBuilder\n", .{});
     {
