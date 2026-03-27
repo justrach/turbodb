@@ -90,13 +90,65 @@ pub fn build(b: *std.Build) void {
     const lib_step = b.step("lib", "Build libturbodb shared library");
     lib_step.dependOn(&lib.step);
 
+    // ── ZagDB registry server ───────────────────────────────────────────────
+    const zagdb_mod = b.createModule(.{
+        .root_source_file = b.path("src/registry/main.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    const zagdb = b.addExecutable(.{
+        .name = "zagdb",
+        .root_module = zagdb_mod,
+    });
+    b.installArtifact(zagdb);
+
+    const zagdb_run = b.addRunArtifact(zagdb);
+    zagdb_run.step.dependOn(b.getInstallStep());
+    if (b.args) |a| zagdb_run.addArgs(a);
+    const zagdb_step = b.step("zagdb", "Run ZagDB registry server");
+    zagdb_step.dependOn(&zagdb_run.step);
+
+    // ── Registry tests ──────────────────────────────────────────────────────
+    const reg_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/registry/registry.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const reg_tests = b.addTest(.{
+        .name = "zagdb-tests",
+        .root_module = reg_test_mod,
+    });
+    const run_reg_tests = b.addRunArtifact(reg_tests);
+    const reg_test_step = b.step("test-registry", "Run ZagDB registry tests");
+    reg_test_step.dependOn(&run_reg_tests.step);
+
+    // ── Zag CLI tool ────────────────────────────────────────────────────────
+    const zag_mod = b.createModule(.{
+        .root_source_file = b.path("src/registry/cli.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
+    const zag_exe = b.addExecutable(.{
+        .name = "zag",
+        .root_module = zag_mod,
+    });
+    b.installArtifact(zag_exe);
+
+    const zag_run = b.addRunArtifact(zag_exe);
+    zag_run.step.dependOn(b.getInstallStep());
+    if (b.args) |a| zag_run.addArgs(a);
+    const zag_step = b.step("zag", "Run zag CLI");
+    zag_step.dependOn(&zag_run.step);
     // ── Run step ────────────────────────────────────────────────────────────
     const run_cmd = b.addRunArtifact(turbodb);
     run_cmd.step.dependOn(b.getInstallStep());
     if (b.args) |args| run_cmd.addArgs(args);
     const run_step = b.step("run", "Run TurboDB server");
     run_step.dependOn(&run_cmd.step);
-
     // ── Scale benchmark ─────────────────────────────────────────────────────
     const scale_mod = b.createModule(.{
         .root_source_file = b.path("src/scale_bench.zig"),
