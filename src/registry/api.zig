@@ -21,6 +21,8 @@ const std = @import("std");
 const registry_mod = @import("registry.zig");
 const sign_mod = @import("sign.zig");
 const hash_mod = @import("hash.zig");
+const auth_mod = @import("auth.zig");
+const AuthContext = auth_mod.AuthContext;
 const Registry = registry_mod.Registry;
 
 const MAX_REQ = 262144; // 256 KiB (larger than TurboDB for package uploads)
@@ -119,6 +121,9 @@ fn dispatch(srv: *RegistryServer, raw: []const u8) usize {
 
     const body = if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |p| raw[p + 4 ..] else if (std.mem.indexOf(u8, raw, "\n\n")) |p| raw[p + 2 ..] else @as([]const u8, "");
 
+    // Parse auth context from headers
+    const auth = auth_mod.parseAuth(raw, method, path);
+
     // ─── /health ────────────────────────────────────────────────────────
     if (std.mem.eql(u8, path, "/health")) {
         return ok("{\"status\":\"ok\",\"engine\":\"ZagDB\",\"backend\":\"TurboDB\"}");
@@ -136,7 +141,7 @@ fn dispatch(srv: *RegistryServer, raw: []const u8) usize {
 
     // ─── /api/v1/search?q=...&limit=N ──────────────────────────────────
     if (std.mem.eql(u8, path, "/api/v1/search") and std.mem.eql(u8, method, "GET")) {
-        return handleSearch(srv, query);
+        return handleSearch(srv, query, auth);
     }
 
     // ─── /api/v1/packages ──────────────────────────────────────────────
@@ -168,12 +173,12 @@ fn dispatch(srv: *RegistryServer, raw: []const u8) usize {
                 const pkg_name = after_slash[0..sep];
                 const ver = after_slash[sep + 1 ..];
                 if (std.mem.eql(u8, method, "GET")) {
-                    return handleGetVersion(srv, pkg_name, ver);
+                    return handleGetVersion(srv, pkg_name, ver, auth);
                 }
             } else {
                 // GET /api/v1/packages/:name
                 if (std.mem.eql(u8, method, "GET")) {
-                    return handleGetPackage(srv, after_slash);
+                    return handleGetPackage(srv, after_slash, auth);
                 }
             }
         }
@@ -202,13 +207,13 @@ fn dispatch(srv: *RegistryServer, raw: []const u8) usize {
 
 // ─── Handlers ───────────────────────────────────────────────────────────────
 
-fn handleSearch(srv: *RegistryServer, query_str: []const u8) usize {
+fn handleSearch(srv: *RegistryServer, query_str: []const u8, auth: AuthContext) usize {
     const q = qparam(query_str, "q") orelse return err(400, "missing q parameter");
     const limit: u32 = qparamInt(query_str, "limit") orelse 20;
     const capped = @min(limit, 50);
 
     var results: [50]registry_mod.PackageInfo = undefined;
-    const count = srv.registry.search(q, capped, &results) catch return err(500, "search failed");
+    const count = srv.registry.searchAuth(q, capped, &results, auth) catch return err(500, "search failed");
 
     var fbs = std.io.fixedBufferStream(getBodyBuf());
     const w = fbs.writer();
@@ -259,13 +264,13 @@ fn handlePublish(srv: *RegistryServer, body: []const u8) usize {
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 
-fn handleGetPackage(srv: *RegistryServer, name: []const u8) usize {
-    const pkg = srv.registry.getPackage(name) orelse return err(404, "package not found");
+fn handleGetPackage(srv: *RegistryServer, name: []const u8, auth: AuthContext) usize {
+    const pkg = srv.registry.getPackageAuth(name, auth) orelse return err(404, "package not found");
     return ok(pkg);
 }
 
-fn handleGetVersion(srv: *RegistryServer, name: []const u8, version: []const u8) usize {
-    const ver = srv.registry.getVersion(name, version) orelse return err(404, "version not found");
+fn handleGetVersion(srv: *RegistryServer, name: []const u8, version: []const u8, auth: AuthContext) usize {
+    const ver = srv.registry.getVersionAuth(name, version, auth) orelse return err(404, "version not found");
     return ok(ver);
 }
 

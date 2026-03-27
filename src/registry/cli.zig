@@ -18,6 +18,8 @@ const sign_mod = @import("sign.zig");
 const hash_mod = @import("hash.zig");
 const registry_mod = @import("registry.zig");
 const resolver_mod = @import("resolver.zig");
+const config_mod = @import("config.zig");
+const auth_mod = @import("auth.zig");
 
 const DEFAULT_REGISTRY = "http://localhost:8080";
 const ZAG_DIR = ".zag";
@@ -86,19 +88,53 @@ fn printUsage() void {
 
 fn cmdInit(alloc: std.mem.Allocator, args: []const []const u8) !void {
     _ = alloc;
-    const name = if (args.len > 0) args[0] else "my-package";
+    var name: []const u8 = "my-package";
+    var org: ?[]const u8 = null;
+    var private = false;
+
+    var i: usize = 0;
+    while (i < args.len) : (i += 1) {
+        if (std.mem.eql(u8, args[i], "--org") and i + 1 < args.len) {
+            i += 1;
+            org = args[i];
+        } else if (std.mem.eql(u8, args[i], "--private")) {
+            private = true;
+        } else {
+            name = args[i];
+        }
+    }
 
     // Check if zag.json already exists
     std.fs.cwd().access("zag.json", .{}) catch |e| {
         if (e == error.FileNotFound) {
-            var buf: [1024]u8 = undefined;
-            const content = try manifest_mod.template(name, &buf);
+            var buf: [2048]u8 = undefined;
+            var fbs = std.io.fixedBufferStream(&buf);
+            const w = fbs.writer();
 
+            try w.writeAll("{\n");
+            try std.fmt.format(w, "  \"name\": \"{s}\",\n", .{name});
+            try w.writeAll("  \"version\": \"0.1.0\",\n");
+            try w.writeAll("  \"description\": \"\",\n");
+            try std.fmt.format(w, "  \"visibility\": \"{s}\",\n", .{if (private) "private" else "public"});
+            if (org) |o| {
+                try std.fmt.format(w, "  \"org\": \"{s}\",\n", .{o});
+            }
+            try w.writeAll("  \"license\": \"MIT\",\n");
+            try w.writeAll("  \"zig_version\": \"0.15.0\",\n");
+            try w.writeAll("  \"dependencies\": {},\n");
+            try w.writeAll("  \"dev_dependencies\": {}\n");
+            try w.writeAll("}");
+
+            const content = fbs.getWritten();
             const file = try std.fs.cwd().createFile("zag.json", .{});
             defer file.close();
             try file.writeAll(content);
 
-            std.debug.print("Created zag.json for \"{s}\"\n", .{name});
+            if (org) |o| {
+                std.debug.print("Created zag.json for @{s}/{s} ({s})\n", .{ o, name, if (private) "private" else "public" });
+            } else {
+                std.debug.print("Created zag.json for \"{s}\" ({s})\n", .{ name, if (private) "private" else "public" });
+            }
             return;
         }
         return e;
@@ -192,13 +228,69 @@ fn cmdAudit(alloc: std.mem.Allocator) !void {
     std.debug.print("  TODO: Verify hashes and signatures\n", .{});
 }
 
+fn cmdLogin(args: []const []const u8) !void {
+    if (args.len == 0) {
+        std.debug.print("Usage: zag login <registry-url>\n", .{});
+        return;
+    }
+    const url = args[0];
+
+    // Generate or load keypair
+    const home = std.posix.getenv("HOME") orelse "/tmp";
+    var keys_buf: [512]u8 = undefined;
+    const keys_dir = try std.fmt.bufPrint(&keys_buf, "{s}/.zag/keys", .{home});
+
+    const kp = sign_mod.loadKeyPair(keys_dir) catch blk: {
+        std.debug.print("No keypair found. Generating one...\n", .{});
+        const new_kp = sign_mod.KeyPair.generate();
+        try sign_mod.saveKeyPair(new_kp, keys_dir);
+        break :blk new_kp;
+    };
+
+    const pk_hex = sign_mod.pubkeyHex(kp.public_key);
+
+    // Save registry config
+    const config = config_mod.Config{
+        .registries = &.{
+            .{ .name = "default", .url = url, .pubkey_hex = &pk_hex },
+        },
+        .default_registry = "default",
+    };
+    try config_mod.saveGlobalConfig(config);
+
+    std.debug.print("Logged in to {s}\n", .{url});
+    std.debug.print("  Public key: {s}\n", .{&pk_hex});
+    std.debug.print("  Config saved to ~/.zag/config.json\n", .{});
+}
+
+fn cmdLogout(args: []const []const u8) !void {
+    if (args.len == 0) {
+        std.debug.print("Usage: zag logout <registry-url>\n", .{});
+        return;
+    }
+    const url = args[0];
+
+    // Save config without auth key
+    const config = config_mod.Config{
+        .registries = &.{
+            .{ .name = "default", .url = url },
+        },
+        .default_registry = "default",
+    };
+    try config_mod.saveGlobalConfig(config);
+
+    std.debug.print("Logged out from {s}\n", .{url});
+    std.debug.print("  Auth key removed from ~/.zag/config.json\n", .{});
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────────
 
 test "cli module compiles" {
-    // Just verify the module compiles — CLI tests are integration tests
     _ = manifest_mod;
     _ = sign_mod;
     _ = hash_mod;
     _ = registry_mod;
     _ = resolver_mod;
+    _ = config_mod;
+    _ = auth_mod;
 }

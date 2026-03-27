@@ -34,6 +34,8 @@ pub const Manifest = struct {
     author_pubkey: []const u8 = "",
     repository: []const u8 = "",
     license: []const u8 = "",
+    visibility: []const u8 = "public",
+    org: ?[]const u8 = null,
     tags: []const []const u8 = &.{},
     dependencies: []const Dependency = &.{},
     dev_dependencies: []const Dependency = &.{},
@@ -54,6 +56,8 @@ pub const Manifest = struct {
         if (self.repository.len > 0) try w.print(",\"repository\":\"{s}\"", .{self.repository});
         if (self.license.len > 0) try w.print(",\"license\":\"{s}\"", .{self.license});
         if (self.zig_version.len > 0) try w.print(",\"zig_version\":\"{s}\"", .{self.zig_version});
+        if (self.visibility.len > 0) try w.print(",\"visibility\":\"{s}\"", .{self.visibility});
+        if (self.org) |o| try w.print(",\"org\":\"{s}\"", .{o});
 
         // Tags
         if (self.tags.len > 0) {
@@ -152,6 +156,8 @@ pub fn parse(alloc: std.mem.Allocator, source: []const u8) !Manifest {
         .author_pubkey = jsonGetStr(source, "author_pubkey") orelse "",
         .repository = jsonGetStr(source, "repository") orelse "",
         .license = jsonGetStr(source, "license") orelse "",
+        .visibility = jsonGetStr(source, "visibility") orelse "public",
+        .org = jsonGetStr(source, "org"),
         .zig_version = jsonGetStr(source, "zig_version") orelse "0.15.0",
     };
 }
