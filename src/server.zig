@@ -253,8 +253,8 @@ fn handleSearch(srv: *Server, col_name: []const u8, query: []const u8, limit: u3
     var fbs = std.io.fixedBufferStream(getBodyBuf());
     const w = fbs.writer();
     std.fmt.format(w,
-        "{{\"query\":\"{s}\",\"hits\":{d},\"candidates\":{d},\"total_docs\":{d},\"trigrams\":{d},\"results\":[",
-        .{ query, result.docs.len, result.candidates, result.total_docs, result.trigrams_used }) catch {};
+        "{{\"query\":\"{s}\",\"hits\":{d},\"candidates\":{d},\"total_files\":{d},\"results\":[",
+        .{ query, result.docs.len, result.candidate_paths.len, result.total_files }) catch {};
     for (result.docs, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
         std.fmt.format(w,

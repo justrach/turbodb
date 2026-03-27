@@ -12,6 +12,7 @@
 ///
 const std = @import("std");
 const collection_mod = @import("collection.zig");
+const codeindex = @import("codeindex.zig");
 const Database = collection_mod.Database;
 const Collection = collection_mod.Collection;
 
@@ -95,6 +96,12 @@ pub fn main() !void {
             return;
         }
         try cmdGet(db, col_name, cmd_args[0]);
+    } else if (std.mem.eql(u8, command, "word")) {
+        if (cmd_argc < 1) {
+            std.debug.print("Usage: tdb word <identifier>\n", .{});
+            return;
+        }
+        try cmdWord(db, col_name, cmd_args[0]);
     } else if (std.mem.eql(u8, command, "insert")) {
         if (cmd_argc < 2) {
             std.debug.print("Usage: tdb insert <key> <value>\n", .{});
@@ -145,8 +152,12 @@ fn cmdIndex(db: *Database, col_name: []const u8, dir_path: []const u8, alloc: st
             skipped += 1;
             continue;
         }
-
-        _ = col.insert(entry.path, buf[0..n]) catch {
+        // Dupe path — walker buffer is reused, but trigram index stores pointers
+        const stable_path = alloc.dupe(u8, entry.path) catch {
+            skipped += 1;
+            continue;
+        };
+        _ = col.insert(stable_path, buf[0..n]) catch {
             skipped += 1;
             continue;
         };
@@ -178,22 +189,20 @@ fn cmdSearch(db: *Database, col_name: []const u8, query: []const u8, alloc: std.
     const elapsed_ns = std.time.nanoTimestamp() - t0;
     const elapsed_us = @as(f64, @floatFromInt(elapsed_ns)) / 1e3;
 
+    const n_cand = result.candidate_paths.len;
+    const total = result.total_files;
+    const selectivity = if (total > 0)
+        @as(f64, @floatFromInt(n_cand)) / @as(f64, @floatFromInt(total)) * 100
+    else
+        @as(f64, 0);
+
     std.debug.print("\n  Query:      \"{s}\"\n", .{query});
-    std.debug.print("  Trigrams:   {d}\n", .{result.trigrams_used});
-    std.debug.print("  Candidates: {d} / {d} ({d:.1}%% scanned)\n", .{
-        result.candidates,
-        result.total_docs,
-        if (result.total_docs > 0)
-            @as(f64, @floatFromInt(result.candidates)) / @as(f64, @floatFromInt(result.total_docs)) * 100
-        else
-            @as(f64, 0),
-    });
+    std.debug.print("  Candidates: {d} / {d} ({d:.1}%% scanned)\n", .{ n_cand, total, selectivity });
     std.debug.print("  Hits:       {d}\n", .{result.docs.len});
     std.debug.print("  Time:       {d:.0} µs\n\n", .{elapsed_us});
 
     for (result.docs, 0..) |d, idx| {
         const path = d.key;
-        // Find match context in value
         const snippet = findSnippet(d.value, query);
         std.debug.print("  {d:>3}. {s}\n", .{ idx + 1, path });
         if (snippet.len > 0) {
@@ -202,6 +211,19 @@ fn cmdSearch(db: *Database, col_name: []const u8, query: []const u8, alloc: std.
     }
     if (result.docs.len == 0) {
         std.debug.print("  (no results)\n", .{});
+    }
+}
+
+fn cmdWord(db: *Database, col_name: []const u8, word: []const u8) !void {
+    const col = try db.collection(col_name);
+    const hits = col.searchWord(word);
+    if (hits.len == 0) {
+        std.debug.print("  No hits for \"{s}\"\n", .{word});
+        return;
+    }
+    std.debug.print("\n  Word: \"{s}\"  ({d} hits)\n\n", .{ word, hits.len });
+    for (hits) |hit| {
+        std.debug.print("  {s}:{d}\n", .{ hit.path, hit.line_num });
     }
 }
 
@@ -234,15 +256,17 @@ fn cmdBench(db: *Database, col_name: []const u8, dir_path: []const u8, alloc: st
         const elapsed_us = @as(f64, @floatFromInt(elapsed_ns)) / 1e3;
         total_us += elapsed_us;
         total_hits += result.docs.len;
-        total_candidates += result.candidates;
+        const n_cand = result.candidate_paths.len;
+        total_candidates += n_cand;
 
-        const selectivity = if (result.total_docs > 0)
-            @as(f64, @floatFromInt(result.candidates)) / @as(f64, @floatFromInt(result.total_docs)) * 100
+        const total_files = result.total_files;
+        const selectivity = if (total_files > 0)
+            @as(f64, @floatFromInt(n_cand)) / @as(f64, @floatFromInt(total_files)) * 100
         else
             @as(f64, 0);
 
         std.debug.print("  \"{s:<20}\"  {d:>4} hits  {d:>5} candidates  {d:>5.1}%% scan  {d:>8.0} µs\n", .{
-            q, result.docs.len, result.candidates, selectivity, elapsed_us,
+            q, result.docs.len, n_cand, selectivity, elapsed_us,
         });
         result.deinit();
     }
