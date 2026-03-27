@@ -89,6 +89,12 @@ fn handleConn(srv: *WireServer, conn: std.net.Server.Connection) void {
     defer conn.stream.close();
     const bufs = std.heap.page_allocator.create(Bufs) catch return;
     defer std.heap.page_allocator.destroy(bufs);
+
+    // Pre-resolve the most common collection for the fast path
+    var cached_col: ?*collection_mod.Collection = null;
+    var cached_col_name: [64]u8 = undefined;
+    var cached_col_len: usize = 0;
+
     var rp: usize = 0;
 
     while (true) {
@@ -104,8 +110,19 @@ fn handleConn(srv: *WireServer, conn: std.net.Server.Connection) void {
             if (consumed + flen > rp) break;
             const op = bufs.rd[consumed + 4];
             const payload = bufs.rd[consumed + HDR .. consumed + flen];
-            const wn = dispatch(srv, op, payload, &bufs.wr);
-            conn.stream.writeAll(bufs.wr[0..wn]) catch return;
+
+            // ── FAST PATH: inline GET with zero-copy ──
+            if (op == OP_GET) {
+                const wn = fastGet(srv, payload, &bufs.wr, &cached_col, &cached_col_name, &cached_col_len);
+                conn.stream.writeAll(bufs.wr[0..wn]) catch return;
+            } else {
+                // Invalidate collection cache on writes
+                if (op == OP_INSERT or op == OP_UPDATE or op == OP_DELETE) {
+                    cached_col = null;
+                }
+                const wn = dispatch(srv, op, payload, &bufs.wr);
+                conn.stream.writeAll(bufs.wr[0..wn]) catch return;
+            }
             consumed += flen;
         }
         if (consumed > 0) {
@@ -113,6 +130,46 @@ fn handleConn(srv: *WireServer, conn: std.net.Server.Connection) void {
             rp -= consumed;
         }
     }
+}
+
+/// Inlined GET: collection lookup is cached, response writes mmap'd bytes directly.
+fn fastGet(
+    srv: *WireServer,
+    p: []const u8,
+    w: *[WR_BUF]u8,
+    cached_col: *?*collection_mod.Collection,
+    cached_name: *[64]u8,
+    cached_len: *usize,
+) usize {
+    const a = parseKey(p) orelse return errResp(w, OP_GET, STATUS_ERROR);
+
+    // Fast collection lookup: skip mutex if same collection as last call
+    const col = blk: {
+        if (cached_col.*) |cc| {
+            if (cached_len.* == a.col.len and std.mem.eql(u8, cached_name[0..cached_len.*], a.col)) {
+                break :blk cc;
+            }
+        }
+        const c = srv.db.collection(a.col) catch return errResp(w, OP_GET, STATUS_ERROR);
+        @memcpy(cached_name[0..a.col.len], a.col);
+        cached_len.* = a.col.len;
+        cached_col.* = c;
+        break :blk c;
+    };
+
+    const d = col.get(a.key) orelse return errResp(w, OP_GET, STATUS_NOT_FOUND);
+
+    // Write response: [len:4][op:1][status:1][doc_id:8][ver:1][val_len:4][val:N]
+    const rlen = HDR + 1 + 8 + 1 + 4 + d.value.len;
+    if (rlen > WR_BUF) return errResp(w, OP_GET, STATUS_ERROR);
+    wrU32BE(w, @intCast(rlen));
+    w[4] = OP_GET;
+    w[5] = STATUS_OK;
+    wrU64LE(w[6..14], d.header.doc_id);
+    w[14] = d.header.version;
+    wrU32LE(w[15..19], @intCast(d.value.len));
+    if (d.value.len > 0) @memcpy(w[19..][0..d.value.len], d.value);
+    return rlen;
 }
 
 fn dispatch(srv: *WireServer, op: u8, p: []const u8, w: *[WR_BUF]u8) usize {
