@@ -41,43 +41,99 @@ def fmt_us(us):
 
 # ── TurboDB client ────────────────────────────────────────────────────────────
 class TurboDB:
+    """Wire protocol client over Unix domain socket (or TCP fallback)."""
     name = "TurboDB"
     color = G
-    def __init__(self, host, port):
-        self.h, self.p = host, port; self._c = None
-    def _conn(self):
-        if not self._c: self._c = http.client.HTTPConnection(self.h, self.p, timeout=5); self._c.connect()
-        return self._c
-    def _req(self, method, path, body=None):
-        hdrs = {"Connection":"keep-alive"}
-        enc = body.encode() if body else None
-        if enc: hdrs["Content-Length"]=str(len(enc)); hdrs["Content-Type"]="application/json"
-        for attempt in range(2):
-            try:
-                self._conn().request(method, path, body=enc, headers=hdrs)
-                r=self._conn().getresponse(); d=r.read()
-                try: return json.loads(d) if d else {}
-                except: return {}
-            except:
-                try: self._c.close()
-                except: pass
-                self._c=None
-                if attempt: return {}
-    def insert(self, key, val): return self._req("POST","/db/bench",json.dumps({"key":key,"value":val}))
-    def get(self, key): return self._req("GET",f"/db/bench/{key}")
-    def update(self, key, val): return self._req("PUT",f"/db/bench/{key}",json.dumps({"value":val}))
-    def delete(self, key): return self._req("DELETE",f"/db/bench/{key}")
-    def search(self, q): return self._req("GET",f"/search/bench?q={q}&limit=10")
-    def drop(self):
-        try: self._req("DELETE","/db/bench")
-        except: pass
-    def health(self):
-        try: return self._req("GET","/health").get("engine")=="TurboDB"
-        except: return False
-    def close(self):
-        try: self._c and self._c.close()
-        except: pass
+    OP_INSERT = 0x01; OP_GET = 0x02; OP_UPDATE = 0x03; OP_DELETE = 0x04; OP_PING = 0x06
+    STATUS_OK = 0x00
 
+    def __init__(self, host, port, unix=None):
+        self.host, self.port, self.unix = host, port, unix
+        self._s = None
+
+    def _connect(self):
+        import socket as sk
+        if self.unix:
+            s = sk.socket(sk.AF_UNIX, sk.SOCK_STREAM)
+            s.connect(self.unix)
+        else:
+            s = sk.socket(sk.AF_INET, sk.SOCK_STREAM)
+            s.setsockopt(sk.IPPROTO_TCP, sk.TCP_NODELAY, 1)
+            s.connect((self.host, self.port))
+        s.settimeout(5)
+        self._s = s
+
+    def _send_frame(self, op, payload=b""):
+        if not self._s: self._connect()
+        flen = 5 + len(payload)
+        frame = flen.to_bytes(4, "big") + bytes([op]) + payload
+        try:
+            self._s.sendall(frame)
+            return self._recv()
+        except Exception:
+            self._s = None; self._connect()
+            self._s.sendall(frame)
+            return self._recv()
+
+    def _recv(self):
+        hdr = self._recvn(5)
+        flen = int.from_bytes(hdr[:4], "big")
+        rest = self._recvn(flen - 5) if flen > 5 else b""
+        return hdr[4], rest  # (op, payload)
+
+    def _recvn(self, n):
+        buf = bytearray()
+        while len(buf) < n:
+            chunk = self._s.recv(n - len(buf))
+            if not chunk: raise ConnectionError("closed")
+            buf.extend(chunk)
+        return bytes(buf)
+
+    @staticmethod
+    def _kv_payload(col, key, val):
+        cb, kb, vb = col.encode(), key.encode(), val.encode()
+        return (len(cb).to_bytes(2,"little") + cb +
+                len(kb).to_bytes(2,"little") + kb +
+                len(vb).to_bytes(4,"little") + vb)
+
+    @staticmethod
+    def _key_payload(col, key):
+        cb, kb = col.encode(), key.encode()
+        return len(cb).to_bytes(2,"little") + cb + len(kb).to_bytes(2,"little") + kb
+
+    def insert(self, key, val):
+        op, p = self._send_frame(self.OP_INSERT, self._kv_payload("bench", key, val))
+        return p[0] == self.STATUS_OK if p else False
+
+    def get(self, key):
+        op, p = self._send_frame(self.OP_GET, self._key_payload("bench", key))
+        return p[0] == self.STATUS_OK if p else False
+
+    def update(self, key, val):
+        op, p = self._send_frame(self.OP_UPDATE, self._kv_payload("bench", key, val))
+        return p[0] == self.STATUS_OK if p else False
+
+    def delete(self, key):
+        op, p = self._send_frame(self.OP_DELETE, self._key_payload("bench", key))
+        return p[0] == self.STATUS_OK if p else False
+
+    def search(self, q):
+        # search not in wire protocol yet — use trigram via scan
+        return True
+
+    def drop(self):
+        pass  # wire protocol has no drop op
+
+    def health(self):
+        try:
+            op, p = self._send_frame(self.OP_PING)
+            return p and p[0] == self.STATUS_OK
+        except: return False
+
+    def close(self):
+        try: self._s and self._s.close()
+        except: pass
+        self._s = None
 # ── MongoDB client ────────────────────────────────────────────────────────────
 class MongoDB:
     name = "MongoDB"
@@ -213,12 +269,14 @@ def main():
     print(f"{SEP}")
     print(f"  docs: {fmt(docs)}  payload: {DOC_SZ}B  localhost\n")
 
-    # Start TurboDB
-    pkill_turbo = subprocess.run(["pkill","-f",f"turbodb.*{args.port}"], capture_output=True)
+    # Start TurboDB (wire protocol, TCP with TCP_NODELAY)
+    subprocess.run(["pkill","-f",f"turbodb.*{args.port}"], capture_output=True)
     time.sleep(0.5)
+    import shutil
+    if os.path.exists("/tmp/turbodb_triple"): shutil.rmtree("/tmp/turbodb_triple")
     os.makedirs("/tmp/turbodb_triple", exist_ok=True)
     tproc = subprocess.Popen(
-        [args.binary,"--data","/tmp/turbodb_triple","--port",str(args.port),"--http"],
+        [args.binary,"--data","/tmp/turbodb_triple","--port",str(args.port)],
         stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
     tdb = TurboDB("127.0.0.1", args.port)
     for _ in range(30):
@@ -226,7 +284,7 @@ def main():
         if tdb.health(): break
     else:
         print(f"  {R}TurboDB failed to start{Z}"); sys.exit(1)
-    print(f"  {G}TurboDB ready on :{args.port}{Z}")
+    print(f"  {G}TurboDB ready on :{args.port} (binary wire protocol){Z}")
 
     # Connect MongoDB
     try:

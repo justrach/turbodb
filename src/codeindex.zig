@@ -120,7 +120,8 @@ pub const WordIndex = struct {
             }
         }
 
-        try self.file_words.put(path, words_set);
+        const owned_path = try self.allocator.dupe(u8, path);
+        try self.file_words.put(owned_path, words_set);
     }
 
     /// Look up all hits for a word. O(1) lookup + O(hits) iteration.
@@ -247,10 +248,13 @@ pub const TrigramIndex = struct {
                     idx_gop.value_ptr.* = std.StringHashMap(PostingMask).init(self.allocator);
                 }
                 // Get or create the posting for this file
-                const file_gop = try idx_gop.value_ptr.getOrPut(path);
+                const duped_path = if (!idx_gop.found_existing or !idx_gop.value_ptr.contains(path))
+                    try self.allocator.dupe(u8, path)
+                else
+                    path;
+                const file_gop = try idx_gop.value_ptr.getOrPut(duped_path);
                 if (!file_gop.found_existing) {
                     file_gop.value_ptr.* = PostingMask{};
-                    // Track this trigram for cleanup (only once per file)
                     try seen_trigrams.put(tri, {});
                 }
                 // OR in position masks
@@ -268,7 +272,8 @@ pub const TrigramIndex = struct {
         while (tri_iter.next()) |tri_ptr| {
             try tri_list.append(self.allocator, tri_ptr.*);
         }
-        try self.file_trigrams.put(path, tri_list);
+        const owned_path2 = try self.allocator.dupe(u8, path);
+        try self.file_trigrams.put(owned_path2, tri_list);
     }
 
 

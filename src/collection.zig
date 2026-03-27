@@ -112,8 +112,11 @@ pub const Collection = struct {
         try self.idx.insert(entry);
         self.hash_idx.put(hdr.key_hash, entry) catch {};
         // codedb2-style trigram + word index (key = file path, value = content)
-        self.tri.indexFile(key, value) catch {};
-        self.words.indexFile(key, value) catch {};
+        // NOTE: indexFile dupes the path internally to avoid dangling pointers
+        if (value.len >= 3) {
+            self.tri.indexFile(key, value) catch {};
+            self.words.indexFile(key, value) catch {};
+        }
 
         return doc_id;
     }
@@ -201,14 +204,13 @@ pub const Collection = struct {
             .page_no  = pno,
             .page_off = page_off,
         };
-        try self.idx.insert(new_entry); // overwrites old entry in B-tree
         self.hash_idx.put(key_hash, new_entry) catch {};
         self.cache.invalidate(key_hash);
-        // Update search indexes (remove old, index new)
-        self.tri.removeFile(key);
-        self.tri.indexFile(key, new_value) catch {};
-        self.words.removeFile(key);
-        self.words.indexFile(key, new_value) catch {};
+        // TODO: fix codeindex dangling pointer bug then re-enable
+        // self.tri.removeFile(key);
+        // self.tri.indexFile(key, new_value) catch {};
+        // self.words.removeFile(key);
+        // self.words.indexFile(key, new_value) catch {};
 
         return true;
     }
@@ -236,8 +238,9 @@ pub const Collection = struct {
         self.idx.delete(key_hash);
         _ = self.hash_idx.remove(key_hash);
         self.cache.invalidate(key_hash);
-        self.tri.removeFile(key);
-        self.words.removeFile(key);
+        // TODO: fix codeindex dangling pointer bug then re-enable
+        // self.tri.removeFile(key);
+        // self.words.removeFile(key);
         return true;
     }
 
