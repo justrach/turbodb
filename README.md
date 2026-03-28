@@ -27,7 +27,7 @@ npm install turbodatabase     # Node.js
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Insert / Get / Update / Delete | ✅ Working | ~14M GET/s in-process, ~42K/s wire protocol |
+| Insert / Get / Update / Delete | ✅ Working | ~13.3M GET/s in-process, ~42K/s wire protocol |
 | B-tree index (FNV-1a) | ✅ Working | O(log N), branching factor 169 |
 | ART index (Adaptive Radix Tree) | ✅ Working | 19M search/s, path compression, Node4/16/48/256 |
 | LSM tree | ✅ Working | MemTable + SSTable + bloom filters, size-tiered compaction |
@@ -36,7 +36,8 @@ npm install turbodatabase     # Node.js
 | WAL group commit | ✅ Working | Parallel WAL with per-core segments |
 | MVCC version chains | ✅ Working | Epoch-based GC, zero read locks |
 | mmap storage | ✅ Working | Zero-copy reads, 256 MiB growth |
-| Columnar projections | ✅ Working | Vectorized filter, 950M scan/s |
+| Columnar projections | ✅ Working | Vectorized filter, 1.02B scan/s |
+| **Vector search (SIMD)** | ✅ Working | **Cosine, dot product, L2 — @Vector(4,f32) SIMD** |
 | Hash/range partitioning | ✅ Working | FNV-1a routing, parallel scatter-gather scan |
 | Calvin replication | ✅ Working | Deterministic sequencer + executor |
 | Shard management | ✅ Working | Consistent hash ring, partition migration |
@@ -44,12 +45,17 @@ npm install turbodatabase     # Node.js
 | io_uring / kqueue | ✅ Working | Async I/O, event-loop server |
 | Binary wire protocol | ✅ Working | TCP_NODELAY, pipelining, batch ops |
 | JSON REST API | ✅ Working | MongoDB-inspired routes on :27017 |
+| **Authentication** | ✅ Working | **API key + BLAKE3 hashing, per-key permissions** |
+| **Schema validation** | ✅ Working | **Required fields, type checking (string/number/bool/object/array)** |
+| **TTL / document expiry** | ✅ Working | **Per-doc TTL with background reaper** |
+| **Cursor pagination** | ✅ Working | **Stable hex-encoded cursor tokens** |
+| **Structured error codes** | ✅ Working | **30+ error codes, HTTP + wire mapping** |
+| Crypto (SHA-256/BLAKE3/Ed25519) | ✅ Working | Zero-dep, Zig std.crypto, FFI-accessible |
 | Python FFI (ctypes) | ✅ Working | `pip install turbodatabase` |
 | Node.js FFI (koffi) | ✅ Working | `npm install turbodatabase` |
-| Collection scan | ✅ Working | Limit/offset pagination |
-| Authentication | 🔜 Planned | Token-based |
-| TLS | 🔜 Planned | Native Zig TLS |
+| TLS | 🔜 Use reverse proxy | Recommended: nginx/Caddy/Fly.io for TLS termination |
 | Multi-doc transactions | 🔜 Planned | Cross-partition ACID |
+| Change streams | 🔜 Planned | WAL tailing subscription API |
 
 ## Benchmarks
 

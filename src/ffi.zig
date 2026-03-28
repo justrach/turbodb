@@ -10,6 +10,7 @@ const std = @import("std");
 const collection = @import("collection.zig");
 const doc_mod = @import("doc.zig");
 const crypto = @import("crypto.zig");
+const vector = @import("vector.zig");
 const Database = collection.Database;
 const Collection = collection.Collection;
 const Doc = doc_mod.Doc;
@@ -254,4 +255,61 @@ export fn turbodb_ed25519_sign(msg: [*]const u8, msg_len: usize, sk: *const [64]
 }
 export fn turbodb_ed25519_verify(msg: [*]const u8, msg_len: usize, sig: *const [64]u8, pk: *const [32]u8) c_int {
     return if (crypto.ed25519Verify(msg[0..msg_len], sig.*, pk.*)) 0 else -1;
+}
+
+// ── Vector column ───────────────────────────────────────────────────────────
+// SIMD-accelerated vector similarity search (cosine, dot product, L2).
+
+/// Create a vector column with given dimensionality.
+export fn turbodb_vector_create(dims: u32) ?*anyopaque {
+    const col = alloc.create(vector.VectorColumn) catch return null;
+    col.* = vector.VectorColumn.init(dims);
+    return @ptrCast(col);
+}
+
+/// Free a vector column.
+export fn turbodb_vector_free(handle: *anyopaque) void {
+    const col: *vector.VectorColumn = @ptrCast(@alignCast(handle));
+    col.deinit(alloc);
+    alloc.destroy(col);
+}
+
+/// Append a vector (dims floats).
+export fn turbodb_vector_append(handle: *anyopaque, data: [*]const f32, dims: u32) c_int {
+    const col: *vector.VectorColumn = @ptrCast(@alignCast(handle));
+    col.append(alloc, data[0..dims]) catch return -1;
+    return 0;
+}
+
+/// Search for top-K similar vectors. Results written to out_indices/out_scores.
+/// metric: 0=cosine, 1=dot_product, 2=l2. Returns actual result count.
+export fn turbodb_vector_search(
+    handle: *anyopaque,
+    query: [*]const f32,
+    dims: u32,
+    k: u32,
+    metric: u8,
+    out_indices: [*]u32,
+    out_scores: [*]f32,
+) c_int {
+    const col: *const vector.VectorColumn = @ptrCast(@alignCast(handle));
+    const m: vector.Metric = switch (metric) {
+        0 => .cosine,
+        1 => .dot_product,
+        2 => .l2,
+        else => return -1,
+    };
+    const results = col.search(alloc, query[0..dims], k, m) catch return -1;
+    defer alloc.free(results);
+    for (results, 0..) |r, i| {
+        out_indices[i] = r.index;
+        out_scores[i] = r.score;
+    }
+    return @intCast(results.len);
+}
+
+/// Get vector count.
+export fn turbodb_vector_count(handle: *anyopaque) u32 {
+    const col: *const vector.VectorColumn = @ptrCast(@alignCast(handle));
+    return col.count;
 }
