@@ -1,4 +1,33 @@
 
+AUTHOR EXCEPTION — ADDITIONAL PERMISSIONS UNDER SSPL SECTION 7
+══════════════════════════════════════════════════════════════════
+
+As the sole copyright holder of TurboDB, Rach Pradhan (GitHub: justrach)
+hereby grants the following irrevocable, perpetual, worldwide, royalty-free
+exception to the Server Side Public License, Version 1 below:
+
+  Rach Pradhan, the justrach GitHub organization, and any software,
+  products, services, or companies created or owned by Rach Pradhan
+  ("Exempted Parties") are permanently and unconditionally exempt from
+  the requirements of Section 13 ("Offering the Program as a Service")
+  of the SSPL v1.
+
+  Exempted Parties may use, run, host, deploy, and offer TurboDB or any
+  modified version as a service — including commercially — in production
+  without any obligation to publish or make available the corresponding
+  source code of surrounding infrastructure or application code.
+
+  All other rights and obligations under the SSPL v1 (sections 0–12 and
+  14–17) continue to apply to all parties including Exempted Parties.
+
+  This exception is granted under SSPL section 7 ("Additional Terms")
+  and takes effect immediately upon publication of this file.
+
+All other licensees (any individual or entity that is not an Exempted
+Party) remain subject to the full and unmodified SSPL v1 terms below.
+
+══════════════════════════════════════════════════════════════════
+
                     Server Side Public License
                     VERSION 1, OCTOBER 16, 2018
 
