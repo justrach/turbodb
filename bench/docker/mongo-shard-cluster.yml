@@ -1,0 +1,104 @@
+version: "3.9"
+
+networks:
+  mongo-shard-net:
+    driver: bridge
+
+volumes:
+  configsvr1_data:
+  shard1_data:
+  shard2_data:
+
+services:
+  configsvr1:
+    image: mongo:7.0
+    container_name: configsvr1
+    hostname: configsvr1
+    command: mongod --configsvr --replSet configrs --port 27019 --bind_ip_all
+    ports:
+      - "27019:27019"
+    volumes:
+      - configsvr1_data:/data/configdb
+    networks:
+      - mongo-shard-net
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "mongosh", "--port", "27019", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  shard1:
+    image: mongo:7.0
+    container_name: shard1
+    hostname: shard1
+    command: mongod --shardsvr --replSet shard1rs --port 27018 --bind_ip_all
+    ports:
+      - "27018:27018"
+    volumes:
+      - shard1_data:/data/db
+    networks:
+      - mongo-shard-net
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "mongosh", "--port", "27018", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  shard2:
+    image: mongo:7.0
+    container_name: shard2
+    hostname: shard2
+    command: mongod --shardsvr --replSet shard2rs --port 27028 --bind_ip_all
+    ports:
+      - "27028:27028"
+    volumes:
+      - shard2_data:/data/db
+    networks:
+      - mongo-shard-net
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+    healthcheck:
+      test: ["CMD", "mongosh", "--port", "27028", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+
+  mongos:
+    image: mongo:7.0
+    container_name: mongos
+    hostname: mongos
+    command: mongos --configdb configrs/configsvr1:27019 --port 27020 --bind_ip_all
+    ports:
+      - "27020:27020"
+    networks:
+      - mongo-shard-net
+    depends_on:
+      configsvr1:
+        condition: service_healthy
+      shard1:
+        condition: service_healthy
+      shard2:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 1G
+    healthcheck:
+      test: ["CMD", "mongosh", "--port", "27020", "--eval", "db.adminCommand('ping')"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s

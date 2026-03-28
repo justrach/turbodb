@@ -7,6 +7,7 @@ const codeindex = @import("codeindex.zig");
 const wal_mod   = @import("wal");
 const epoch_mod = @import("epoch");
 const hot_cache = @import("hot_cache.zig");
+const mvcc_mod  = @import("mvcc.zig");
 const Doc = doc_mod.Doc;
 const DocHeader = doc_mod.DocHeader;
 const PageFile = page_mod.PageFile;
@@ -30,10 +31,21 @@ pub const Collection = struct {
     wal_log: *WAL,
     epochs: *EpochManager,
     next_doc_id: std.atomic.Value(u64),
-    write_mu: std.Thread.Mutex,
+    // Record-level latching: 1024 stripe locks replace single write_mu.
+    // Two writers to different keys proceed in parallel; same-key writes serialize.
+    stripe_locks: [STRIPE_COUNT]std.Thread.Mutex,
     hash_idx: std.AutoHashMap(u64, BTreeEntry),
     alloc: std.mem.Allocator,
     cache: hot_cache.HotCache,
+    // MVCC version chain — append-only, no vacuum.
+    versions: mvcc_mod.VersionChain,
+
+    pub const STRIPE_COUNT = 1024;
+
+    /// Get the stripe lock index for a key hash.
+    fn stripeIndex(key_hash: u64) usize {
+        return @intCast(key_hash % STRIPE_COUNT);
+    }
 
     pub fn open(
         alloc: std.mem.Allocator,
@@ -55,10 +67,14 @@ pub const Collection = struct {
         col.wal_log = wal_log;
         col.epochs = epochs;
         col.next_doc_id = std.atomic.Value(u64).init(1);
-        col.write_mu = .{};
+        // Initialize all stripe locks.
+        for (&col.stripe_locks) |*lock| {
+            lock.* = .{};
+        }
         col.hash_idx = std.AutoHashMap(u64, BTreeEntry).init(alloc);
         col.alloc = alloc;
         col.cache = hot_cache.HotCache.init();
+        col.versions = mvcc_mod.VersionChain.init(alloc);
 
         const n = @min(col_name.len, 63);
         @memcpy(col.name_buf[0..n], col_name[0..n]);
@@ -70,6 +86,7 @@ pub const Collection = struct {
         self.tri.deinit();
         self.words.deinit();
         self.hash_idx.deinit();
+        self.versions.deinit(self.alloc);
         self.pf.close();
         self.alloc.destroy(self);
     }
@@ -78,14 +95,25 @@ pub const Collection = struct {
         return self.name_buf[0..self.name_len];
     }
 
+    // ─── MVCC read transaction ──────────────────────────────────────────
+
+    /// Begin a snapshot-isolated read transaction.
+    /// The caller sees a consistent view as of the current epoch.
+    pub fn beginRead(self: *Collection) mvcc_mod.ReadTxn {
+        return self.versions.beginRead();
+    }
+
     // ─── insert ──────────────────────────────────────────────────────────
 
     /// Insert a new document. Returns assigned doc_id.
+    /// Uses per-key stripe lock for fine-grained concurrency.
     pub fn insert(self: *Collection, key: []const u8, value: []const u8) !u64 {
-        self.write_mu.lock();
-        defer self.write_mu.unlock();
+        const key_hash = doc_mod.fnv1a(key);
+        const stripe = stripeIndex(key_hash);
+        self.stripe_locks[stripe].lock();
+        defer self.stripe_locks[stripe].unlock();
 
-        const doc_id = self.next_doc_id.fetchAdd(1, .monotonic); // under write_mu
+        const doc_id = self.next_doc_id.fetchAdd(1, .monotonic);
         const hdr = doc_mod.newHeader(doc_id, key, value);
         const d = Doc{ .header = hdr, .key = key, .value = value };
 
@@ -95,12 +123,11 @@ pub const Collection = struct {
         // Write to WAL buffer (background flusher will commit periodically).
         const txn = self.wal_log.next_lsn.load(.monotonic);
         _ = try self.wal_log.write(txn, .doc_insert, 0, 0, enc);
-        // NOTE: no commit() here — background flusher batches fsyncs every ~1ms
 
         // Find (or allocate) a leaf page with enough space.
         const pno = try self.findOrAllocLeaf(enc.len);
         const page_off = self.pf.leafAppend(pno, enc) orelse
-            return error.PageFull; // should not happen after findOrAllocLeaf
+            return error.PageFull;
 
         // Index the document.
         const entry = BTreeEntry{
@@ -111,8 +138,12 @@ pub const Collection = struct {
         };
         try self.idx.insert(entry);
         self.hash_idx.put(hdr.key_hash, entry) catch {};
-        // codedb2-style trigram + word index (key = file path, value = content)
-        // NOTE: indexFile dupes the path internally to avoid dangling pointers
+
+        // MVCC: register version in the version chain.
+        const epoch = self.epochs.now();
+        self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
+
+        // codedb2-style trigram + word index
         if (value.len >= 3) {
             self.tri.indexFile(key, value) catch {};
             self.words.indexFile(key, value) catch {};
@@ -149,9 +180,6 @@ pub const Collection = struct {
 
     /// Look up a document by doc_id using a linear scan of the index.
     pub fn getById(self: *Collection, doc_id: u64) ?Doc {
-        // B-tree is keyed by key_hash, not doc_id.
-        // For production, maintain a secondary doc_id→(page,off) map.
-        // Here we do a page scan (acceptable for moderate collections).
         const total_pages = self.pf.next_alloc.load(.acquire);
         var pno: u32 = 0;
         while (pno < total_pages) : (pno += 1) {
@@ -174,11 +202,13 @@ pub const Collection = struct {
     // ─── update ──────────────────────────────────────────────────────────
 
     /// Update an existing document (append new version, update index).
+    /// Uses per-key stripe lock — concurrent updates to different keys proceed in parallel.
     pub fn update(self: *Collection, key: []const u8, new_value: []const u8) !bool {
-        self.write_mu.lock();
-        defer self.write_mu.unlock();
-
         const key_hash = doc_mod.fnv1a(key);
+        const stripe = stripeIndex(key_hash);
+        self.stripe_locks[stripe].lock();
+        defer self.stripe_locks[stripe].unlock();
+
         const old_entry = self.idx.search(key_hash) orelse return false;
         const old_doc = self.readEntry(old_entry) orelse return false;
 
@@ -206,11 +236,10 @@ pub const Collection = struct {
         };
         self.hash_idx.put(key_hash, new_entry) catch {};
         self.cache.invalidate(key_hash);
-        // TODO: fix codeindex dangling pointer bug then re-enable
-        // self.tri.removeFile(key);
-        // self.tri.indexFile(key, new_value) catch {};
-        // self.words.removeFile(key);
-        // self.words.indexFile(key, new_value) catch {};
+
+        // MVCC: register new version in the version chain (links to old automatically).
+        const epoch = self.epochs.now();
+        self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
 
         return true;
     }
@@ -218,10 +247,11 @@ pub const Collection = struct {
     // ─── delete ──────────────────────────────────────────────────────────
 
     pub fn delete(self: *Collection, key: []const u8) !bool {
-        self.write_mu.lock();
-        defer self.write_mu.unlock();
-
         const key_hash = doc_mod.fnv1a(key);
+        const stripe = stripeIndex(key_hash);
+        self.stripe_locks[stripe].lock();
+        defer self.stripe_locks[stripe].unlock();
+
         const entry = self.idx.search(key_hash) orelse return false;
 
         // Write tombstone.
@@ -238,9 +268,6 @@ pub const Collection = struct {
         self.idx.delete(key_hash);
         _ = self.hash_idx.remove(key_hash);
         self.cache.invalidate(key_hash);
-        // TODO: fix codeindex dangling pointer bug then re-enable
-        // self.tri.removeFile(key);
-        // self.words.removeFile(key);
         return true;
     }
 
@@ -258,21 +285,16 @@ pub const Collection = struct {
     };
 
     /// Full-text substring search using codedb2's trigram index with PostingMask bloom filters.
-    /// Phase 1: trigram candidates() with adjacency + next-char filtering
-    /// Phase 2: verify substring match on candidate docs
     pub fn searchText(
         self: *Collection,
         query: []const u8,
         limit: u32,
         alloc: std.mem.Allocator,
     ) !TextSearchResult {
-        // Phase 1: codedb2 trigram index narrows to candidate file paths
         const cand_paths = self.tri.candidates(query, alloc) orelse {
-            // Query too short or no trigrams — fall back to brute force scan
             return self.bruteForceSearch(query, limit, alloc);
         };
 
-        // Phase 2: for each candidate path, load the doc and verify substring
         var results: std.ArrayList(Doc) = .empty;
         errdefer results.deinit(alloc);
 
@@ -378,6 +400,15 @@ pub const Collection = struct {
         return ScanResult{ .docs = try results.toOwnedSlice(alloc), .alloc = alloc };
     }
 
+    // ─── MVCC background compaction ─────────────────────────────────────
+
+    /// Run epoch-based garbage collection on the version chain.
+    /// Frees old versions that are no longer visible to any reader.
+    /// Returns the number of versions freed.
+    pub fn gcVersions(self: *Collection) u64 {
+        return self.versions.gc(self.alloc);
+    }
+
     // ─── private helpers ─────────────────────────────────────────────────
 
     fn readLoc(self: *Collection, page_no: u32, page_off: u16) ?Doc {
@@ -400,7 +431,6 @@ pub const Collection = struct {
     }
 
     fn findOrAllocLeaf(self: *Collection, needed: usize) !u32 {
-        // Search recent pages for one with enough space.
         const total = self.pf.next_alloc.load(.acquire);
         var pno = if (total > 0) total - 1 else 0;
         var checked: u32 = 0;

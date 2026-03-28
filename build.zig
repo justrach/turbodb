@@ -211,7 +211,67 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run native Zig benchmark");
     bench_step.dependOn(&bench_run.step);
 
-    // ── Test step ───────────────────────────────────────────────────────────
+    // ── Regression benchmark ────────────────────────────────────────────────
+    const regbench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench_regression.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    wireStorage(regbench_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+
+    const regbench_exe = b.addExecutable(.{
+        .name = "bench-regression",
+        .root_module = regbench_mod,
+    });
+    b.installArtifact(regbench_exe);
+
+    const regbench_run = b.addRunArtifact(regbench_exe);
+    regbench_run.step.dependOn(b.getInstallStep());
+    const regbench_step = b.step("bench-regression", "Run regression benchmark (all subsystems)");
+    regbench_step.dependOn(&regbench_run.step);
+
+    // ── Partition scaling benchmark ──────────────────────────────────────────
+    const partbench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench_partition.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    wireStorage(partbench_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+
+    const partbench_exe = b.addExecutable(.{
+        .name = "bench-partition",
+        .root_module = partbench_mod,
+    });
+    b.installArtifact(partbench_exe);
+
+    const partbench_run = b.addRunArtifact(partbench_exe);
+    partbench_run.step.dependOn(b.getInstallStep());
+    const partbench_step = b.step("bench-partition", "Run partition scaling benchmark");
+    partbench_step.dependOn(&partbench_run.step);
+
+    // ── Test steps ──────────────────────────────────────────────────────────
+
+    // Helper: add a test module with storage imports
+    const addTestMod = struct {
+        fn f(b2: *std.Build, src: []const u8, tgt: std.Build.ResolvedTarget, opt: std.builtin.OptimizeMode, mm: *std.Build.Module, wl: *std.Build.Module, ep: *std.Build.Module, sl: *std.Build.Module) *std.Build.Step.Compile {
+            const mod = b2.createModule(.{
+                .root_source_file = b2.path(src),
+                .target = tgt,
+                .optimize = opt,
+            });
+            mod.addImport("mmap", mm);
+            mod.addImport("wal", wl);
+            mod.addImport("epoch", ep);
+            mod.addImport("seqlock", sl);
+            // Extract just the filename without path for the test name.
+            const basename = std.fs.path.stem(src);
+            return b2.addTest(.{ .name = basename, .root_module = mod });
+        }
+    }.f;
+
+    // Core tests (doc.zig)
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/doc.zig"),
         .target = target,
@@ -224,4 +284,39 @@ pub fn build(b: *std.Build) void {
     const run_tests = b.addRunArtifact(unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_tests.step);
+
+    // New subsystem tests — each standalone file has embedded tests.
+    const new_test_files = [_][]const u8{
+        "src/compression.zig",
+        "src/art.zig",
+        "src/query.zig",
+        "src/io_engine.zig",
+        "src/lsm.zig",
+        "src/partition.zig",
+        "src/columnar.zig",
+        "src/mvcc.zig",
+        "src/replication/sequencer.zig",
+        "src/replication/calvin.zig",
+        "src/replication/shard.zig",
+        "src/replication/router.zig",
+    };
+
+    const test_all_step = b.step("test-all", "Run all tests (core + new subsystems)");
+    test_all_step.dependOn(&run_tests.step);
+
+    for (new_test_files) |src| {
+        const t = addTestMod(b, src, target, optimize, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+        const run_t = b.addRunArtifact(t);
+        test_all_step.dependOn(&run_t.step);
+    }
+
+    // Also add collection test with storage imports
+    const col_test = addTestMod(b, "src/collection.zig", target, optimize, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+    const run_col_test = b.addRunArtifact(col_test);
+    test_all_step.dependOn(&run_col_test.step);
+
+    // Parallel WAL test
+    const pwal_test = addTestMod(b, "src/storage/parallel_wal.zig", target, optimize, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+    const run_pwal_test = b.addRunArtifact(pwal_test);
+    test_all_step.dependOn(&run_pwal_test.step);
 }

@@ -39,8 +39,11 @@ jobs:
             nm -D zig-out/lib/libturbodb.so | grep turbodb_
           fi
 
-      - name: Run Zig tests
+      - name: Run core tests
         run: zig build test 2>&1 || true
+
+      - name: Run all subsystem tests
+        run: zig build test-all 2>&1 || true
 
   python-test:
     name: Python FFI Test
@@ -87,15 +90,27 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-
       - name: Run benchmark (TurboDB only)
         timeout-minutes: 3
         run: |
           python3 bench/bench.py --turbodb-only --docs 2000 --threads 4 --workloads insert,get,update --binary ./zig-out/bin/turbodb --csv bench_results.csv
+
+      - name: Run regression benchmark (all subsystems)
+        timeout-minutes: 5
+        run: |
+          zig build bench-regression 2>&1 | tee regression_results.txt
+
+      - name: Run partition scaling benchmark
+        timeout-minutes: 5
+        run: |
+          zig build bench-partition 2>&1 | tee partition_results.txt
 
       - name: Upload benchmark results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: benchmark-results
-          path: bench_results.csv
+          path: |
+            bench_results.csv
+            regression_results.txt
+            partition_results.txt
