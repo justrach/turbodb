@@ -72,33 +72,41 @@ npm install turbodatabase     # Node.js
 
 | Subsystem | Throughput | Notes |
 |-----------|-----------|-------|
-| **Core GET** | **14.1M ops/s** | Zero-copy mmap read |
-| **Core INSERT** | **989K ops/s** | B-tree + WAL |
+| **Core GET** | **13.3M ops/s** | Zero-copy mmap read |
+| **Core INSERT** | **910K ops/s** | B-tree + WAL |
+| **Core Update** | **2.3M ops/s** | In-place mmap write |
+| **Core Delete** | **3.7M ops/s** | Tombstone + WAL |
 | **ART Search** | **19.0M ops/s** | Adaptive Radix Tree |
-| **Query Match** | **34.7M ops/s** | Predicate evaluation |
-| **Column Scan** | **950M ops/s** | Vectorized columnar |
-| **MVCC GC** | **48.9M ops/s** | Epoch-based reclamation |
-| **LZ4 Compress** | **768K ops/s** | 4KB blocks |
+| **ART Insert** | **8.7M ops/s** | Trie w/ path compression |
+| **Query Match** | **35.3M ops/s** | Predicate evaluation |
+| **Field Extract** | **43.5M ops/s** | Zero-alloc JSON scanner |
+| **Column Scan** | **1.02B ops/s** | Vectorized columnar |
+| **Column Filter** | **701M ops/s** | SIMD predicate pushdown |
+| **Column Append** | **302M ops/s** | Append-only columnar |
+| **MVCC Read** | **41.8M ops/s** | Snapshot isolation |
+| **MVCC GC** | **49.2M ops/s** | Epoch-based reclamation |
+| **LSM Get** | **19.1M ops/s** | Bloom filter + SSTable |
+| **LZ4 Compress** | **758K ops/s** | 4KB blocks |
+| **LZ4 Decompress** | **845K ops/s** | 4KB blocks |
 
-> Run `zig build bench-regression` for all 21 subsystem benchmarks.
+> 21 subsystem benchmarks. Run `zig build bench-regression` to reproduce.
 
 ### Partition scaling (in-process, hash partitioning)
 
-| Partitions | INSERT | GET | SCAN |
-|:----------:|-------:|----:|-----:|
-| 1 | 862K/s | 14.1M/s | 3.6M/s |
-| 2 | 937K/s | 13.3M/s | 1.6M/s |
-| 4 | 934K/s | 9.7M/s | 736K/s |
-| 8 | 930K/s | 10.5M/s | 414K/s |
-| 16 | 898K/s | 10.2M/s | 233K/s |
+| Partitions | INSERT | GET | SCAN | PAR_SCAN |
+|:----------:|-------:|----:|-----:|--------:|
+| 1 | 919K/s | 12.0M/s | 3.7M/s | 46K/s |
+| 2 | 912K/s | 10.4M/s | 1.6M/s | 26K/s |
+| 4 | 910K/s | 11.2M/s | 737K/s | 14K/s |
+| 8 | 947K/s | 12.3M/s | 422K/s | 7K/s |
+| 16 | 946K/s | 10.6M/s | 234K/s | 3K/s |
 
-> INSERT stays flat (~900K/s) — hash routing is near-zero overhead. Run `zig build bench-partition` or `bash bench/setup_shard_bench.sh` for the full cross-engine shard comparison.
+> INSERT stays flat (~920K/s) — FNV-1a hash routing is near-zero overhead. GET stays 10-12M across all partition counts. Run `zig build bench-partition` or `bash bench/setup_shard_bench.sh` for the full cross-engine shard comparison.
 
 - **Zero-copy**: `get()` returns a pointer directly into mmap'd memory — no deserialization
 - **FNV-1a 8-byte hash** vs MongoDB's 12-byte ObjectId — smaller index entries, better cache locality
 - **4KB page B-tree** — 3 levels handles 6.2M documents
 - **No BSON overhead** — compact binary format, zero-alloc JSON field scanner
-
 ## Quick Start
 
 ### Build from source
