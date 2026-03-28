@@ -1,0 +1,75 @@
+# TurboDB Calvin Replication — 3-node cluster
+# Uses pre-built turbodb-node image (zig build + docker build)
+#
+# Usage:
+#   docker compose -f bench/docker/calvin-cluster.yml up -d
+#   docker compose -f bench/docker/calvin-cluster.yml run --rm tester
+#   docker compose -f bench/docker/calvin-cluster.yml down -v
+
+services:
+  node-0:
+    image: turbodb-node:latest
+    command: ["--data", "/data", "--port", "27017", "--replicate", "--node-id", "0", "--leader", "--repl-port", "27117", "--peers", "node-1:27117,node-2:27117"]
+    ports:
+      - "27017:27017"
+    volumes:
+      - leader-data:/data
+    networks:
+      - calvin-net
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "27017"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  node-1:
+    image: turbodb-node:latest
+    command: ["--data", "/data", "--port", "27017", "--replicate", "--node-id", "1", "--repl-port", "27117"]
+    ports:
+      - "27018:27017"
+    volumes:
+      - replica1-data:/data
+    networks:
+      - calvin-net
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "27017"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  node-2:
+    image: turbodb-node:latest
+    command: ["--data", "/data", "--port", "27017", "--replicate", "--node-id", "2", "--repl-port", "27117"]
+    ports:
+      - "27019:27017"
+    volumes:
+      - replica2-data:/data
+    networks:
+      - calvin-net
+    healthcheck:
+      test: ["CMD", "nc", "-z", "localhost", "27017"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  tester:
+    image: turbodb-node:latest
+    entrypoint: ["test-calvin"]
+    networks:
+      - calvin-net
+    depends_on:
+      node-0:
+        condition: service_healthy
+      node-1:
+        condition: service_healthy
+      node-2:
+        condition: service_healthy
+
+volumes:
+  leader-data:
+  replica1-data:
+  replica2-data:
+
+networks:
+  calvin-net:
+    driver: bridge
