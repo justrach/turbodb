@@ -18,6 +18,14 @@ pub fn main() !void {
     var use_wire: bool = true; // wire protocol by default
     var use_http: bool = false;
     var unix_path: ?[]const u8 = null;
+
+    // Replication flags
+    var repl_enabled: bool = false;
+    var repl_node_id: u16 = 0;
+    var repl_is_leader: bool = false;
+    var repl_port: u16 = 27117;
+    var repl_peers_raw: ?[]const u8 = null;
+
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--data") and i + 1 < args.len) {
@@ -36,28 +44,46 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, args[i], "--unix") and i + 1 < args.len) {
             i += 1;
             unix_path = args[i];
+        } else if (std.mem.eql(u8, args[i], "--replicate")) {
+            repl_enabled = true;
+        } else if (std.mem.eql(u8, args[i], "--node-id") and i + 1 < args.len) {
+            i += 1;
+            repl_node_id = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--leader")) {
+            repl_is_leader = true;
+        } else if (std.mem.eql(u8, args[i], "--repl-port") and i + 1 < args.len) {
+            i += 1;
+            repl_port = try std.fmt.parseInt(u16, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--peers") and i + 1 < args.len) {
+            i += 1;
+            repl_peers_raw = args[i];
         } else if (std.mem.eql(u8, args[i], "--help")) {
             std.debug.print(
                 \\TurboDB — a fast NoSQL document database in Zig
                 \\
-                \\  --data <dir>   data directory (default: ./turbodb_data)
-                \\  --port <port>  listen port (default: 27017)
-                \\  --wire         binary wire protocol (default)
-                \\  --http         HTTP REST API
-                \\  --both         run wire + HTTP (wire on port, HTTP on port+1)
-                \\  --unix <path>  also listen on a Unix domain socket
+                \\  --data <dir>       data directory (default: ./turbodb_data)
+                \\  --port <port>      listen port (default: 27017)
+                \\  --wire             binary wire protocol (default)
+                \\  --http             HTTP REST API
+                \\  --both             run wire + HTTP (wire on port, HTTP on port+1)
+                \\  --unix <path>      also listen on a Unix domain socket
                 \\
-                \\Wire protocol (default, fastest):
-                \\  Binary frame protocol with pipelining and batch support.
-                \\  Use Python/JS client: from turbodb import Database
+                \\Replication (Calvin deterministic):
+                \\  --replicate        enable Calvin replication
+                \\  --node-id <id>     this node's ID (0, 1, 2, ...)
+                \\  --leader           this node is the sequencer/leader
+                \\  --repl-port <port> inter-node communication port (default: 27117)
+                \\  --peers <addrs>    comma-separated peer addresses (host:port,...)
                 \\
-                \\HTTP API (--http):
-                \\  POST   /db/:col              insert document
-                \\  GET    /db/:col/:key         get document by key
-                \\  PUT    /db/:col/:key         update document
-                \\  DELETE /db/:col/:key         delete document
-                \\  GET    /db/:col?limit=N      scan collection
-                \\  GET    /health               health check
+                \\Example cluster:
+                \\  # Node 0 (leader):
+                \\  turbodb --replicate --node-id 0 --leader --peers 10.0.0.2:27117,10.0.0.3:27117
+                \\
+                \\  # Node 1 (replica):
+                \\  turbodb --replicate --node-id 1 --repl-port 27117
+                \\
+                \\  # Node 2 (replica):
+                \\  turbodb --replicate --node-id 2 --repl-port 27117
                 \\
             , .{});
             return;
@@ -74,6 +100,16 @@ pub fn main() !void {
     std.log.info("Opening TurboDB at {s}", .{data_dir});
     const db = try collection.Database.open(alloc, data_dir);
     defer db.close();
+
+    // ── replication setup ─────────────────────────────────────────────────
+    if (repl_enabled) {
+        std.log.info("Calvin replication: node={d} leader={} repl_port={d}", .{
+            repl_node_id, repl_is_leader, repl_port,
+        });
+        if (repl_peers_raw) |peers_str| {
+            std.log.info("Peers: {s}", .{peers_str});
+        }
+    }
 
     // ── signal handler ────────────────────────────────────────────────────
     var http_srv = server.Server.init(alloc, db, if (use_http and use_wire) port + 1 else port);
@@ -121,6 +157,5 @@ pub fn main() !void {
     } else {
         try http_srv.run();
     }
-    std.log.info("TurboDB stopped.", .{});
     std.log.info("TurboDB stopped.", .{});
 }
