@@ -295,6 +295,7 @@ pub fn build(b: *std.Build) void {
         "src/partition.zig",
         "src/columnar.zig",
         "src/mvcc.zig",
+        "src/crypto.zig",
         "src/replication/sequencer.zig",
         "src/replication/calvin.zig",
         "src/replication/shard.zig",

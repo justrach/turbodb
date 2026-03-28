@@ -145,6 +145,66 @@ _lib.turbodb_scan_free.restype = None
 _lib.turbodb_version.argtypes = []
 _lib.turbodb_version.restype = ctypes.c_char_p
 
+# turbodb_search(col, query, query_len, limit, out) -> c_int
+_lib.turbodb_search.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+    ctypes.c_uint32, ctypes.POINTER(ScanHandle),
+]
+_lib.turbodb_search.restype = ctypes.c_int
+
+# ── Crypto ───────────────────────────────────────────────────────────────────
+
+# turbodb_sha256(data, len, out)
+_lib.turbodb_sha256.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p]
+_lib.turbodb_sha256.restype = None
+
+# turbodb_sha256_hex(data, len, out)
+_lib.turbodb_sha256_hex.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p]
+_lib.turbodb_sha256_hex.restype = None
+
+# turbodb_sha512(data, len, out)
+_lib.turbodb_sha512.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p]
+_lib.turbodb_sha512.restype = None
+
+# turbodb_blake3(data, len, out)
+_lib.turbodb_blake3.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p]
+_lib.turbodb_blake3.restype = None
+
+# turbodb_blake3_hex(data, len, out)
+_lib.turbodb_blake3_hex.argtypes = [ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p]
+_lib.turbodb_blake3_hex.restype = None
+
+# turbodb_hmac_sha256(key, klen, data, dlen, out)
+_lib.turbodb_hmac_sha256.argtypes = [
+    ctypes.c_char_p, ctypes.c_size_t,
+    ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p,
+]
+_lib.turbodb_hmac_sha256.restype = None
+
+# turbodb_hmac_sha256_hex(key, klen, data, dlen, out)
+_lib.turbodb_hmac_sha256_hex.argtypes = [
+    ctypes.c_char_p, ctypes.c_size_t,
+    ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p,
+]
+_lib.turbodb_hmac_sha256_hex.restype = None
+
+# turbodb_ed25519_keygen(pub_out, sec_out)
+_lib.turbodb_ed25519_keygen.argtypes = [ctypes.c_char_p, ctypes.c_char_p]
+_lib.turbodb_ed25519_keygen.restype = None
+
+# turbodb_ed25519_sign(msg, msg_len, sk, sig_out)
+_lib.turbodb_ed25519_sign.argtypes = [
+    ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_char_p,
+]
+_lib.turbodb_ed25519_sign.restype = None
+
+# turbodb_ed25519_verify(msg, msg_len, sig, pk) -> c_int
+_lib.turbodb_ed25519_verify.argtypes = [
+    ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_char_p,
+]
+_lib.turbodb_ed25519_verify.restype = ctypes.c_int
+
+
 
 # ── Public low-level API ────────────────────────────────────────────────────
 

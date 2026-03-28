@@ -29,9 +29,10 @@ Usage::
 
 from . import _ffi
 import json
+import ctypes
 
 __version__ = _ffi.version()
-__all__ = ["Database", "Collection", "__version__"]
+__all__ = ["Database", "Collection", "crypto", "__version__"]
 
 
 class Collection:
@@ -139,3 +140,96 @@ class Database:
 
     def __repr__(self):
         return f"Database('{self._path}')"
+
+
+# ── Crypto module ────────────────────────────────────────────────────────────
+# Zero-dependency cryptographic functions powered by Zig's std.crypto.
+# No OpenSSL, no pip install — just call them.
+
+class crypto:
+    """Cryptographic primitives via TurboDB's Zig core.
+
+    Usage::
+
+        from turbodb import crypto
+
+        h = crypto.sha256(b"hello")        # bytes (32)
+        h = crypto.sha256_hex(b"hello")    # "2cf24dba..."
+        h = crypto.blake3(b"hello")        # bytes (32)
+        h = crypto.blake3_hex(b"hello")    # hex string
+        h = crypto.hmac_sha256(key, data)  # bytes (32)
+
+        pub, sec = crypto.ed25519_keygen()
+        sig = crypto.ed25519_sign(b"msg", sec)
+        assert crypto.ed25519_verify(b"msg", sig, pub)
+    """
+
+    @staticmethod
+    def sha256(data: bytes) -> bytes:
+        """SHA-256 hash (32 bytes)."""
+        out = ctypes.create_string_buffer(32)
+        _ffi._lib.turbodb_sha256(data, len(data), out)
+        return out.raw
+
+    @staticmethod
+    def sha256_hex(data: bytes) -> str:
+        """SHA-256 hash as hex string (64 chars)."""
+        out = ctypes.create_string_buffer(64)
+        _ffi._lib.turbodb_sha256_hex(data, len(data), out)
+        return out.raw.decode("ascii")
+
+    @staticmethod
+    def sha512(data: bytes) -> bytes:
+        """SHA-512 hash (64 bytes)."""
+        out = ctypes.create_string_buffer(64)
+        _ffi._lib.turbodb_sha512(data, len(data), out)
+        return out.raw
+
+    @staticmethod
+    def blake3(data: bytes) -> bytes:
+        """BLAKE3 hash (32 bytes). Faster than SHA-256."""
+        out = ctypes.create_string_buffer(32)
+        _ffi._lib.turbodb_blake3(data, len(data), out)
+        return out.raw
+
+    @staticmethod
+    def blake3_hex(data: bytes) -> str:
+        """BLAKE3 hash as hex string (64 chars)."""
+        out = ctypes.create_string_buffer(64)
+        _ffi._lib.turbodb_blake3_hex(data, len(data), out)
+        return out.raw.decode("ascii")
+
+    @staticmethod
+    def hmac_sha256(key: bytes, data: bytes) -> bytes:
+        """HMAC-SHA256 (32 bytes). Use for API key derivation, webhooks."""
+        out = ctypes.create_string_buffer(32)
+        _ffi._lib.turbodb_hmac_sha256(key, len(key), data, len(data), out)
+        return out.raw
+
+    @staticmethod
+    def hmac_sha256_hex(key: bytes, data: bytes) -> str:
+        """HMAC-SHA256 as hex string (64 chars)."""
+        out = ctypes.create_string_buffer(64)
+        _ffi._lib.turbodb_hmac_sha256_hex(key, len(key), data, len(data), out)
+        return out.raw.decode("ascii")
+
+    @staticmethod
+    def ed25519_keygen() -> tuple:
+        """Generate Ed25519 keypair. Returns (public_key: bytes, secret_key: bytes)."""
+        pub = ctypes.create_string_buffer(32)
+        sec = ctypes.create_string_buffer(64)
+        _ffi._lib.turbodb_ed25519_keygen(pub, sec)
+        return pub.raw, sec.raw
+
+    @staticmethod
+    def ed25519_sign(message: bytes, secret_key: bytes) -> bytes:
+        """Sign a message with Ed25519. Returns 64-byte signature."""
+        sig = ctypes.create_string_buffer(64)
+        _ffi._lib.turbodb_ed25519_sign(message, len(message), secret_key, sig)
+        return sig.raw
+
+    @staticmethod
+    def ed25519_verify(message: bytes, signature: bytes, public_key: bytes) -> bool:
+        """Verify an Ed25519 signature. Returns True if valid."""
+        rc = _ffi._lib.turbodb_ed25519_verify(message, len(message), signature, public_key)
+        return rc == 0

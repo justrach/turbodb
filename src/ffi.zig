@@ -9,6 +9,7 @@
 const std = @import("std");
 const collection = @import("collection.zig");
 const doc_mod = @import("doc.zig");
+const crypto = @import("crypto.zig");
 const Database = collection.Database;
 const Collection = collection.Collection;
 const Doc = doc_mod.Doc;
@@ -217,4 +218,40 @@ export fn turbodb_search(
 
 export fn turbodb_version() [*:0]const u8 {
     return "0.1.0";
+}
+
+// ── Crypto ──────────────────────────────────────────────────────────────────
+// SHA-256, SHA-512, BLAKE3, HMAC-SHA256, Ed25519.
+
+export fn turbodb_sha256(data: [*]const u8, len: usize, out: *[32]u8) void {
+    out.* = crypto.sha256(data[0..len]);
+}
+export fn turbodb_sha256_hex(data: [*]const u8, len: usize, out: *[64]u8) void {
+    out.* = crypto.sha256Hex(data[0..len]);
+}
+export fn turbodb_sha512(data: [*]const u8, len: usize, out: *[64]u8) void {
+    out.* = crypto.sha512(data[0..len]);
+}
+export fn turbodb_blake3(data: [*]const u8, len: usize, out: *[32]u8) void {
+    out.* = crypto.blake3(data[0..len]);
+}
+export fn turbodb_blake3_hex(data: [*]const u8, len: usize, out: *[64]u8) void {
+    out.* = crypto.blake3Hex(data[0..len]);
+}
+export fn turbodb_hmac_sha256(key: [*]const u8, klen: usize, data: [*]const u8, dlen: usize, out: *[32]u8) void {
+    out.* = crypto.hmacSha256(key[0..klen], data[0..dlen]);
+}
+export fn turbodb_hmac_sha256_hex(key: [*]const u8, klen: usize, data: [*]const u8, dlen: usize, out: *[64]u8) void {
+    out.* = crypto.hmacSha256Hex(key[0..klen], data[0..dlen]);
+}
+export fn turbodb_ed25519_keygen(pub_out: *[32]u8, sec_out: *[64]u8) void {
+    const kp = crypto.KeyPair.generate();
+    pub_out.* = kp.public_key;
+    sec_out.* = kp.secret_key;
+}
+export fn turbodb_ed25519_sign(msg: [*]const u8, msg_len: usize, sk: *const [64]u8, sig: *[64]u8) void {
+    sig.* = crypto.ed25519Sign(msg[0..msg_len], sk.*);
+}
+export fn turbodb_ed25519_verify(msg: [*]const u8, msg_len: usize, sig: *const [64]u8, pk: *const [32]u8) c_int {
+    return if (crypto.ed25519Verify(msg[0..msg_len], sig.*, pk.*)) 0 else -1;
 }
