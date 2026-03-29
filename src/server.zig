@@ -136,7 +136,7 @@ pub const Server = struct {
 
     fn recordQueryCost(self: *Server, tenant_id: []const u8, op: []const u8, rows_scanned: usize, bytes_read: usize, start_ns: i128) void {
         const elapsed_ns = std.time.nanoTimestamp() - start_ns;
-        const cpu_us: u64 = @intCast(@max(elapsed_ns / 1000, 0));
+        const cpu_us: u64 = @intCast(@max(@divTrunc(elapsed_ns, 1000), 0));
         const cost_nanos_usd: u64 = cpu_us * 5 + @as(u64, @intCast(rows_scanned)) + @as(u64, @intCast(bytes_read / 1024));
 
         _ = self.query_count.fetchAdd(1, .monotonic);
@@ -313,7 +313,10 @@ fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []c
         const start_ns = std.time.nanoTimestamp();
         srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
         const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
-        const d = if (as_of) |ts_ms| col.getAsOfTimestamp(key, ts_ms) else col.get(key) orelse return err(404, "not found");
+        const d = if (as_of) |ts_ms|
+            (col.getAsOfTimestamp(key, ts_ms) orelse return err(404, "not found"))
+        else
+            (col.get(key) orelse return err(404, "not found"));
         srv.recordQueryCost(tenant_id, "get", 1, d.key.len + d.value.len, start_ns);
 
         // Write JSON body directly into resp_buf at offset 256 (reserve space for headers)
@@ -432,7 +435,7 @@ fn handleListCollections(srv: *Server, tenant_id: []const u8, alloc: std.mem.All
     var cols = srv.db.listCollectionsForTenant(tenant_id, alloc) catch return err(500, "list collections failed");
     defer {
         for (cols.items) |name| alloc.free(name);
-        cols.deinit();
+        cols.deinit(alloc);
     }
     var fbs = std.io.fixedBufferStream(getBodyBuf());
     const w = fbs.writer();
