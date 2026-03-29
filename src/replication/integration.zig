@@ -29,10 +29,16 @@ const PeerReceiver = peer.PeerReceiver;
 pub const DBOps = struct {
     /// fn(db: *anyopaque, col_name: []const u8, key: []const u8, value: []const u8) -> ?u64
     insert_fn: ?*const fn (*anyopaque, []const u8, []const u8, []const u8) ?u64 = null,
+    /// fn(db: *anyopaque, branch_name: []const u8, col_name: []const u8, key: []const u8, value: []const u8) -> ?u64
+    insert_branch_fn: ?*const fn (*anyopaque, []const u8, []const u8, []const u8, []const u8) ?u64 = null,
     /// fn(db: *anyopaque, col_name: []const u8, key: []const u8, value: []const u8) -> bool
     update_fn: ?*const fn (*anyopaque, []const u8, []const u8, []const u8) bool = null,
+    /// fn(db: *anyopaque, branch_name: []const u8, col_name: []const u8, key: []const u8, value: []const u8) -> bool
+    update_branch_fn: ?*const fn (*anyopaque, []const u8, []const u8, []const u8, []const u8) bool = null,
     /// fn(db: *anyopaque, col_name: []const u8, key: []const u8) -> bool
     delete_fn: ?*const fn (*anyopaque, []const u8, []const u8) bool = null,
+    /// fn(db: *anyopaque, branch_name: []const u8, col_name: []const u8, key: []const u8) -> bool
+    delete_branch_fn: ?*const fn (*anyopaque, []const u8, []const u8, []const u8) bool = null,
 };
 
 /// FNV-1a hash (duplicated here to avoid cross-module import of doc.zig).
@@ -103,6 +109,7 @@ pub const ReplicatedDB = struct {
             // Set global state for the executor callback
             g_db_handle = self.db_handle;
             g_ops = self.ops;
+            mgr.setBatchReadyHook(self, leaderBatchReady);
 
             try mgr.start();
 
@@ -128,12 +135,17 @@ pub const ReplicatedDB = struct {
 
     /// Insert a document. If replicated, submits to sequencer; otherwise direct.
     pub fn insert(self: *ReplicatedDB, col_name: []const u8, key: []const u8, value: []const u8) ?u64 {
+        return self.insertOnBranch("", col_name, key, value);
+    }
+
+    /// Insert a document into a branch-aware replica stream.
+    pub fn insertOnBranch(self: *ReplicatedDB, branch_name: []const u8, col_name: []const u8, key: []const u8, value: []const u8) ?u64 {
         if (self.repl_mgr) |*mgr| {
             const key_hash = fnv1a(key);
             const partition: u16 = @intCast(key_hash % 256);
 
             var data_buf: [4096]u8 = undefined;
-            const data_len = packTxnData(&data_buf, col_name, key, value);
+            const data_len = packTxnData(&data_buf, branch_name, col_name, key, value);
 
             const data = self.alloc.alloc(u8, data_len) catch return null;
             @memcpy(data, data_buf[0..data_len]);
@@ -150,6 +162,7 @@ pub const ReplicatedDB = struct {
                 .data = data,
                 .read_set = &.{},
                 .write_set = ws,
+                .owns_buffers = true,
             };
 
             mgr.submit(txn) catch return null;
@@ -157,18 +170,26 @@ pub const ReplicatedDB = struct {
         }
 
         // Direct path
+        if (branch_name.len > 0) {
+            if (self.ops.insert_branch_fn) |f| return f(self.db_handle, branch_name, col_name, key, value);
+        }
         if (self.ops.insert_fn) |f| return f(self.db_handle, col_name, key, value);
         return null;
     }
 
     /// Update a document.
     pub fn update(self: *ReplicatedDB, col_name: []const u8, key: []const u8, value: []const u8) bool {
+        return self.updateOnBranch("", col_name, key, value);
+    }
+
+    /// Update a document in a named branch.
+    pub fn updateOnBranch(self: *ReplicatedDB, branch_name: []const u8, col_name: []const u8, key: []const u8, value: []const u8) bool {
         if (self.repl_mgr) |*mgr| {
             const key_hash = fnv1a(key);
             const partition: u16 = @intCast(key_hash % 256);
 
             var data_buf: [4096]u8 = undefined;
-            const data_len = packTxnData(&data_buf, col_name, key, value);
+            const data_len = packTxnData(&data_buf, branch_name, col_name, key, value);
 
             const data = self.alloc.alloc(u8, data_len) catch return false;
             @memcpy(data, data_buf[0..data_len]);
@@ -184,24 +205,33 @@ pub const ReplicatedDB = struct {
                 .data = data,
                 .read_set = &.{},
                 .write_set = ws,
+                .owns_buffers = true,
             };
 
             mgr.submit(txn) catch return false;
             return true;
         }
 
+        if (branch_name.len > 0) {
+            if (self.ops.update_branch_fn) |f| return f(self.db_handle, branch_name, col_name, key, value);
+        }
         if (self.ops.update_fn) |f| return f(self.db_handle, col_name, key, value);
         return false;
     }
 
     /// Delete a document.
     pub fn delete(self: *ReplicatedDB, col_name: []const u8, key: []const u8) bool {
+        return self.deleteOnBranch("", col_name, key);
+    }
+
+    /// Delete a document in a named branch.
+    pub fn deleteOnBranch(self: *ReplicatedDB, branch_name: []const u8, col_name: []const u8, key: []const u8) bool {
         if (self.repl_mgr) |*mgr| {
             const key_hash = fnv1a(key);
             const partition: u16 = @intCast(key_hash % 256);
 
             var data_buf: [256]u8 = undefined;
-            const data_len = packTxnData(&data_buf, col_name, key, "");
+            const data_len = packTxnData(&data_buf, branch_name, col_name, key, "");
 
             const data = self.alloc.alloc(u8, data_len) catch return false;
             @memcpy(data, data_buf[0..data_len]);
@@ -217,12 +247,16 @@ pub const ReplicatedDB = struct {
                 .data = data,
                 .read_set = &.{},
                 .write_set = ws,
+                .owns_buffers = true,
             };
 
             mgr.submit(txn) catch return false;
             return true;
         }
 
+        if (branch_name.len > 0) {
+            if (self.ops.delete_branch_fn) |f| return f(self.db_handle, branch_name, col_name, key);
+        }
         if (self.ops.delete_fn) |f| return f(self.db_handle, col_name, key);
         return false;
     }
@@ -239,10 +273,14 @@ pub const ReplicatedDB = struct {
 };
 
 // ── Transaction data packing ─────────────────────────────────────────────────
-// Format: [col_name_len:u8][col_name][key_len:u16 LE][key][value]
+// Format: [branch_len:u8][branch][col_name_len:u8][col_name][key_len:u16 LE][key][value]
 
-fn packTxnData(buf: []u8, col_name: []const u8, key: []const u8, value: []const u8) usize {
+fn packTxnData(buf: []u8, branch_name: []const u8, col_name: []const u8, key: []const u8, value: []const u8) usize {
     var pos: usize = 0;
+    buf[pos] = @intCast(branch_name.len);
+    pos += 1;
+    @memcpy(buf[pos..][0..branch_name.len], branch_name);
+    pos += branch_name.len;
     buf[pos] = @intCast(col_name.len);
     pos += 1;
     @memcpy(buf[pos..][0..col_name.len], col_name);
@@ -256,9 +294,14 @@ fn packTxnData(buf: []u8, col_name: []const u8, key: []const u8, value: []const 
     return pos;
 }
 
-fn unpackTxnData(data: []const u8) ?struct { col: []const u8, key: []const u8, val: []const u8 } {
-    if (data.len < 4) return null;
+fn unpackTxnData(data: []const u8) ?struct { branch: []const u8, col: []const u8, key: []const u8, val: []const u8 } {
+    if (data.len < 5) return null;
     var pos: usize = 0;
+    const branch_len: usize = data[pos];
+    pos += 1;
+    if (pos + branch_len > data.len) return null;
+    const branch = data[pos..][0..branch_len];
+    pos += branch_len;
     const col_len: usize = data[pos];
     pos += 1;
     if (pos + col_len > data.len) return null;
@@ -270,13 +313,46 @@ fn unpackTxnData(data: []const u8) ?struct { col: []const u8, key: []const u8, v
     if (pos + key_len > data.len) return null;
     const key = data[pos..][0..key_len];
     pos += key_len;
-    return .{ .col = col, .key = key, .val = data[pos..] };
+    return .{ .branch = branch, .col = col, .key = key, .val = data[pos..] };
 }
 
 // ── Transaction executor (called by CalvinExecutor) ──────────────────────────
 
 var g_db_handle: ?*anyopaque = null;
 var g_ops: DBOps = .{};
+
+const BranchCall = struct {
+    branch_buf: [64]u8 = [_]u8{0} ** 64,
+    branch_len: usize = 0,
+    col_buf: [64]u8 = [_]u8{0} ** 64,
+    col_len: usize = 0,
+    key_buf: [64]u8 = [_]u8{0} ** 64,
+    key_len: usize = 0,
+    value_buf: [256]u8 = [_]u8{0} ** 256,
+    value_len: usize = 0,
+
+    fn branch(self: *const BranchCall) []const u8 {
+        return self.branch_buf[0..self.branch_len];
+    }
+
+    fn col(self: *const BranchCall) []const u8 {
+        return self.col_buf[0..self.col_len];
+    }
+
+    fn key(self: *const BranchCall) []const u8 {
+        return self.key_buf[0..self.key_len];
+    }
+
+    fn value(self: *const BranchCall) []const u8 {
+        return self.value_buf[0..self.value_len];
+    }
+
+    fn setField(buf: []u8, len_out: *usize, input: []const u8) void {
+        const n = @min(buf.len, input.len);
+        @memcpy(buf[0..n], input[0..n]);
+        len_out.* = n;
+    }
+};
 
 fn executeTransaction(txn: *const Transaction) anyerror!void {
     const db = g_db_handle orelse return error.DatabaseNotInitialized;
@@ -285,11 +361,23 @@ fn executeTransaction(txn: *const Transaction) anyerror!void {
     switch (txn.txn_type) {
         .put => {
             // put = insert or update (same semantics: upsert)
+            if (parsed.branch.len > 0) {
+                if (g_ops.insert_branch_fn) |f| {
+                    _ = f(db, parsed.branch, parsed.col, parsed.key, parsed.val);
+                    return;
+                }
+            }
             if (g_ops.insert_fn) |f| {
                 _ = f(db, parsed.col, parsed.key, parsed.val);
             }
         },
         .delete => {
+            if (parsed.branch.len > 0) {
+                if (g_ops.delete_branch_fn) |f| {
+                    _ = f(db, parsed.branch, parsed.col, parsed.key);
+                    return;
+                }
+            }
             if (g_ops.delete_fn) |f| {
                 _ = f(db, parsed.col, parsed.key);
             }
@@ -298,13 +386,36 @@ fn executeTransaction(txn: *const Transaction) anyerror!void {
     }
 }
 
+fn leaderBatchReady(ctx: *anyopaque, batch: *const sequencer.Batch) anyerror!void {
+    const self: *ReplicatedDB = @ptrCast(@alignCast(ctx));
+
+    const buf = try self.alloc.alloc(u8, 1 << 20);
+    defer self.alloc.free(buf);
+
+    const len = try CalvinExecutor.serializeBatch(batch, buf);
+    self.sender.broadcast(buf[0..len]);
+    try self.repl_mgr.?.executor.executeBatch(batch, &executeTransaction);
+}
+
 // ── Tests ────────────────────────────────────────────────────────────────────
 
 test "packTxnData and unpackTxnData round-trip" {
     var buf: [256]u8 = undefined;
-    const len = packTxnData(&buf, "users", "alice", "{\"name\":\"Alice\"}");
+    const len = packTxnData(&buf, "", "users", "alice", "{\"name\":\"Alice\"}");
 
     const parsed = unpackTxnData(buf[0..len]).?;
+    try std.testing.expectEqual(@as(usize, 0), parsed.branch.len);
+    try std.testing.expectEqualStrings("users", parsed.col);
+    try std.testing.expectEqualStrings("alice", parsed.key);
+    try std.testing.expectEqualStrings("{\"name\":\"Alice\"}", parsed.val);
+}
+
+test "packTxnData preserves branch identity" {
+    var buf: [256]u8 = undefined;
+    const len = packTxnData(&buf, "feature-x", "users", "alice", "{\"name\":\"Alice\"}");
+
+    const parsed = unpackTxnData(buf[0..len]).?;
+    try std.testing.expectEqualStrings("feature-x", parsed.branch);
     try std.testing.expectEqualStrings("users", parsed.col);
     try std.testing.expectEqualStrings("alice", parsed.key);
     try std.testing.expectEqualStrings("{\"name\":\"Alice\"}", parsed.val);
@@ -312,7 +423,7 @@ test "packTxnData and unpackTxnData round-trip" {
 
 test "packTxnData empty value (delete)" {
     var buf: [256]u8 = undefined;
-    const len = packTxnData(&buf, "users", "alice", "");
+    const len = packTxnData(&buf, "", "users", "alice", "");
 
     const parsed = unpackTxnData(buf[0..len]).?;
     try std.testing.expectEqualStrings("users", parsed.col);
@@ -343,6 +454,32 @@ test "ReplicatedDB direct mode" {
     try std.testing.expectEqual(@as(u64, 0), rdb.replicationLag());
 }
 
+test "ReplicatedDB direct branch mode uses branch callback" {
+    const ops = DBOps{
+        .insert_branch_fn = struct {
+            fn f(db: *anyopaque, branch_name: []const u8, col_name: []const u8, key: []const u8, value: []const u8) ?u64 {
+                const seen: *BranchCall = @ptrCast(@alignCast(db));
+                BranchCall.setField(&seen.branch_buf, &seen.branch_len, branch_name);
+                BranchCall.setField(&seen.col_buf, &seen.col_len, col_name);
+                BranchCall.setField(&seen.key_buf, &seen.key_len, key);
+                BranchCall.setField(&seen.value_buf, &seen.value_len, value);
+                return 77;
+            }
+        }.f,
+    };
+
+    var seen = BranchCall{};
+    var rdb = try ReplicatedDB.init(std.testing.allocator, @ptrCast(&seen), ops, .{});
+    defer rdb.deinit();
+
+    const result = rdb.insertOnBranch("feature-x", "users", "alice", "{\"name\":\"Alice\"}");
+    try std.testing.expectEqual(@as(?u64, 77), result);
+    try std.testing.expectEqualStrings("feature-x", seen.branch());
+    try std.testing.expectEqualStrings("users", seen.col());
+    try std.testing.expectEqualStrings("alice", seen.key());
+    try std.testing.expectEqualStrings("{\"name\":\"Alice\"}", seen.value());
+}
+
 test "ReplicatedDB replicated mode submits to sequencer" {
     var dummy_db: u8 = 0;
     var rdb = try ReplicatedDB.init(std.testing.allocator, @ptrCast(&dummy_db), .{}, .{
@@ -357,6 +494,78 @@ test "ReplicatedDB replicated mode submits to sequencer" {
     try std.testing.expect(result != null);
     try std.testing.expect(result.? >= 1);
     try std.testing.expect(rdb.isLeader());
+}
+
+test "executeTransaction routes branch payloads to branch callbacks" {
+    const ops = DBOps{
+        .insert_branch_fn = struct {
+            fn f(db: *anyopaque, branch_name: []const u8, col_name: []const u8, key: []const u8, value: []const u8) ?u64 {
+                const seen: *BranchCall = @ptrCast(@alignCast(db));
+                BranchCall.setField(&seen.branch_buf, &seen.branch_len, branch_name);
+                BranchCall.setField(&seen.col_buf, &seen.col_len, col_name);
+                BranchCall.setField(&seen.key_buf, &seen.key_len, key);
+                BranchCall.setField(&seen.value_buf, &seen.value_len, value);
+                return 1;
+            }
+        }.f,
+    };
+
+    var seen = BranchCall{};
+    g_db_handle = @ptrCast(&seen);
+    g_ops = ops;
+
+    var buf: [256]u8 = undefined;
+    const len = packTxnData(&buf, "feature-x", "users", "alice", "{\"name\":\"Alice\"}");
+    const txn = Transaction{
+        .txn_id = 1,
+        .txn_type = .put,
+        .partition_id = 0,
+        .key_hash = fnv1a("alice"),
+        .data = buf[0..len],
+        .read_set = &.{},
+        .write_set = &.{},
+    };
+
+    try executeTransaction(&txn);
+    try std.testing.expectEqualStrings("feature-x", seen.branch());
+    try std.testing.expectEqualStrings("users", seen.col());
+    try std.testing.expectEqualStrings("alice", seen.key());
+    try std.testing.expectEqualStrings("{\"name\":\"Alice\"}", seen.value());
+}
+
+test "leader batch hook executes queued writes locally" {
+    const ops = DBOps{
+        .insert_fn = struct {
+            fn f(db: *anyopaque, col_name: []const u8, key: []const u8, value: []const u8) ?u64 {
+                const seen: *BranchCall = @ptrCast(@alignCast(db));
+                BranchCall.setField(&seen.col_buf, &seen.col_len, col_name);
+                BranchCall.setField(&seen.key_buf, &seen.key_len, key);
+                BranchCall.setField(&seen.value_buf, &seen.value_len, value);
+                return 1;
+            }
+        }.f,
+    };
+
+    var seen = BranchCall{};
+    var rdb = try ReplicatedDB.init(std.testing.allocator, @ptrCast(&seen), ops, .{
+        .enabled = true,
+        .node_id = 1,
+        .is_leader = true,
+    });
+    defer rdb.deinit();
+
+    g_db_handle = rdb.db_handle;
+    g_ops = rdb.ops;
+    try rdb.repl_mgr.?.executor.setLocalPartitions(&.{@as(u16, @intCast(fnv1a("alice") % 256))});
+
+    const txn_id = rdb.insert("users", "alice", "{\"name\":\"Alice\"}");
+    try std.testing.expect(txn_id != null);
+    var batch = (try rdb.repl_mgr.?.seq.drainBatch(std.testing.allocator)).?;
+    defer batch.deinitDeep(std.testing.allocator);
+    try leaderBatchReady(&rdb, &batch);
+    try std.testing.expectEqualStrings("users", seen.col());
+    try std.testing.expectEqualStrings("alice", seen.key());
+    try std.testing.expectEqualStrings("{\"name\":\"Alice\"}", seen.value());
 }
 
 test "fnv1a matches expected" {

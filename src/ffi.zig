@@ -72,6 +72,18 @@ export fn turbodb_collection(
     return @ptrCast(col);
 }
 
+export fn turbodb_collection_tenant(
+    db_handle: *anyopaque,
+    tenant: [*]const u8,
+    tenant_len: usize,
+    name: [*]const u8,
+    name_len: usize,
+) ?*anyopaque {
+    const db: *Database = @ptrCast(@alignCast(db_handle));
+    const col = db.collectionForTenant(tenant[0..tenant_len], name[0..name_len]) catch return null;
+    return @ptrCast(col);
+}
+
 /// Drop a named collection.
 export fn turbodb_drop_collection(
     db_handle: *anyopaque,
@@ -80,6 +92,17 @@ export fn turbodb_drop_collection(
 ) void {
     const db: *Database = @ptrCast(@alignCast(db_handle));
     db.dropCollection(name[0..name_len]);
+}
+
+export fn turbodb_drop_collection_tenant(
+    db_handle: *anyopaque,
+    tenant: [*]const u8,
+    tenant_len: usize,
+    name: [*]const u8,
+    name_len: usize,
+) void {
+    const db: *Database = @ptrCast(@alignCast(db_handle));
+    db.dropCollectionForTenant(tenant[0..tenant_len], name[0..name_len]);
 }
 
 // ── Document operations ─────────────────────────────────────────────────────

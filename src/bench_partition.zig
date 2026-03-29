@@ -4,6 +4,7 @@ const partition_mod = @import("partition.zig");
 const doc_mod = @import("doc.zig");
 const wal_mod = @import("wal");
 const epoch_mod = @import("epoch");
+const cdc_mod = @import("cdc.zig");
 
 const Collection = collection_mod.Collection;
 const Database = collection_mod.Database;
@@ -99,9 +100,12 @@ fn benchPartitionCount(n_partitions: u16) !void {
 
     // Init epoch manager
     var epochs = try EpochManager.init(alloc);
+    var cdc = cdc_mod.CDCManager.init(alloc);
+    defer cdc.deinit();
+    try cdc.start();
 
     // Open partitioned collection
-    const pc = try PartitionedCollection.open(alloc, data_dir, "bench", n_partitions, .hash, &wal_log, &epochs);
+    const pc = try PartitionedCollection.open(alloc, data_dir, "bench", n_partitions, .hash, &wal_log, &epochs, &cdc);
 
     const INSERT_OPS: usize = 100_000;
     const GET_OPS: usize = 100_000;

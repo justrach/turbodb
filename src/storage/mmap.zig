@@ -58,11 +58,11 @@ pub const MmapFile = struct {
     // ── Sync / Checkpoint ─────────────────────────────────────────────────────
 
     pub fn syncAsync(self: MmapFile) void {
-        posix.msync(@alignCast(self.ptr[0..self.capacity]), .{ .ASYNC = true }) catch {};
+        posix.msync(@alignCast(self.ptr[0..self.capacity]), posix.MSF.ASYNC) catch {};
     }
 
     pub fn syncSync(self: MmapFile) !void {
-        try posix.msync(@alignCast(self.ptr[0..self.capacity]), .{ .SYNC = true });
+        try posix.msync(@alignCast(self.ptr[0..self.capacity]), posix.MSF.SYNC);
     }
 
     // ── Grow ──────────────────────────────────────────────────────────────────

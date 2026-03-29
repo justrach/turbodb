@@ -12,6 +12,9 @@ pub const VersionPtr = struct {
     prev_page_off: u16,
 };
 
+const NO_PREV_PAGE_NO = std.math.maxInt(u32);
+const NO_PREV_PAGE_OFF = std.math.maxInt(u16);
+
 /// A read transaction that pins the epoch at which it started.
 pub const ReadTxn = struct {
     epoch: u64,
@@ -28,7 +31,7 @@ pub const ReadTxn = struct {
         var cur = start;
         while (true) {
             if (cur.epoch <= self.epoch) return cur;
-            if (cur.prev_page_no == 0 and cur.prev_page_off == 0) return null;
+            if (cur.prev_page_no == NO_PREV_PAGE_NO and cur.prev_page_off == NO_PREV_PAGE_OFF) return null;
             // Follow the chain — in a real system this would read from the page store.
             // For the in-memory model we look up via the history list.
             const hist = self.chain.history.get(chainKey(cur.prev_page_no, cur.prev_page_off)) orelse return null;
@@ -89,8 +92,8 @@ pub const VersionChain = struct {
     /// Register a new version for `doc_id` at the given page location and epoch.
     /// Links the new version to the previous latest (if any) via prev pointers.
     pub fn appendVersion(self: *VersionChain, alloc: Allocator, doc_id: u64, page_no: u32, page_off: u16, epoch: u64) !void {
-        var prev_page_no: u32 = 0;
-        var prev_page_off: u16 = 0;
+        var prev_page_no: u32 = NO_PREV_PAGE_NO;
+        var prev_page_off: u16 = NO_PREV_PAGE_OFF;
 
         if (self.latest.get(doc_id)) |old| {
             prev_page_no = old.page_no;
@@ -113,6 +116,16 @@ pub const VersionChain = struct {
     /// Get the latest version location for a document.
     pub fn getLatest(self: *VersionChain, doc_id: u64) ?VersionPtr {
         return self.latest.get(doc_id);
+    }
+
+    pub fn getAtEpoch(self: *VersionChain, doc_id: u64, epoch: u64) ?VersionPtr {
+        const ptr = self.latest.get(doc_id) orelse return null;
+        var cur = ptr;
+        while (true) {
+            if (cur.epoch <= epoch) return cur;
+            if (cur.prev_page_no == NO_PREV_PAGE_NO and cur.prev_page_off == NO_PREV_PAGE_OFF) return null;
+            cur = self.history.get(chainKey(cur.prev_page_no, cur.prev_page_off)) orelse return null;
+        }
     }
 
     /// Begin a read transaction pinned at the current epoch.

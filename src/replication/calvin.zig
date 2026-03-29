@@ -189,6 +189,7 @@ pub const CalvinExecutor = struct {
             } else {
                 txn.write_set = &.{};
             }
+            txn.owns_buffers = true;
         }
 
         return .{
@@ -209,6 +210,8 @@ pub const ReplicationManager = struct {
     running: std.atomic.Value(bool),
     batch_thread: ?std.Thread,
     alloc: std.mem.Allocator,
+    batch_ready_ctx: ?*anyopaque,
+    batch_ready_fn: ?*const fn (*anyopaque, *const sequencer.Batch) anyerror!void,
 
     pub fn init(alloc: std.mem.Allocator, node_id: NodeId, is_leader: bool) ReplicationManager {
         return .{
@@ -218,6 +221,8 @@ pub const ReplicationManager = struct {
             .running = std.atomic.Value(bool).init(false),
             .batch_thread = null,
             .alloc = alloc,
+            .batch_ready_ctx = null,
+            .batch_ready_fn = null,
         };
     }
 
@@ -254,6 +259,33 @@ pub const ReplicationManager = struct {
         try self.seq.submit(self.alloc, txn);
     }
 
+    pub fn setBatchReadyHook(
+        self: *ReplicationManager,
+        ctx: *anyopaque,
+        hook: *const fn (*anyopaque, *const sequencer.Batch) anyerror!void,
+    ) void {
+        self.batch_ready_ctx = ctx;
+        self.batch_ready_fn = hook;
+    }
+
+    pub fn processOnce(self: *ReplicationManager) !bool {
+        if (try self.seq.drainBatch(self.alloc)) |batch_val| {
+            var batch = batch_val;
+            defer batch.deinitDeep(self.alloc);
+
+            if (self.batch_ready_ctx) |ctx| {
+                if (self.batch_ready_fn) |hook| {
+                    try hook(ctx, &batch);
+                    return true;
+                }
+            }
+
+            try self.executor.executeBatch(&batch, &noopExecutor);
+            return true;
+        }
+        return false;
+    }
+
     /// Get replication lag (epochs behind leader).
     pub fn lag(self: *const ReplicationManager) u64 {
         const current = self.seq.current_epoch;
@@ -264,15 +296,7 @@ pub const ReplicationManager = struct {
 
     fn batchLoop(self: *ReplicationManager) void {
         while (self.running.load(.acquire)) {
-            // Drain and execute. In a full system, the batch would be
-            // broadcast to all nodes first; here we execute locally.
-            if (self.seq.drainBatch(self.alloc)) |batch_opt| {
-                if (batch_opt) |batch_val| {
-                    var batch = batch_val;
-                    defer batch.deinit(self.alloc);
-                    self.executor.executeBatch(&batch, &noopExecutor) catch {};
-                }
-            } else |_| {}
+            self.processOnce() catch {};
 
             // Sleep for the batch window.
             std.time.sleep(self.seq.batch_window_ns);
@@ -376,14 +400,7 @@ test "calvin: serialize/deserialize batch round-trip" {
     const len = try CalvinExecutor.serializeBatch(&batch, &buf);
 
     var decoded = try CalvinExecutor.deserializeBatch(buf[0..len], alloc);
-    defer {
-        for (decoded.transactions) |t| {
-            if (t.data.len > 0) alloc.free(t.data);
-            if (t.read_set.len > 0) alloc.free(t.read_set);
-            if (t.write_set.len > 0) alloc.free(t.write_set);
-        }
-        decoded.deinit(alloc);
-    }
+    defer decoded.deinitDeep(alloc);
 
     try std.testing.expectEqual(@as(u64, 7), decoded.epoch);
     try std.testing.expectEqual(@as(u64, 100), decoded.sequence_start);

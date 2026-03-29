@@ -171,15 +171,8 @@ pub fn main() !void {
 
         // ── Step 7: Deserialize + execute on replica ─────────────────────
         std.debug.print("[7] Deserializing + executing batch on REPLICA (node 1)...\n", .{});
-        const replica_batch = try CalvinExecutor.deserializeBatch(serial_buf[0..serial_len], alloc);
-        defer {
-            for (replica_batch.transactions) |txn| {
-                if (txn.data.len > 0) alloc.free(txn.data);
-                if (txn.read_set.len > 0) alloc.free(txn.read_set);
-                if (txn.write_set.len > 0) alloc.free(txn.write_set);
-            }
-            alloc.free(replica_batch.transactions);
-        }
+        var replica_batch = try CalvinExecutor.deserializeBatch(serial_buf[0..serial_len], alloc);
+        defer replica_batch.deinitDeep(alloc);
         try replica_exec.executeBatch(&replica_batch, &replicaExecutor);
         std.debug.print("    Replica executed epoch {d}\n", .{replica_exec.last_executed_epoch});
 

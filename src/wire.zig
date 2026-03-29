@@ -6,6 +6,7 @@
 /// Ops: INSERT=0x01 GET=0x02 UPDATE=0x03 DELETE=0x04 SCAN=0x05 PING=0x06
 /// Status: OK=0x00 NOT_FOUND=0x01 ERROR=0x02
 const std = @import("std");
+const activity = @import("activity.zig");
 const collection_mod = @import("collection.zig");
 const Database = collection_mod.Database;
 const Collection = collection_mod.Collection;
@@ -30,9 +31,10 @@ pub const WireServer = struct {
     db: *Database,
     port: u16,
     running: std.atomic.Value(bool),
+    activity: activity.ActivityTracker,
 
     pub fn init(db: *Database, port: u16) WireServer {
-        return .{ .db = db, .port = port, .running = std.atomic.Value(bool).init(false) };
+        return .{ .db = db, .port = port, .running = std.atomic.Value(bool).init(false), .activity = activity.ActivityTracker.init() };
     }
 
     pub fn run(self: *WireServer) !void {
@@ -92,7 +94,7 @@ fn handleConn(srv: *WireServer, conn: std.net.Server.Connection) void {
 
     // Pre-resolve the most common collection for the fast path
     var cached_col: ?*collection_mod.Collection = null;
-    var cached_col_name: [64]u8 = undefined;
+    var cached_col_name: [128]u8 = undefined;
     var cached_col_len: usize = 0;
 
     var rp: usize = 0;
@@ -113,6 +115,7 @@ fn handleConn(srv: *WireServer, conn: std.net.Server.Connection) void {
 
             // ── FAST PATH: inline GET with zero-copy ──
             if (op == OP_GET) {
+                srv.activity.recordQuery();
                 const wn = fastGet(srv, payload, &bufs.wr, &cached_col, &cached_col_name, &cached_col_len);
                 conn.stream.writeAll(bufs.wr[0..wn]) catch return;
             } else {
@@ -120,6 +123,7 @@ fn handleConn(srv: *WireServer, conn: std.net.Server.Connection) void {
                 if (op == OP_INSERT or op == OP_UPDATE or op == OP_DELETE) {
                     cached_col = null;
                 }
+                srv.activity.recordQuery();
                 const wn = dispatch(srv, op, payload, &bufs.wr);
                 conn.stream.writeAll(bufs.wr[0..wn]) catch return;
             }
@@ -138,7 +142,7 @@ fn fastGet(
     p: []const u8,
     w: *[WR_BUF]u8,
     cached_col: *?*collection_mod.Collection,
-    cached_name: *[64]u8,
+    cached_name: *[128]u8,
     cached_len: *usize,
 ) usize {
     const a = parseKey(p) orelse return errResp(w, OP_GET, STATUS_ERROR);
@@ -150,7 +154,7 @@ fn fastGet(
                 break :blk cc;
             }
         }
-        const c = srv.db.collection(a.col) catch return errResp(w, OP_GET, STATUS_ERROR);
+        const c = lookupCollection(srv, a.col) catch return errResp(w, OP_GET, STATUS_ERROR);
         @memcpy(cached_name[0..a.col.len], a.col);
         cached_len.* = a.col.len;
         cached_col.* = c;
@@ -188,7 +192,10 @@ fn dispatch(srv: *WireServer, op: u8, p: []const u8, w: *[WR_BUF]u8) usize {
 
 fn doInsert(srv: *WireServer, p: []const u8, w: *[WR_BUF]u8) usize {
     const a = parseKV(p) orelse return errResp(w, OP_INSERT, STATUS_ERROR);
-    const col = srv.db.collection(a.col) catch return errResp(w, OP_INSERT, STATUS_ERROR);
+    const ref = resolveCollectionRef(a.col);
+    srv.db.recordTenantOperation(ref.tenant_id) catch return errResp(w, OP_INSERT, STATUS_ERROR);
+    srv.db.ensureTenantStorageAvailable(ref.tenant_id, a.val.len) catch return errResp(w, OP_INSERT, STATUS_ERROR);
+    const col = srv.db.collectionForTenant(ref.tenant_id, ref.collection_name) catch return errResp(w, OP_INSERT, STATUS_ERROR);
     const doc_id = col.insert(a.key, a.val) catch return errResp(w, OP_INSERT, STATUS_ERROR);
     // [len:4][op:1][status:1][doc_id:8] = 14
     wrU32BE(w, 14);
@@ -202,7 +209,9 @@ fn doInsert(srv: *WireServer, p: []const u8, w: *[WR_BUF]u8) usize {
 
 fn doGet(srv: *WireServer, p: []const u8, w: *[WR_BUF]u8) usize {
     const a = parseKey(p) orelse return errResp(w, OP_GET, STATUS_ERROR);
-    const col = srv.db.collection(a.col) catch return errResp(w, OP_GET, STATUS_ERROR);
+    const ref = resolveCollectionRef(a.col);
+    srv.db.recordTenantOperation(ref.tenant_id) catch return errResp(w, OP_GET, STATUS_ERROR);
+    const col = srv.db.collectionForTenant(ref.tenant_id, ref.collection_name) catch return errResp(w, OP_GET, STATUS_ERROR);
     const d = col.get(a.key) orelse return errResp(w, OP_GET, STATUS_NOT_FOUND);
     // [len:4][op:1][status:1][doc_id:8][ver:1][val_len:4][val:N]
     const rlen = HDR + 1 + 8 + 1 + 4 + d.value.len;
@@ -221,7 +230,10 @@ fn doGet(srv: *WireServer, p: []const u8, w: *[WR_BUF]u8) usize {
 
 fn doUpdate(srv: *WireServer, p: []const u8, w: *[WR_BUF]u8) usize {
     const a = parseKV(p) orelse return errResp(w, OP_UPDATE, STATUS_ERROR);
-    const col = srv.db.collection(a.col) catch return errResp(w, OP_UPDATE, STATUS_ERROR);
+    const ref = resolveCollectionRef(a.col);
+    srv.db.recordTenantOperation(ref.tenant_id) catch return errResp(w, OP_UPDATE, STATUS_ERROR);
+    srv.db.ensureTenantStorageAvailable(ref.tenant_id, a.val.len) catch return errResp(w, OP_UPDATE, STATUS_ERROR);
+    const col = srv.db.collectionForTenant(ref.tenant_id, ref.collection_name) catch return errResp(w, OP_UPDATE, STATUS_ERROR);
     const ok = col.update(a.key, a.val) catch return errResp(w, OP_UPDATE, STATUS_ERROR);
     if (!ok) return errResp(w, OP_UPDATE, STATUS_NOT_FOUND);
     wrU32BE(w, HDR + 1);
@@ -234,7 +246,9 @@ fn doUpdate(srv: *WireServer, p: []const u8, w: *[WR_BUF]u8) usize {
 
 fn doDelete(srv: *WireServer, p: []const u8, w: *[WR_BUF]u8) usize {
     const a = parseKey(p) orelse return errResp(w, OP_DELETE, STATUS_ERROR);
-    const col = srv.db.collection(a.col) catch return errResp(w, OP_DELETE, STATUS_ERROR);
+    const ref = resolveCollectionRef(a.col);
+    srv.db.recordTenantOperation(ref.tenant_id) catch return errResp(w, OP_DELETE, STATUS_ERROR);
+    const col = srv.db.collectionForTenant(ref.tenant_id, ref.collection_name) catch return errResp(w, OP_DELETE, STATUS_ERROR);
     const ok = col.delete(a.key) catch return errResp(w, OP_DELETE, STATUS_ERROR);
     if (!ok) return errResp(w, OP_DELETE, STATUS_NOT_FOUND);
     wrU32BE(w, HDR + 1);
@@ -252,7 +266,9 @@ fn doScan(srv: *WireServer, p: []const u8, w: *[WR_BUF]u8) usize {
     const col_name = p[2..][0..cl];
     const limit = rdU32LE(p[2 + cl ..]);
     const offset = rdU32LE(p[6 + cl ..]);
-    const col = srv.db.collection(col_name) catch return errResp(w, OP_SCAN, STATUS_ERROR);
+    const ref = resolveCollectionRef(col_name);
+    srv.db.recordTenantOperation(ref.tenant_id) catch return errResp(w, OP_SCAN, STATUS_ERROR);
+    const col = srv.db.collectionForTenant(ref.tenant_id, ref.collection_name) catch return errResp(w, OP_SCAN, STATUS_ERROR);
     const result = col.scan(limit, offset, std.heap.page_allocator) catch return errResp(w, OP_SCAN, STATUS_ERROR);
     defer result.deinit();
 
@@ -346,4 +362,17 @@ fn wrU32LE(w: []u8, v: u32) void {
 }
 fn wrU16LE(w: []u8, v: u16) void {
     @memcpy(w[0..2], &std.mem.toBytes(v));
+}
+
+fn lookupCollection(srv: *WireServer, full_name: []const u8) !*collection_mod.Collection {
+    const ref = resolveCollectionRef(full_name);
+    try srv.db.recordTenantOperation(ref.tenant_id);
+    return srv.db.collectionForTenant(ref.tenant_id, ref.collection_name);
+}
+
+fn resolveCollectionRef(full_name: []const u8) collection_mod.TenantCollectionRef {
+    return collection_mod.splitTenantCollectionKey(full_name) orelse .{
+        .tenant_id = collection_mod.DEFAULT_TENANT,
+        .collection_name = full_name,
+    };
 }

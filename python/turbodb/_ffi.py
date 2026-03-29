@@ -90,9 +90,21 @@ _lib.turbodb_close.restype = None
 _lib.turbodb_collection.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
 _lib.turbodb_collection.restype = ctypes.c_void_p
 
+_lib.turbodb_collection_tenant.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+    ctypes.c_char_p, ctypes.c_size_t,
+]
+_lib.turbodb_collection_tenant.restype = ctypes.c_void_p
+
 # turbodb_drop_collection(db, name, name_len)
 _lib.turbodb_drop_collection.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
 _lib.turbodb_drop_collection.restype = None
+
+_lib.turbodb_drop_collection_tenant.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+    ctypes.c_char_p, ctypes.c_size_t,
+]
+_lib.turbodb_drop_collection_tenant.restype = None
 
 # turbodb_insert(col, key, key_len, val, val_len, out_id) -> c_int
 _lib.turbodb_insert.argtypes = [
@@ -225,9 +237,22 @@ def get_collection(db_handle, name: str):
         raise RuntimeError(f"Failed to open collection '{name}'")
     return h
 
+def get_collection_for_tenant(db_handle, tenant: str, name: str):
+    tb = tenant.encode("utf-8")
+    nb = name.encode("utf-8")
+    h = _lib.turbodb_collection_tenant(db_handle, tb, len(tb), nb, len(nb))
+    if not h:
+        raise RuntimeError(f"Failed to open collection '{tenant}/{name}'")
+    return h
+
 def drop_collection(db_handle, name: str):
     b = name.encode("utf-8")
     _lib.turbodb_drop_collection(db_handle, b, len(b))
+
+def drop_collection_for_tenant(db_handle, tenant: str, name: str):
+    tb = tenant.encode("utf-8")
+    nb = name.encode("utf-8")
+    _lib.turbodb_drop_collection_tenant(db_handle, tb, len(tb), nb, len(nb))
 
 def insert(col_handle, key: str, value: str) -> int:
     kb = key.encode("utf-8")

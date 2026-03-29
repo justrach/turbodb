@@ -2,3 +2,6 @@ zig-out/
 .zig-cache/
 python/dist/
 *.egg-info/
+codedb.snapshot
+__pycache__/
+*.pyc

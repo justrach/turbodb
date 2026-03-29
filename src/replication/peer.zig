@@ -124,8 +124,8 @@ pub const PeerReceiver = struct {
         if (read != payload_len) return;
 
         // Deserialize and execute the batch
-        const batch = calvin.CalvinExecutor.deserializeBatch(payload, self.alloc) catch return;
-        defer self.alloc.free(batch.transactions);
+        var batch = calvin.CalvinExecutor.deserializeBatch(payload, self.alloc) catch return;
+        defer batch.deinitDeep(self.alloc);
 
         self.executor.executeBatch(&batch, self.exec_fn) catch |err| {
             std.log.err("Calvin batch execution failed: {}", .{err});

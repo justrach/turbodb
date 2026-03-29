@@ -26,11 +26,18 @@ const Slot = struct {
 };
 
 pub const EpochManager = struct {
+    pub const EpochPoint = struct {
+        epoch: u64,
+        ts_ms: i64,
+    };
+
     /// Global clock — advanced by writers on commit.
     global_ts: std.atomic.Value(u64),
     /// Per-reader pinned epoch.
     slots: []Slot,
     allocator: std.mem.Allocator,
+    timeline: std.ArrayList(EpochPoint),
+    timeline_mu: std.Thread.Mutex,
 
     pub fn init(allocator: std.mem.Allocator) !EpochManager {
         const slots = try allocator.alloc(Slot, MAX_READERS);
@@ -39,10 +46,13 @@ pub const EpochManager = struct {
             .global_ts = std.atomic.Value(u64).init(1),
             .slots     = slots,
             .allocator = allocator,
+            .timeline = .empty,
+            .timeline_mu = .{},
         };
     }
 
     pub fn deinit(self: *EpochManager) void {
+        self.timeline.deinit(self.allocator);
         self.allocator.free(self.slots);
     }
 
@@ -50,12 +60,36 @@ pub const EpochManager = struct {
 
     /// Called by a writer at commit.  Returns the new timestamp.
     pub fn advance(self: *EpochManager) u64 {
-        return self.global_ts.fetchAdd(1, .acq_rel) + 1;
+        return self.advanceAt(std.time.milliTimestamp());
+    }
+
+    pub fn advanceAt(self: *EpochManager, ts_ms: i64) u64 {
+        const epoch = self.global_ts.fetchAdd(1, .acq_rel) + 1;
+        self.timeline_mu.lock();
+        defer self.timeline_mu.unlock();
+        self.timeline.append(self.allocator, .{ .epoch = epoch, .ts_ms = ts_ms }) catch {};
+        return epoch;
     }
 
     /// Current global timestamp (snapshot for reads).
     pub fn now(self: *const EpochManager) u64 {
         return self.global_ts.load(.acquire);
+    }
+
+    pub fn epochForTimestamp(self: *const EpochManager, ts_ms: i64) ?u64 {
+        const mutable: *EpochManager = @constCast(self);
+        mutable.timeline_mu.lock();
+        defer mutable.timeline_mu.unlock();
+
+        var best: ?u64 = null;
+        for (mutable.timeline.items) |entry| {
+            if (entry.ts_ms <= ts_ms) {
+                best = entry.epoch;
+            } else {
+                break;
+            }
+        }
+        return best;
     }
 
     // ── Reader side ───────────────────────────────────────────────────────────
@@ -93,3 +127,15 @@ pub const EpochManager = struct {
         return if (min == EPOCH_INACTIVE) self.global_ts.load(.acquire) else min;
     }
 };
+
+test "epoch manager maps timestamps to epochs" {
+    const alloc = std.testing.allocator;
+    var mgr = try EpochManager.init(alloc);
+    defer mgr.deinit();
+
+    try std.testing.expectEqual(@as(?u64, null), mgr.epochForTimestamp(999));
+    try std.testing.expectEqual(@as(u64, 2), mgr.advanceAt(1_000));
+    try std.testing.expectEqual(@as(u64, 3), mgr.advanceAt(2_000));
+    try std.testing.expectEqual(@as(?u64, @as(u64, 2)), mgr.epochForTimestamp(1_500));
+    try std.testing.expectEqual(@as(?u64, @as(u64, 3)), mgr.epochForTimestamp(2_000));
+}

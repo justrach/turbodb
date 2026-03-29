@@ -11,6 +11,7 @@ pub const Transaction = struct {
     data: []const u8, // serialized key+value
     read_set: []const u64, // key_hashes read
     write_set: []const u64, // key_hashes written
+    owns_buffers: bool = false,
 };
 
 /// An ordered batch of transactions ready for deterministic execution.
@@ -20,6 +21,17 @@ pub const Batch = struct {
     transactions: []Transaction,
 
     pub fn deinit(self: *Batch, alloc: std.mem.Allocator) void {
+        alloc.free(self.transactions);
+    }
+
+    pub fn deinitDeep(self: *Batch, alloc: std.mem.Allocator) void {
+        for (self.transactions) |txn| {
+            if (txn.owns_buffers) {
+                if (txn.data.len > 0) alloc.free(txn.data);
+                if (txn.write_set.len > 0) alloc.free(txn.write_set);
+                if (txn.read_set.len > 0) alloc.free(txn.read_set);
+            }
+        }
         alloc.free(self.transactions);
     }
 };
@@ -48,6 +60,13 @@ pub const Sequencer = struct {
     }
 
     pub fn deinit(self: *Sequencer, alloc: std.mem.Allocator) void {
+        for (self.pending.items) |txn| {
+            if (txn.owns_buffers) {
+                if (txn.data.len > 0) alloc.free(txn.data);
+                if (txn.write_set.len > 0) alloc.free(txn.write_set);
+                if (txn.read_set.len > 0) alloc.free(txn.read_set);
+            }
+        }
         self.pending.deinit(alloc);
     }
 
@@ -165,15 +184,16 @@ pub const Sequencer = struct {
 // ─── Tests ───────────────────────────────────────────────────────────
 
 fn makeTxn(id: u64, typ: TxnType, partition: u16, key: u64, rs: []const u64, ws: []const u64) Transaction {
-    return .{
-        .txn_id = id,
-        .txn_type = typ,
-        .partition_id = partition,
-        .key_hash = key,
-        .data = &.{},
-        .read_set = rs,
-        .write_set = ws,
-    };
+        return .{
+            .txn_id = id,
+            .txn_type = typ,
+            .partition_id = partition,
+            .key_hash = key,
+            .data = &.{},
+            .read_set = rs,
+            .write_set = ws,
+            .owns_buffers = false,
+        };
 }
 
 test "sequencer: submit and drain batch preserves ordering" {

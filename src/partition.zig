@@ -12,6 +12,7 @@ const collection_mod = @import("collection.zig");
 const doc_mod = @import("doc.zig");
 const wal_mod = @import("wal");
 const epoch_mod = @import("epoch");
+const cdc_mod = @import("cdc.zig");
 
 const Collection = collection_mod.Collection;
 const Doc = doc_mod.Doc;
@@ -56,6 +57,7 @@ pub const PartitionedCollection = struct {
         strategy: Strategy,
         wal_log: *WAL,
         epochs: *EpochManager,
+        cdc: *cdc_mod.CDCManager,
     ) !*PartitionedCollection {
         if (n_partitions == 0) return error.InvalidPartitionCount;
 
@@ -86,7 +88,7 @@ pub const PartitionedCollection = struct {
         for (0..n_partitions) |i| {
             const part_name = std.fmt.bufPrint(&part_name_buf, "{s}_p{d}", .{ col_name, i }) catch
                 return error.NameTooLong;
-            parts[i] = try Collection.open(alloc, data_dir, part_name, wal_log, epochs);
+            parts[i] = try Collection.open(alloc, data_dir, part_name, part_name, wal_log, epochs, cdc);
             opened += 1;
         }
 
