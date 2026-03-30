@@ -38,10 +38,15 @@ __all__ = ["Database", "Collection", "crypto", "__version__"]
 class Collection:
     """A TurboDB document collection."""
 
-    def __init__(self, db_handle, name: str):
+    def __init__(self, db_handle, name: str, tenant: str | None = None):
         self._db = db_handle
         self._name = name
-        self._handle = _ffi.get_collection(db_handle, name)
+        self._tenant = tenant
+        self._handle = (
+            _ffi.get_collection_for_tenant(db_handle, tenant, name)
+            if tenant is not None else
+            _ffi.get_collection(db_handle, name)
+        )
 
     @property
     def name(self) -> str:
@@ -96,7 +101,9 @@ class Collection:
             _ffi.scan_free(handle)
 
     def __repr__(self):
-        return f"Collection('{self._name}')"
+        if self._tenant is None:
+            return f"Collection('{self._name}')"
+        return f"Collection('{self._tenant}/{self._name}')"
 
 
 class Database:
@@ -112,6 +119,9 @@ class Database:
         if name not in self._collections:
             self._collections[name] = Collection(self._handle, name)
         return self._collections[name]
+
+    def tenant(self, tenant_id: str):
+        return TenantDatabase(self, tenant_id)
 
     def drop_collection(self, name: str):
         """Drop a collection."""
@@ -140,6 +150,23 @@ class Database:
 
     def __repr__(self):
         return f"Database('{self._path}')"
+
+
+class TenantDatabase:
+    def __init__(self, db: Database, tenant_id: str):
+        self._db = db
+        self._tenant_id = tenant_id
+        self._collections = {}
+
+    def collection(self, name: str) -> Collection:
+        cache_key = f"{self._tenant_id}/{name}"
+        if cache_key not in self._collections:
+            self._collections[cache_key] = Collection(self._db._handle, name, tenant=self._tenant_id)
+        return self._collections[cache_key]
+
+    def drop_collection(self, name: str):
+        _ffi.drop_collection_for_tenant(self._db._handle, self._tenant_id, name)
+        self._collections.pop(f"{self._tenant_id}/{name}", None)
 
 
 # ── Crypto module ────────────────────────────────────────────────────────────

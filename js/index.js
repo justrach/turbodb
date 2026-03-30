@@ -76,7 +76,9 @@ const ffi = {
   open:            lib.func('void *turbodb_open(const char *dir, size_t dir_len)'),
   close:           lib.func('void turbodb_close(void *handle)'),
   collection:      lib.func('void *turbodb_collection(void *db, const char *name, size_t name_len)'),
+  collection_tenant: lib.func('void *turbodb_collection_tenant(void *db, const char *tenant, size_t tenant_len, const char *name, size_t name_len)'),
   drop_collection: lib.func('void turbodb_drop_collection(void *db, const char *name, size_t name_len)'),
+  drop_collection_tenant: lib.func('void turbodb_drop_collection_tenant(void *db, const char *tenant, size_t tenant_len, const char *name, size_t name_len)'),
   insert:          lib.func('int turbodb_insert(void *col, const char *key, size_t key_len, const char *val, size_t val_len, uint64_t *out_id)'),
   get:             lib.func('int turbodb_get(void *col, const char *key, size_t key_len, DocResult *out)'),
   update:          lib.func('int turbodb_update(void *col, const char *key, size_t key_len, const char *val, size_t val_len)'),
@@ -99,12 +101,15 @@ function ptrToString(ptr, len) {
 // ── Collection class ────────────────────────────────────────────────────────
 
 class Collection {
-  constructor(dbHandle, name) {
+  constructor(dbHandle, name, tenant = null) {
     this._db = dbHandle;
     this._name = name;
+    this._tenant = tenant;
     const nameBuf = Buffer.from(name, 'utf-8');
-    this._handle = ffi.collection(dbHandle, nameBuf, nameBuf.length);
-    if (!this._handle) throw new Error(`Failed to open collection '${name}'`);
+    this._handle = tenant == null
+      ? ffi.collection(dbHandle, nameBuf, nameBuf.length)
+      : ffi.collection_tenant(dbHandle, Buffer.from(tenant, 'utf-8'), Buffer.byteLength(tenant), nameBuf, nameBuf.length);
+    if (!this._handle) throw new Error(`Failed to open collection '${tenant == null ? name : `${tenant}/${name}`}'`);
   }
 
   get name() { return this._name; }
@@ -206,6 +211,10 @@ class Database {
     return this._collections[name];
   }
 
+  tenant(tenantId) {
+    return new TenantDatabase(this, tenantId);
+  }
+
   dropCollection(name) {
     const nameBuf = Buffer.from(name, 'utf-8');
     ffi.drop_collection(this._handle, nameBuf, nameBuf.length);
@@ -218,6 +227,29 @@ class Database {
       this._handle = null;
       this._collections = {};
     }
+  }
+}
+
+class TenantDatabase {
+  constructor(db, tenantId) {
+    this._db = db;
+    this._tenantId = tenantId;
+    this._collections = {};
+  }
+
+  collection(name) {
+    const cacheKey = `${this._tenantId}/${name}`;
+    if (!this._collections[cacheKey]) {
+      this._collections[cacheKey] = new Collection(this._db._handle, name, this._tenantId);
+    }
+    return this._collections[cacheKey];
+  }
+
+  dropCollection(name) {
+    const tenantBuf = Buffer.from(this._tenantId, 'utf-8');
+    const nameBuf = Buffer.from(name, 'utf-8');
+    ffi.drop_collection_tenant(this._db._handle, tenantBuf, tenantBuf.length, nameBuf, nameBuf.length);
+    delete this._collections[`${this._tenantId}/${name}`];
   }
 }
 

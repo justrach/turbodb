@@ -75,8 +75,8 @@ pub const HotCache = struct {
                 return;
             }
         }
-        // All probe slots occupied — use CLOCK to evict one
-        const slot = self.clockEvict();
+        // All probe slots occupied — evict within the probe window so lookup can still find it.
+        const slot = self.clockEvictWindow(base);
         self.entries[slot] = .{
             .key_hash = key_hash,
             .page_no = page_no,
@@ -128,6 +128,26 @@ pub const HotCache = struct {
         // Fallback: just evict at hand
         const slot = self.hand;
         self.hand = (self.hand +% 1) & MASK;
+        self.entries[slot].valid = false;
+        self.entries[slot].key_hash = 0;
+        return slot;
+    }
+
+    fn clockEvictWindow(self: *HotCache, base: u32) u32 {
+        var sweeps: u32 = 0;
+        while (sweeps < PROBE_LIMIT * 2) : (sweeps += 1) {
+            const slot = (base +% (self.hand % PROBE_LIMIT)) & MASK;
+            self.hand = (self.hand +% 1) & MASK;
+            const e = &self.entries[slot];
+            if (!e.valid) return slot;
+            if (!e.referenced) {
+                e.valid = false;
+                e.key_hash = 0;
+                return slot;
+            }
+            e.referenced = false;
+        }
+        const slot = base & MASK;
         self.entries[slot].valid = false;
         self.entries[slot].key_hash = 0;
         return slot;

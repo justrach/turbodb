@@ -8,6 +8,7 @@ const wal_mod   = @import("wal");
 const epoch_mod = @import("epoch");
 const hot_cache = @import("hot_cache.zig");
 const mvcc_mod  = @import("mvcc.zig");
+const cdc_mod = @import("cdc.zig");
 const Doc = doc_mod.Doc;
 const DocHeader = doc_mod.DocHeader;
 const PageFile = page_mod.PageFile;
@@ -18,11 +19,15 @@ const EpochManager = epoch_mod.EpochManager;
 const TrigramIndex = codeindex.TrigramIndex;
 const WordIndex = codeindex.WordIndex;
 
+pub const DEFAULT_TENANT = "default";
+pub const MAX_TENANT_ID_LEN: usize = 64;
+pub const MAX_COLLECTION_NAME_LEN: usize = 64;
+
 
 // ─── Collection ──────────────────────────────────────────────────────────
 // ─── Collection ──────────────────────────────────────────────────────────
 pub const Collection = struct {
-    name_buf: [64]u8,
+    name_buf: [128]u8,
     name_len: u8,
     pf: PageFile,
     idx: BTree,
@@ -30,11 +35,13 @@ pub const Collection = struct {
     words: WordIndex,
     wal_log: *WAL,
     epochs: *EpochManager,
+    cdc: *cdc_mod.CDCManager,
     next_doc_id: std.atomic.Value(u64),
     // Record-level latching: 1024 stripe locks replace single write_mu.
     // Two writers to different keys proceed in parallel; same-key writes serialize.
     stripe_locks: [STRIPE_COUNT]std.Thread.Mutex,
     hash_idx: std.AutoHashMap(u64, BTreeEntry),
+    key_doc_ids: std.AutoHashMap(u64, u64),
     alloc: std.mem.Allocator,
     cache: hot_cache.HotCache,
     // MVCC version chain — append-only, no vacuum.
@@ -50,15 +57,18 @@ pub const Collection = struct {
     pub fn open(
         alloc: std.mem.Allocator,
         data_dir: []const u8,
-        col_name: []const u8,
+        logical_name: []const u8,
+        storage_name: []const u8,
         wal_log: *WAL,
         epochs: *EpochManager,
+        cdc: *cdc_mod.CDCManager,
     ) !*Collection {
         var path_buf: [512]u8 = undefined;
         const col = try alloc.create(Collection);
         errdefer alloc.destroy(col);
 
-        const page_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.pages", .{ data_dir, col_name });
+        try ensureDirPath(data_dir);
+        const page_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.pages", .{ data_dir, storage_name });
         col.pf = try PageFile.open(page_path);
 
         col.idx = BTree.init(&col.pf, 0);
@@ -66,19 +76,22 @@ pub const Collection = struct {
         col.words = WordIndex.init(alloc);
         col.wal_log = wal_log;
         col.epochs = epochs;
+        col.cdc = cdc;
         col.next_doc_id = std.atomic.Value(u64).init(1);
         // Initialize all stripe locks.
         for (&col.stripe_locks) |*lock| {
             lock.* = .{};
         }
         col.hash_idx = std.AutoHashMap(u64, BTreeEntry).init(alloc);
+        col.key_doc_ids = std.AutoHashMap(u64, u64).init(alloc);
         col.alloc = alloc;
         col.cache = hot_cache.HotCache.init();
         col.versions = mvcc_mod.VersionChain.init(alloc);
 
-        const n = @min(col_name.len, 63);
-        @memcpy(col.name_buf[0..n], col_name[0..n]);
+        const n = @min(logical_name.len, col.name_buf.len - 1);
+        @memcpy(col.name_buf[0..n], logical_name[0..n]);
         col.name_len = @intCast(n);
+        try col.rebuildIndexes();
 
         return col;
     }
@@ -86,13 +99,22 @@ pub const Collection = struct {
         self.tri.deinit();
         self.words.deinit();
         self.hash_idx.deinit();
+        self.key_doc_ids.deinit();
         self.versions.deinit(self.alloc);
         self.pf.close();
         self.alloc.destroy(self);
     }
 
+    pub fn sync(self: *Collection) !void {
+        try self.pf.sync();
+    }
+
     pub fn name(self: *const Collection) []const u8 {
         return self.name_buf[0..self.name_len];
+    }
+
+    pub fn storageBytes(self: *const Collection) usize {
+        return self.pf.mm.len;
     }
 
     // ─── MVCC read transaction ──────────────────────────────────────────
@@ -140,14 +162,17 @@ pub const Collection = struct {
         self.hash_idx.put(hdr.key_hash, entry) catch {};
 
         // MVCC: register version in the version chain.
-        const epoch = self.epochs.now();
+        const epoch = self.epochs.advance();
         self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
+        self.key_doc_ids.put(hdr.key_hash, doc_id) catch {};
 
         // codedb2-style trigram + word index
         if (value.len >= 3) {
             self.tri.indexFile(key, value) catch {};
             self.words.indexFile(key, value) catch {};
         }
+
+        emitChange(self, .insert, key, value, doc_id);
 
         return doc_id;
     }
@@ -176,6 +201,18 @@ pub const Collection = struct {
         const d = self.readEntry(entry) orelse return null;
         self.cache.insert(key_hash, entry.page_no, entry.page_off);
         return d;
+    }
+
+    pub fn getAsOfEpoch(self: *Collection, key: []const u8, epoch: u64) ?Doc {
+        const key_hash = doc_mod.fnv1a(key);
+        const doc_id = self.key_doc_ids.get(key_hash) orelse return null;
+        const ver = self.versions.getAtEpoch(doc_id, epoch) orelse return null;
+        return self.readLoc(ver.page_no, ver.page_off);
+    }
+
+    pub fn getAsOfTimestamp(self: *Collection, key: []const u8, ts_ms: i64) ?Doc {
+        const epoch = self.epochs.epochForTimestamp(ts_ms) orelse return null;
+        return self.getAsOfEpoch(key, epoch);
     }
 
     /// Look up a document by doc_id using a linear scan of the index.
@@ -238,8 +275,9 @@ pub const Collection = struct {
         self.cache.invalidate(key_hash);
 
         // MVCC: register new version in the version chain (links to old automatically).
-        const epoch = self.epochs.now();
+        const epoch = self.epochs.advance();
         self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
+        emitChange(self, .update, key, new_value, doc_id);
 
         return true;
     }
@@ -254,20 +292,24 @@ pub const Collection = struct {
 
         const entry = self.idx.search(key_hash) orelse return false;
 
-        // Write tombstone.
-        var tomb_hdr: DocHeader = std.mem.zeroes(DocHeader);
-        tomb_hdr.key_hash = key_hash;
-        tomb_hdr.flags = DocHeader.DELETED;
+        const old_doc = self.readEntry(entry) orelse return false;
+        var tomb_hdr = doc_mod.newHeader(old_doc.header.doc_id, key, "");
+        tomb_hdr.flags |= DocHeader.DELETED;
+        tomb_hdr.version = old_doc.header.version +% 1;
+        tomb_hdr.next_ver = (@as(u64, entry.page_no) << 16) | entry.page_off;
         const txn = self.wal_log.next_lsn.load(.monotonic);
         _ = try self.wal_log.write(txn, .doc_delete, 0, 0, std.mem.asBytes(&tomb_hdr));
-
-        // Mark the stored document as deleted.
-        if (self.readEntryMut(entry)) |mut_hdr| {
-            mut_hdr.flags |= DocHeader.DELETED;
-        }
+        const tomb_doc = Doc{ .header = tomb_hdr, .key = key, .value = "" };
+        var enc_buf: [65536]u8 = undefined;
+        const enc = try tomb_doc.encodeBuf(&enc_buf);
+        const pno = try self.findOrAllocLeaf(enc.len);
+        const page_off = self.pf.leafAppend(pno, enc) orelse return error.PageFull;
+        const epoch = self.epochs.advance();
+        self.versions.appendVersion(self.alloc, old_doc.header.doc_id, pno, page_off, epoch) catch {};
         self.idx.delete(key_hash);
         _ = self.hash_idx.remove(key_hash);
         self.cache.invalidate(key_hash);
+        emitChange(self, .delete, key, "", old_doc.header.doc_id);
         return true;
     }
 
@@ -400,6 +442,32 @@ pub const Collection = struct {
         return ScanResult{ .docs = try results.toOwnedSlice(alloc), .alloc = alloc };
     }
 
+    pub fn scanAsOfEpoch(self: *Collection, epoch: u64, limit: u32, offset: u32, alloc: std.mem.Allocator) !ScanResult {
+        var results: std.ArrayList(Doc) = .empty;
+        errdefer results.deinit(alloc);
+
+        var skipped: u32 = 0;
+        var it = self.key_doc_ids.iterator();
+        while (it.next()) |entry| {
+            const ver = self.versions.getAtEpoch(entry.value_ptr.*, epoch) orelse continue;
+            const doc = self.readLoc(ver.page_no, ver.page_off) orelse continue;
+            if (skipped < offset) {
+                skipped += 1;
+                continue;
+            }
+            try results.append(alloc, doc);
+            if (results.items.len >= limit) break;
+        }
+        return ScanResult{ .docs = try results.toOwnedSlice(alloc), .alloc = alloc };
+    }
+
+    pub fn scanAsOfTimestamp(self: *Collection, ts_ms: i64, limit: u32, offset: u32, alloc: std.mem.Allocator) !ScanResult {
+        const epoch = self.epochs.epochForTimestamp(ts_ms) orelse {
+            return ScanResult{ .docs = try alloc.alloc(Doc, 0), .alloc = alloc };
+        };
+        return self.scanAsOfEpoch(epoch, limit, offset, alloc);
+    }
+
     // ─── MVCC background compaction ─────────────────────────────────────
 
     /// Run epoch-based garbage collection on the version chain.
@@ -441,12 +509,58 @@ pub const Collection = struct {
         }
         return self.pf.allocPage(.leaf);
     }
+
+    fn rebuildIndexes(self: *Collection) !void {
+        const total_pages = self.pf.next_alloc.load(.acquire);
+        var max_doc_id: u64 = 0;
+        var pno: u32 = 0;
+        while (pno < total_pages) : (pno += 1) {
+            const ph = self.pf.pageHeader(pno);
+            if (@as(page_mod.PageType, @enumFromInt(ph.page_type)) != .leaf) continue;
+            const data = self.pf.pageData(pno);
+            var pos: usize = 0;
+            while (pos + DocHeader.size <= ph.used_bytes) {
+                const rem = data[pos..ph.used_bytes];
+                const decoded = doc_mod.decode(rem) catch break;
+                const d = decoded.doc;
+                const entry = BTreeEntry{
+                    .key_hash = d.header.key_hash,
+                    .doc_id = d.header.doc_id,
+                    .page_no = pno,
+                    .page_off = @intCast(pos),
+                };
+                if (d.header.flags & DocHeader.DELETED == 0) {
+                    self.hash_idx.put(d.header.key_hash, entry) catch {};
+                    self.key_doc_ids.put(d.header.key_hash, d.header.doc_id) catch {};
+                    if (d.value.len >= 3) {
+                        self.tri.indexFile(d.key, d.value) catch {};
+                        self.words.indexFile(d.key, d.value) catch {};
+                    }
+                }
+                if (d.header.doc_id > max_doc_id) max_doc_id = d.header.doc_id;
+                pos += decoded.consumed;
+            }
+        }
+        self.next_doc_id.store(max_doc_id + 1, .release);
+    }
+
+    fn emitChange(self: *Collection, op: cdc_mod.Op, key: []const u8, value: []const u8, doc_id: u64) void {
+        const full_name = self.name();
+        const ref: TenantCollectionRef = splitTenantCollectionKey(full_name) orelse TenantCollectionRef{
+            .tenant_id = DEFAULT_TENANT,
+            .collection_name = full_name,
+        };
+        self.cdc.emit(ref.tenant_id, ref.collection_name, key, value, doc_id, op);
+    }
 };
 
 // ─── Database (multi-collection manager) ─────────────────────────────────
 
 pub const Database = struct {
     collections: std.StringHashMap(*Collection),
+    tenant_quotas: std.StringHashMap(TenantQuota),
+    tenant_usage: std.StringHashMap(TenantUsage),
+    cdc: cdc_mod.CDCManager,
     wal_log: WAL,
     epochs: EpochManager,
     data_dir_buf: [256]u8,
@@ -454,22 +568,40 @@ pub const Database = struct {
     alloc: std.mem.Allocator,
     mu: std.Thread.RwLock,
 
+    pub const TenantQuota = struct {
+        max_collections: u32 = std.math.maxInt(u32),
+        max_storage_bytes: usize = std.math.maxInt(usize),
+        max_ops_per_second: u32 = std.math.maxInt(u32),
+    };
+
+    pub const TenantUsage = struct {
+        ops_window_ms: i64 = 0,
+        ops_in_window: u32 = 0,
+    };
+
     pub fn open(alloc: std.mem.Allocator, data_dir: []const u8) !*Database {
         const db = try alloc.create(Database);
         errdefer alloc.destroy(db);
 
+        const resolved_data_dir = try ensureDataDir(alloc, data_dir);
+        defer alloc.free(resolved_data_dir);
+
         var path_buf: [512]u8 = undefined;
-        const wal_path = try std.fmt.bufPrintZ(&path_buf, "{s}/doc.wal", .{data_dir});
+        const wal_path = try std.fmt.bufPrintZ(&path_buf, "{s}/doc.wal", .{resolved_data_dir});
         db.wal_log = try WAL.open(wal_path, alloc);
         // Start background WAL flusher (batches fsyncs every ~1ms like MongoDB's w:1)
         try db.wal_log.startFlusher();
         db.epochs = try EpochManager.init(alloc);
         db.collections = std.StringHashMap(*Collection).init(alloc);
+        db.tenant_quotas = std.StringHashMap(TenantQuota).init(alloc);
+        db.tenant_usage = std.StringHashMap(TenantUsage).init(alloc);
+        db.cdc = cdc_mod.CDCManager.init(alloc);
+        try db.cdc.start();
         db.alloc = alloc;
         db.mu = .{};
 
-        const n = @min(data_dir.len, 255);
-        @memcpy(db.data_dir_buf[0..n], data_dir[0..n]);
+        const n = @min(resolved_data_dir.len, 255);
+        @memcpy(db.data_dir_buf[0..n], resolved_data_dir[0..n]);
         db.data_dir_len = n;
 
         return db;
@@ -478,10 +610,25 @@ pub const Database = struct {
     pub fn close(self: *Database) void {
         var it = self.collections.valueIterator();
         while (it.next()) |col| col.*.close();
+        var key_it = self.collections.keyIterator();
+        while (key_it.next()) |key| self.alloc.free(key.*);
         self.collections.deinit();
+        var quota_it = self.tenant_quotas.keyIterator();
+        while (quota_it.next()) |key| self.alloc.free(key.*);
+        self.tenant_quotas.deinit();
+        var usage_it = self.tenant_usage.keyIterator();
+        while (usage_it.next()) |key| self.alloc.free(key.*);
+        self.tenant_usage.deinit();
+        self.cdc.deinit();
         self.wal_log.close();
         self.epochs.deinit();
         self.alloc.destroy(self);
+    }
+
+    pub fn checkpoint(self: *Database) !void {
+        self.wal_log.flushPending();
+        var it = self.collections.valueIterator();
+        while (it.next()) |col| try col.*.sync();
     }
 
     pub fn dataDir(self: *const Database) []const u8 {
@@ -490,9 +637,18 @@ pub const Database = struct {
 
     /// Get or create a named collection.
     pub fn collection(self: *Database, name: []const u8) !*Collection {
+        return self.collectionForTenant(DEFAULT_TENANT, name);
+    }
+
+    pub fn collectionForTenant(self: *Database, tenant_id: []const u8, name: []const u8) !*Collection {
+        try validateTenantComponent(tenant_id);
+        try validateCollectionComponent(name);
+        const tenant_key = try self.tenantCollectionKey(tenant_id, name);
+        defer self.alloc.free(tenant_key);
+
         // Fast path: read lock
         self.mu.lockShared();
-        if (self.collections.get(name)) |c| {
+        if (self.collections.get(tenant_key)) |c| {
             self.mu.unlockShared();
             return c;
         }
@@ -502,26 +658,406 @@ pub const Database = struct {
         self.mu.lock();
         defer self.mu.unlock();
         // Double-check after acquiring write lock
-        if (self.collections.get(name)) |c| return c;
+        if (self.collections.get(tenant_key)) |c| return c;
+        try self.enforceCollectionQuotaLocked(tenant_id);
+
+        var storage_name_buf: [MAX_TENANT_ID_LEN + MAX_COLLECTION_NAME_LEN + 4]u8 = undefined;
+        const storage_name = try makeStorageName(&storage_name_buf, tenant_id, name);
 
         const col = try Collection.open(
             self.alloc,
             self.dataDir(),
-            name,
+            tenant_key,
+            storage_name,
             &self.wal_log,
             &self.epochs,
+            &self.cdc,
         );
-        const key = try self.alloc.dupe(u8, name);
+        const key = try self.alloc.dupe(u8, tenant_key);
         try self.collections.put(key, col);
         return col;
     }
 
     pub fn dropCollection(self: *Database, name: []const u8) void {
+        self.dropCollectionForTenant(DEFAULT_TENANT, name);
+    }
+
+    pub fn dropCollectionForTenant(self: *Database, tenant_id: []const u8, name: []const u8) void {
+        const tenant_key = self.tenantCollectionKey(tenant_id, name) catch return;
+        defer self.alloc.free(tenant_key);
         self.mu.lock();
         defer self.mu.unlock();
-        if (self.collections.fetchRemove(name)) |kv| {
+        if (self.collections.fetchRemove(tenant_key)) |kv| {
             kv.value.close();
             self.alloc.free(kv.key);
         }
     }
+
+    pub fn listCollectionsForTenant(self: *Database, tenant_id: []const u8, alloc: std.mem.Allocator) !std.ArrayList([]const u8) {
+        try validateTenantComponent(tenant_id);
+        const prefix = try std.fmt.allocPrint(alloc, "{s}/", .{tenant_id});
+        defer alloc.free(prefix);
+
+        var result: std.ArrayList([]const u8) = .empty;
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        var it = self.collections.keyIterator();
+        while (it.next()) |k| {
+            if (std.mem.startsWith(u8, k.*, prefix)) {
+                try result.append(alloc, try alloc.dupe(u8, k.*[prefix.len..]));
+            }
+        }
+        return result;
+    }
+
+    pub fn configureTenantQuota(self: *Database, tenant_id: []const u8, quota: TenantQuota) !void {
+        try validateTenantComponent(tenant_id);
+        self.mu.lock();
+        defer self.mu.unlock();
+        const gop = try self.tenant_quotas.getOrPut(tenant_id);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.alloc.dupe(u8, tenant_id);
+        }
+        gop.value_ptr.* = quota;
+    }
+
+    pub fn registerWebhook(self: *Database, tenant_id: []const u8, collection_name: []const u8, webhook_url: []const u8, secret: []const u8) !u64 {
+        try validateTenantComponent(tenant_id);
+        if (collection_name.len > 0) try validateCollectionComponent(collection_name);
+        return self.cdc.registerWebhook(tenant_id, collection_name, webhook_url, secret);
+    }
+
+    pub fn listWebhookDeliveries(self: *Database, alloc: std.mem.Allocator, tenant_id: ?[]const u8) ![]cdc_mod.Delivery {
+        return self.cdc.listDeliveries(alloc, tenant_id);
+    }
+
+    pub fn recordTenantOperation(self: *Database, tenant_id: []const u8) !void {
+        try validateTenantComponent(tenant_id);
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        const quota = self.tenant_quotas.get(tenant_id) orelse return;
+        if (quota.max_ops_per_second == std.math.maxInt(u32)) return;
+
+        const now_ms: i64 = std.time.milliTimestamp();
+        const window_ms = now_ms - @mod(now_ms, 1000);
+        const usage = try self.getOrCreateTenantUsageLocked(tenant_id);
+        if (usage.ops_window_ms != window_ms) {
+            usage.ops_window_ms = window_ms;
+            usage.ops_in_window = 0;
+        }
+        if (usage.ops_in_window >= quota.max_ops_per_second) return error.TenantOpsQuotaExceeded;
+        usage.ops_in_window += 1;
+    }
+
+    pub fn ensureTenantStorageAvailable(self: *Database, tenant_id: []const u8, extra_bytes: usize) !void {
+        try validateTenantComponent(tenant_id);
+        self.mu.lockShared();
+        defer self.mu.unlockShared();
+
+        const quota = self.tenant_quotas.get(tenant_id) orelse return;
+        if (quota.max_storage_bytes == std.math.maxInt(usize)) return;
+
+        var total: usize = 0;
+        var it = self.collections.iterator();
+        while (it.next()) |entry| {
+            const parts = splitTenantCollectionKey(entry.key_ptr.*) orelse continue;
+            if (std.mem.eql(u8, parts.tenant_id, tenant_id)) {
+                total += entry.value_ptr.*.storageBytes();
+            }
+        }
+
+        if (total + extra_bytes > quota.max_storage_bytes) return error.TenantStorageQuotaExceeded;
+    }
+
+    fn enforceCollectionQuotaLocked(self: *Database, tenant_id: []const u8) !void {
+        const quota = self.tenant_quotas.get(tenant_id) orelse return;
+        if (quota.max_collections == std.math.maxInt(u32)) return;
+
+        var count: u32 = 0;
+        var it = self.collections.keyIterator();
+        while (it.next()) |k| {
+            const parts = splitTenantCollectionKey(k.*) orelse continue;
+            if (std.mem.eql(u8, parts.tenant_id, tenant_id)) count += 1;
+        }
+        if (count >= quota.max_collections) return error.TenantCollectionQuotaExceeded;
+    }
+
+    fn tenantCollectionKey(self: *Database, tenant_id: []const u8, name: []const u8) ![]u8 {
+        return std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ tenant_id, name });
+    }
+
+    fn getOrCreateTenantUsageLocked(self: *Database, tenant_id: []const u8) !*TenantUsage {
+        const gop = try self.tenant_usage.getOrPut(tenant_id);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.alloc.dupe(u8, tenant_id);
+            gop.value_ptr.* = .{};
+        }
+        return gop.value_ptr;
+    }
 };
+
+pub const TenantCollectionRef = struct {
+    tenant_id: []const u8,
+    collection_name: []const u8,
+};
+
+pub fn splitTenantCollectionKey(full_name: []const u8) ?TenantCollectionRef {
+    const sep = std.mem.indexOfScalar(u8, full_name, '/') orelse return null;
+    return .{
+        .tenant_id = full_name[0..sep],
+        .collection_name = full_name[sep + 1 ..],
+    };
+}
+
+fn validateTenantComponent(name: []const u8) !void {
+    if (name.len == 0 or name.len > MAX_TENANT_ID_LEN) return error.InvalidTenantId;
+    for (name) |c| {
+        if (!std.ascii.isAlphanumeric(c) and c != '-' and c != '_' and c != '.') return error.InvalidTenantId;
+    }
+}
+
+fn validateCollectionComponent(name: []const u8) !void {
+    if (name.len == 0 or name.len > MAX_COLLECTION_NAME_LEN) return error.InvalidCollectionName;
+    for (name) |c| {
+        if (c == '/' or c == '\\') return error.InvalidCollectionName;
+    }
+}
+
+fn makeStorageName(buf: []u8, tenant_id: []const u8, collection_name: []const u8) ![]const u8 {
+    var fbs = std.io.fixedBufferStream(buf);
+    const w = fbs.writer();
+    try appendSanitizedComponent(w, tenant_id);
+    try w.writeAll("__");
+    try appendSanitizedComponent(w, collection_name);
+    return buf[0..fbs.pos];
+}
+
+fn appendSanitizedComponent(writer: anytype, input: []const u8) !void {
+    for (input) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '-' or c == '_') {
+            try writer.writeByte(c);
+        } else {
+            try writer.writeByte('_');
+        }
+    }
+}
+
+fn ensureDataDir(alloc: std.mem.Allocator, data_dir: []const u8) ![]u8 {
+    try ensureDirPath(data_dir);
+    return try std.fs.realpathAlloc(alloc, data_dir);
+}
+
+fn ensureDirPath(data_dir: []const u8) !void {
+    if (std.fs.path.isAbsolute(data_dir)) {
+        var root = try std.fs.openDirAbsolute("/", .{});
+        defer root.close();
+        const rel = std.mem.trimLeft(u8, data_dir, "/");
+        if (rel.len > 0) root.makePath(rel) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    } else {
+        std.fs.cwd().makePath(data_dir) catch |err| switch (err) {
+            error.PathAlreadyExists => {},
+            else => return err,
+        };
+    }
+}
+
+test "tenant collections are isolated" {
+    const alloc = std.testing.allocator;
+    const tmp_dir = "/tmp/turbodb_multi_tenant_test";
+    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    try std.fs.cwd().makePath(tmp_dir);
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    const db = try Database.open(alloc, tmp_dir);
+    defer db.close();
+
+    const a = try db.collectionForTenant("tenant-a", "users");
+    const b = try db.collectionForTenant("tenant-b", "users");
+
+    _ = try a.insert("alice", "{\"name\":\"Alice\"}");
+    _ = try b.insert("bob", "{\"name\":\"Bob\"}");
+
+    try std.testing.expect(a.get("alice") != null);
+    try std.testing.expect(a.get("bob") == null);
+    try std.testing.expect(b.get("bob") != null);
+    try std.testing.expect(b.get("alice") == null);
+}
+
+test "tenant collection quota limits new collections" {
+    const alloc = std.testing.allocator;
+    const tmp_dir = "/tmp/turbodb_tenant_quota_test";
+    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    try std.fs.cwd().makePath(tmp_dir);
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    const db = try Database.open(alloc, tmp_dir);
+    defer db.close();
+
+    try db.configureTenantQuota("tenant-a", .{ .max_collections = 1 });
+    _ = try db.collectionForTenant("tenant-a", "users");
+    try std.testing.expectError(error.TenantCollectionQuotaExceeded, db.collectionForTenant("tenant-a", "orders"));
+}
+
+test "tenant ops quota is enforced per second" {
+    const alloc = std.testing.allocator;
+    const tmp_dir = "/tmp/turbodb_tenant_ops_test";
+    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    try std.fs.cwd().makePath(tmp_dir);
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    const db = try Database.open(alloc, tmp_dir);
+    defer db.close();
+
+    try db.configureTenantQuota("tenant-a", .{ .max_ops_per_second = 2 });
+    try db.recordTenantOperation("tenant-a");
+    try db.recordTenantOperation("tenant-a");
+    try std.testing.expectError(error.TenantOpsQuotaExceeded, db.recordTenantOperation("tenant-a"));
+}
+
+test "time travel get returns historical version after update" {
+    const alloc = std.testing.allocator;
+    const tmp_dir = "/tmp/turbodb_time_travel_update";
+    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    try std.fs.cwd().makePath(tmp_dir);
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    const db = try Database.open(alloc, tmp_dir);
+    defer db.close();
+
+    const col = try db.collection("users");
+    _ = try col.insert("u1", "{\"name\":\"alice-v1\"}");
+    const first_epoch = col.versions.getLatest(1).?.epoch;
+    _ = try col.update("u1", "{\"name\":\"alice-v2\"}");
+    const second_epoch = col.versions.getLatest(1).?.epoch;
+
+    try std.testing.expectEqualStrings("{\"name\":\"alice-v1\"}", col.getAsOfEpoch("u1", first_epoch).?.value);
+    try std.testing.expectEqualStrings("{\"name\":\"alice-v2\"}", col.getAsOfEpoch("u1", second_epoch).?.value);
+}
+
+test "time travel get survives delete" {
+    const alloc = std.testing.allocator;
+    const tmp_dir = "/tmp/turbodb_time_travel_delete";
+    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    try std.fs.cwd().makePath(tmp_dir);
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    const db = try Database.open(alloc, tmp_dir);
+    defer db.close();
+
+    const col = try db.collection("users");
+    _ = try col.insert("u1", "{\"name\":\"alice\"}");
+    const live_epoch = col.versions.getLatest(1).?.epoch;
+    try std.testing.expect(try col.delete("u1"));
+
+    try std.testing.expect(col.get("u1") == null);
+    try std.testing.expectEqualStrings("{\"name\":\"alice\"}", col.getAsOfEpoch("u1", live_epoch).?.value);
+}
+
+test "time travel scan uses historical snapshot" {
+    const alloc = std.testing.allocator;
+    const tmp_dir = "/tmp/turbodb_time_travel_scan";
+    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    try std.fs.cwd().makePath(tmp_dir);
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    const db = try Database.open(alloc, tmp_dir);
+    defer db.close();
+
+    const col = try db.collection("users");
+    _ = try col.insert("u1", "{\"name\":\"alice\"}");
+    const epoch_before_delete = col.versions.getLatest(1).?.epoch;
+    _ = try col.insert("u2", "{\"name\":\"bob\"}");
+    try std.testing.expect(try col.delete("u2"));
+
+    const historical = try col.scanAsOfEpoch(epoch_before_delete, 10, 0, alloc);
+    defer historical.deinit();
+    try std.testing.expectEqual(@as(usize, 1), historical.docs.len);
+    try std.testing.expectEqualStrings("u1", historical.docs[0].key);
+}
+
+test "cdc emits signed ordered deliveries for tenant mutations" {
+    const alloc = std.testing.allocator;
+    const tmp_dir = "/tmp/turbodb_cdc_integration";
+    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    try std.fs.cwd().makePath(tmp_dir);
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    const db = try Database.open(alloc, tmp_dir);
+    defer db.close();
+
+    _ = try db.registerWebhook("tenant-a", "users", "memory://tenant-a-users", "secret-a");
+    const col = try db.collectionForTenant("tenant-a", "users");
+    _ = try col.insert("u1", "{\"name\":\"alice\"}");
+    _ = try col.update("u1", "{\"name\":\"alice-2\"}");
+    try std.testing.expect(try col.delete("u1"));
+    std.Thread.sleep(20_000_000);
+
+    const deliveries = try db.listWebhookDeliveries(alloc, "tenant-a");
+    defer alloc.free(deliveries);
+    try std.testing.expectEqual(@as(usize, 3), deliveries.len);
+    try std.testing.expect(deliveries[0].seq < deliveries[1].seq);
+    try std.testing.expect(deliveries[1].seq < deliveries[2].seq);
+    try std.testing.expect(std.mem.indexOf(u8, deliveries[0].payloadSlice(), "\"op\":\"insert\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, deliveries[1].payloadSlice(), "\"op\":\"update\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, deliveries[2].payloadSlice(), "\"op\":\"delete\"") != null);
+}
+
+test "tenant collections isolate keys and listings" {
+    const alloc = std.testing.allocator;
+    const tmp_dir = "/tmp/turbodb_tenant_isolation";
+    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    try std.fs.cwd().makePath(tmp_dir);
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    const db = try Database.open(alloc, tmp_dir);
+    defer db.close();
+
+    const tenant_a_users = try db.collectionForTenant("tenant-a", "users");
+    const tenant_b_users = try db.collectionForTenant("tenant-b", "users");
+
+    _ = try tenant_a_users.insert("u1", "{\"name\":\"alice\"}");
+    _ = try tenant_b_users.insert("u1", "{\"name\":\"bob\"}");
+
+    const a_doc = tenant_a_users.get("u1").?;
+    const b_doc = tenant_b_users.get("u1").?;
+    try std.testing.expectEqualStrings("{\"name\":\"alice\"}", a_doc.value);
+    try std.testing.expectEqualStrings("{\"name\":\"bob\"}", b_doc.value);
+
+    var tenant_a_cols = try db.listCollectionsForTenant("tenant-a", alloc);
+    defer {
+        for (tenant_a_cols.items) |name| alloc.free(name);
+        tenant_a_cols.deinit(alloc);
+    }
+    try std.testing.expectEqual(@as(usize, 1), tenant_a_cols.items.len);
+    try std.testing.expectEqualStrings("users", tenant_a_cols.items[0]);
+}
+
+test "tenant quotas apply per tenant" {
+    const alloc = std.testing.allocator;
+    const tmp_dir = "/tmp/turbodb_tenant_quotas";
+    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    try std.fs.cwd().makePath(tmp_dir);
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    const db = try Database.open(alloc, tmp_dir);
+    defer db.close();
+
+    try db.configureTenantQuota("tenant-a", .{ .max_collections = 1, .max_ops_per_second = 2 });
+    _ = try db.collectionForTenant("tenant-a", "users");
+    try std.testing.expectError(
+        error.TenantCollectionQuotaExceeded,
+        db.collectionForTenant("tenant-a", "orders"),
+    );
+
+    try db.recordTenantOperation("tenant-a");
+    try db.recordTenantOperation("tenant-a");
+    try std.testing.expectError(error.TenantOpsQuotaExceeded, db.recordTenantOperation("tenant-a"));
+
+    _ = try db.collectionForTenant("tenant-b", "users");
+    try db.recordTenantOperation("tenant-b");
+}

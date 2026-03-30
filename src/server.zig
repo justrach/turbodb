@@ -10,6 +10,7 @@
 ///   GET    /health               health check
 ///   GET    /metrics              server metrics
 const std = @import("std");
+const activity = @import("activity.zig");
 const collection = @import("collection.zig");
 const Database = collection.Database;
 
@@ -30,6 +31,17 @@ fn getRespBuf() *[MAX_RESP]u8 { return &tl_bufs.?.resp; }
 fn getBodyBuf() *[MAX_BODY]u8 { return &tl_bufs.?.body; }
 
 pub const Server = struct {
+    pub const QueryCost = struct {
+        tenant_id: [64]u8,
+        tenant_id_len: u8,
+        op: [16]u8,
+        op_len: u8,
+        rows_scanned: u64,
+        bytes_read: u64,
+        cpu_us: u64,
+        cost_nanos_usd: u64,
+    };
+
     db: *Database,
     port: u16,
     running: std.atomic.Value(bool),
@@ -38,6 +50,14 @@ pub const Server = struct {
     // metrics
     req_count: std.atomic.Value(u64),
     err_count: std.atomic.Value(u64),
+    query_count: std.atomic.Value(u64),
+    query_rows_scanned: std.atomic.Value(u64),
+    query_bytes_read: std.atomic.Value(u64),
+    query_cpu_us: std.atomic.Value(u64),
+    query_cost_nanos_usd: std.atomic.Value(u64),
+    billing_log: std.ArrayList(QueryCost),
+    billing_mu: std.Thread.Mutex,
+    activity: activity.ActivityTracker,
 
     pub fn init(alloc: std.mem.Allocator, db: *Database, port: u16) Server {
         return .{
@@ -47,6 +67,14 @@ pub const Server = struct {
             .alloc   = alloc,
             .req_count = std.atomic.Value(u64).init(0),
             .err_count = std.atomic.Value(u64).init(0),
+            .query_count = std.atomic.Value(u64).init(0),
+            .query_rows_scanned = std.atomic.Value(u64).init(0),
+            .query_bytes_read = std.atomic.Value(u64).init(0),
+            .query_cpu_us = std.atomic.Value(u64).init(0),
+            .query_cost_nanos_usd = std.atomic.Value(u64).init(0),
+            .billing_log = .empty,
+            .billing_mu = .{},
+            .activity = activity.ActivityTracker.init(),
         };
     }
 
@@ -105,6 +133,39 @@ pub const Server = struct {
     pub fn stop(self: *Server) void {
         self.running.store(false, .release);
     }
+
+    fn recordQueryCost(self: *Server, tenant_id: []const u8, op: []const u8, rows_scanned: usize, bytes_read: usize, start_ns: i128) void {
+        const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+        const cpu_us: u64 = @intCast(@max(@divTrunc(elapsed_ns, 1000), 0));
+        const cost_nanos_usd: u64 = cpu_us * 5 + @as(u64, @intCast(rows_scanned)) + @as(u64, @intCast(bytes_read / 1024));
+
+        _ = self.query_count.fetchAdd(1, .monotonic);
+        _ = self.query_rows_scanned.fetchAdd(rows_scanned, .monotonic);
+        _ = self.query_bytes_read.fetchAdd(bytes_read, .monotonic);
+        _ = self.query_cpu_us.fetchAdd(cpu_us, .monotonic);
+        _ = self.query_cost_nanos_usd.fetchAdd(cost_nanos_usd, .monotonic);
+        self.activity.recordQuery();
+
+        var entry = QueryCost{
+            .tenant_id = [_]u8{0} ** 64,
+            .tenant_id_len = @intCast(@min(tenant_id.len, 64)),
+            .op = [_]u8{0} ** 16,
+            .op_len = @intCast(@min(op.len, 16)),
+            .rows_scanned = rows_scanned,
+            .bytes_read = bytes_read,
+            .cpu_us = cpu_us,
+            .cost_nanos_usd = cost_nanos_usd,
+        };
+        @memcpy(entry.tenant_id[0..entry.tenant_id_len], tenant_id[0..entry.tenant_id_len]);
+        @memcpy(entry.op[0..entry.op_len], op[0..entry.op_len]);
+
+        self.billing_mu.lock();
+        defer self.billing_mu.unlock();
+        self.billing_log.append(self.alloc, entry) catch return;
+        if (self.billing_log.items.len > 1024) {
+            _ = self.billing_log.orderedRemove(0);
+        }
+    }
 };
 
 fn handleConn(srv: *Server, conn: std.net.Server.Connection) void {
@@ -158,21 +219,41 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
     if (std.mem.eql(u8, path, "/metrics")) {
         var fbs = std.io.fixedBufferStream(getBodyBuf());
         std.fmt.format(fbs.writer(),
-            "{{\"requests\":{d},\"errors\":{d}}}",
-            .{ srv.req_count.load(.acquire), srv.err_count.load(.acquire) }) catch {};
+            "{{\"requests\":{d},\"errors\":{d},\"queries\":{d},\"rows_scanned\":{d},\"bytes_read\":{d},\"cpu_us\":{d},\"cost_nanos_usd\":{d}}}",
+            .{
+                srv.req_count.load(.acquire),
+                srv.err_count.load(.acquire),
+                srv.query_count.load(.acquire),
+                srv.query_rows_scanned.load(.acquire),
+                srv.query_bytes_read.load(.acquire),
+                srv.query_cpu_us.load(.acquire),
+                srv.query_cost_nanos_usd.load(.acquire),
+            }) catch {};
         return ok(getBodyBuf()[0..fbs.pos]);
     }
 
+    if (std.mem.eql(u8, path, "/billing") and std.mem.eql(u8, method, "GET"))
+        return handleBillingLog(srv);
+
+    if (std.mem.eql(u8, path, "/resource_state") and std.mem.eql(u8, method, "GET"))
+        return handleResourceState(srv);
+
+    if (std.mem.eql(u8, path, "/cdc/webhooks") and std.mem.eql(u8, method, "POST"))
+        return handleWebhookRegistration(srv, body);
+
+    if (std.mem.eql(u8, path, "/cdc/events") and std.mem.eql(u8, method, "GET"))
+        return handleCdcEvents(srv, qparam(query, "tenant"), alloc);
+
     // Route: /collections
     if (std.mem.eql(u8, path, "/collections") and std.mem.eql(u8, method, "GET"))
-        return handleListCollections(srv, alloc);
+        return handleListCollections(srv, requestTenant(raw, query), alloc);
 
     // Route: /search/:col?q=...
     if (std.mem.startsWith(u8, path, "/search/") and std.mem.eql(u8, method, "GET")) {
         const col_name = path[8..];
         const q = qparam(query, "q") orelse return err(400, "missing q parameter");
         const limit_val: u32 = qparamInt(query, "limit") orelse 50;
-        return handleSearch(srv, col_name, q, limit_val, alloc);
+        return handleSearch(srv, requestTenant(raw, query), col_name, q, limit_val, alloc);
     }
 
     // Routes under /db/:col
@@ -182,14 +263,16 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
         if (std.mem.indexOfScalar(u8, rest, '/')) |sep| {
             const col_name = rest[0..sep];
             const key = rest[sep + 1 ..];
-            if (std.mem.eql(u8, method, "GET"))    return handleGet(srv, col_name, key);
-            if (std.mem.eql(u8, method, "PUT"))    return handleUpdate(srv, col_name, key, body, alloc);
-            if (std.mem.eql(u8, method, "DELETE")) return handleDelete(srv, col_name, key);
+            const tenant_id = requestTenant(raw, query);
+            if (std.mem.eql(u8, method, "GET"))    return handleGet(srv, tenant_id, col_name, key, requestAsOf(raw, query));
+            if (std.mem.eql(u8, method, "PUT"))    return handleUpdate(srv, tenant_id, col_name, key, body, alloc);
+            if (std.mem.eql(u8, method, "DELETE")) return handleDelete(srv, tenant_id, col_name, key);
         } else {
             const col_name = rest;
-            if (std.mem.eql(u8, method, "POST"))   return handleInsert(srv, col_name, body, alloc);
-            if (std.mem.eql(u8, method, "GET"))    return handleScan(srv, col_name, query, alloc);
-            if (std.mem.eql(u8, method, "DELETE")) return handleDrop(srv, col_name);
+            const tenant_id = requestTenant(raw, query);
+            if (std.mem.eql(u8, method, "POST"))   return handleInsert(srv, tenant_id, col_name, body, alloc);
+            if (std.mem.eql(u8, method, "GET"))    return handleScan(srv, tenant_id, col_name, query, requestAsOf(raw, query), alloc);
+            if (std.mem.eql(u8, method, "DELETE")) return handleDrop(srv, tenant_id, col_name);
         }
     }
 
@@ -199,7 +282,7 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
 
 // ─── handlers ────────────────────────────────────────────────────────────
 
-fn handleInsert(srv: *Server, col_name: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
+fn handleInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
     _ = alloc;
     // Expect body: {"key":"...","value":{...}}  OR  use auto-generated key.
     const key_raw = jsonStr(body, "key") orelse {
@@ -207,24 +290,34 @@ fn handleInsert(srv: *Server, col_name: []const u8, body: []const u8, alloc: std
         var kb: [32]u8 = undefined;
         const k = std.fmt.bufPrint(&kb, "doc_{d}", .{std.time.milliTimestamp()}) catch
             return err(400, "bad key");
-        return doInsert(srv, col_name, k, body);
+        return doInsert(srv, tenant_id, col_name, k, body);
     };
-    return doInsert(srv, col_name, key_raw, body);
+    return doInsert(srv, tenant_id, col_name, key_raw, body);
 }
 
-fn doInsert(srv: *Server, col_name: []const u8, key: []const u8, value: []const u8) usize {
-    const col = srv.db.collection(col_name) catch return err(500, "open collection failed");
+fn doInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, value: []const u8) usize {
+    const start_ns = std.time.nanoTimestamp();
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    srv.db.ensureTenantStorageAvailable(tenant_id, value.len) catch return err(429, "tenant storage quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
     const doc_id = col.insert(key, value) catch return err(500, "insert failed");
+    srv.recordQueryCost(tenant_id, "insert", 1, value.len, start_ns);
     var fbs = std.io.fixedBufferStream(getBodyBuf());
     std.fmt.format(fbs.writer(),
-        "{{\"doc_id\":{d},\"key\":\"{s}\",\"collection\":\"{s}\"}}",
-        .{ doc_id, key, col_name }) catch {};
+        "{{\"doc_id\":{d},\"key\":\"{s}\",\"collection\":\"{s}\",\"tenant\":\"{s}\"}}",
+        .{ doc_id, key, col_name, tenant_id }) catch {};
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 
-fn handleGet(srv: *Server, col_name: []const u8, key: []const u8) usize {
-        const col = srv.db.collection(col_name) catch return err(500, "open collection failed");
-        const d = col.get(key) orelse return err(404, "not found");
+fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, as_of: ?i64) usize {
+        const start_ns = std.time.nanoTimestamp();
+        srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+        const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+        const d = if (as_of) |ts_ms|
+            (col.getAsOfTimestamp(key, ts_ms) orelse return err(404, "not found"))
+        else
+            (col.get(key) orelse return err(404, "not found"));
+        srv.recordQueryCost(tenant_id, "get", 1, d.key.len + d.value.len, start_ns);
 
         // Write JSON body directly into resp_buf at offset 256 (reserve space for headers)
         const HEADER_RESERVE = 256;
@@ -250,32 +343,47 @@ fn handleGet(srv: *Server, col_name: []const u8, key: []const u8) usize {
         return hdr_len + body_len;
     }
 
-fn handleUpdate(srv: *Server, col_name: []const u8, key: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
+fn handleUpdate(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
+    const start_ns = std.time.nanoTimestamp();
     _ = alloc;
-    const col = srv.db.collection(col_name) catch return err(500, "open collection failed");
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    srv.db.ensureTenantStorageAvailable(tenant_id, body.len) catch return err(429, "tenant storage quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
     const updated = col.update(key, body) catch return err(500, "update failed");
     if (!updated) return err(404, "not found");
+    srv.recordQueryCost(tenant_id, "update", 1, body.len, start_ns);
     return ok("{\"updated\":true}");
 }
 
-fn handleDelete(srv: *Server, col_name: []const u8, key: []const u8) usize {
-    const col = srv.db.collection(col_name) catch return err(500, "open collection failed");
+fn handleDelete(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8) usize {
+    const start_ns = std.time.nanoTimestamp();
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
     const deleted = col.delete(key) catch return err(500, "delete failed");
     if (!deleted) return err(404, "not found");
+    srv.recordQueryCost(tenant_id, "delete", 1, 0, start_ns);
     return ok("{\"deleted\":true}");
 }
 
-fn handleScan(srv: *Server, col_name: []const u8, query_str: []const u8, alloc: std.mem.Allocator) usize {
+fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_str: []const u8, as_of: ?i64, alloc: std.mem.Allocator) usize {
+    const start_ns = std.time.nanoTimestamp();
     const limit: u32 = qparamInt(query_str, "limit") orelse 20;
     const offset: u32 = qparamInt(query_str, "offset") orelse 0;
-    const col = srv.db.collection(col_name) catch return err(500, "open collection failed");
-    const result = col.scan(limit, offset, alloc) catch return err(500, "scan failed");
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+    const result = if (as_of) |ts_ms|
+        col.scanAsOfTimestamp(ts_ms, limit, offset, alloc) catch return err(500, "scan failed")
+    else
+        col.scan(limit, offset, alloc) catch return err(500, "scan failed");
     defer result.deinit();
+    var bytes_read: u64 = 0;
+    for (result.docs) |d| bytes_read += d.key.len + d.value.len;
+    srv.recordQueryCost(tenant_id, "scan", result.docs.len, bytes_read, start_ns);
 
     var fbs = std.io.fixedBufferStream(getBodyBuf());
     const w = fbs.writer();
-    std.fmt.format(w, "{{\"collection\":\"{s}\",\"count\":{d},\"docs\":[",
-        .{ col_name, result.docs.len }) catch {};
+    std.fmt.format(w, "{{\"tenant\":\"{s}\",\"collection\":\"{s}\",\"count\":{d},\"docs\":[",
+        .{ tenant_id, col_name, result.docs.len }) catch {};
     for (result.docs, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
         std.fmt.format(w,
@@ -287,15 +395,23 @@ fn handleScan(srv: *Server, col_name: []const u8, query_str: []const u8, alloc: 
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 
-fn handleDrop(srv: *Server, col_name: []const u8) usize {
-    srv.db.dropCollection(col_name);
+fn handleDrop(srv: *Server, tenant_id: []const u8, col_name: []const u8) usize {
+    const start_ns = std.time.nanoTimestamp();
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    srv.db.dropCollectionForTenant(tenant_id, col_name);
+    srv.recordQueryCost(tenant_id, "drop", 0, 0, start_ns);
     return ok("{\"dropped\":true}");
 }
 
-fn handleSearch(srv: *Server, col_name: []const u8, query: []const u8, limit: u32, alloc: std.mem.Allocator) usize {
-    const col = srv.db.collection(col_name) catch return err(500, "open collection failed");
+fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query: []const u8, limit: u32, alloc: std.mem.Allocator) usize {
+    const start_ns = std.time.nanoTimestamp();
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
     const result = col.searchText(query, limit, alloc) catch return err(500, "search failed");
     defer result.deinit();
+    var bytes_read: u64 = 0;
+    for (result.docs) |d| bytes_read += d.key.len + d.value.len;
+    srv.recordQueryCost(tenant_id, "search", result.docs.len, bytes_read, start_ns);
 
     var fbs = std.io.fixedBufferStream(getBodyBuf());
     const w = fbs.writer();
@@ -313,20 +429,127 @@ fn handleSearch(srv: *Server, col_name: []const u8, query: []const u8, limit: u3
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 
-fn handleListCollections(srv: *Server, alloc: std.mem.Allocator) usize {
-    _ = alloc;
+fn handleListCollections(srv: *Server, tenant_id: []const u8, alloc: std.mem.Allocator) usize {
+    const start_ns = std.time.nanoTimestamp();
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    var cols = srv.db.listCollectionsForTenant(tenant_id, alloc) catch return err(500, "list collections failed");
+    defer {
+        for (cols.items) |name| alloc.free(name);
+        cols.deinit(alloc);
+    }
     var fbs = std.io.fixedBufferStream(getBodyBuf());
     const w = fbs.writer();
-    w.writeAll("{\"collections\":[") catch {};
-    var it = srv.db.collections.keyIterator();
-    var first = true;
-    while (it.next()) |k| {
-        if (!first) w.writeByte(',') catch {};
-        first = false;
-        std.fmt.format(w, "\"{s}\"", .{k.*}) catch {};
+    std.fmt.format(w, "{{\"tenant\":\"{s}\",\"collections\":[", .{tenant_id}) catch {};
+    for (cols.items, 0..) |name, i| {
+        if (i > 0) w.writeByte(',') catch {};
+        std.fmt.format(w, "\"{s}\"", .{name}) catch {};
+    }
+    srv.recordQueryCost(tenant_id, "list_collections", cols.items.len, 0, start_ns);
+    w.writeAll("]}") catch {};
+    return ok(getBodyBuf()[0..fbs.pos]);
+}
+
+fn handleBillingLog(srv: *Server) usize {
+    var fbs = std.io.fixedBufferStream(getBodyBuf());
+    const w = fbs.writer();
+    w.writeAll("{\"queries\":[") catch {};
+    srv.billing_mu.lock();
+    defer srv.billing_mu.unlock();
+    const start = if (srv.billing_log.items.len > 100) srv.billing_log.items.len - 100 else 0;
+    for (srv.billing_log.items[start..], 0..) |entry, i| {
+        if (i > 0) w.writeByte(',') catch {};
+        std.fmt.format(w,
+            "{{\"tenant\":\"{s}\",\"op\":\"{s}\",\"rows_scanned\":{d},\"bytes_read\":{d},\"cpu_us\":{d},\"cost_nanos_usd\":{d}}}",
+            .{
+                entry.tenant_id[0..entry.tenant_id_len],
+                entry.op[0..entry.op_len],
+                entry.rows_scanned,
+                entry.bytes_read,
+                entry.cpu_us,
+                entry.cost_nanos_usd,
+            },
+        ) catch {};
     }
     w.writeAll("]}") catch {};
     return ok(getBodyBuf()[0..fbs.pos]);
+}
+
+fn handleResourceState(srv: *Server) usize {
+    var fbs = std.io.fixedBufferStream(getBodyBuf());
+    std.fmt.format(
+        fbs.writer(),
+        "{{\"state\":\"{s}\",\"queries_per_second\":{d},\"last_query_ms\":{d}}}",
+        .{ resourceStateName(srv.activity.state()), srv.activity.queriesPerSecond(), srv.activity.lastQueryMs() },
+    ) catch {};
+    return ok(getBodyBuf()[0..fbs.pos]);
+}
+
+fn handleWebhookRegistration(srv: *Server, body: []const u8) usize {
+    const tenant = jsonStr(body, "tenant") orelse return err(400, "missing tenant");
+    const webhook = jsonStr(body, "webhook_url") orelse return err(400, "missing webhook_url");
+    const secret = jsonStr(body, "secret") orelse return err(400, "missing secret");
+    const collection_name = jsonStr(body, "collection") orelse "";
+    const id = srv.db.registerWebhook(tenant, collection_name, webhook, secret) catch return err(500, "register webhook failed");
+    var fbs = std.io.fixedBufferStream(getBodyBuf());
+    std.fmt.format(fbs.writer(), "{{\"subscription_id\":{d}}}", .{id}) catch {};
+    return ok(getBodyBuf()[0..fbs.pos]);
+}
+
+fn handleCdcEvents(srv: *Server, tenant_filter: ?[]const u8, alloc: std.mem.Allocator) usize {
+    const deliveries = srv.db.listWebhookDeliveries(alloc, tenant_filter) catch return err(500, "cdc read failed");
+    defer alloc.free(deliveries);
+    var fbs = std.io.fixedBufferStream(getBodyBuf());
+    const w = fbs.writer();
+    w.writeAll("{\"events\":[") catch {};
+    for (deliveries, 0..) |entry, i| {
+        if (i > 0) w.writeByte(',') catch {};
+        std.fmt.format(w,
+            "{{\"seq\":{d},\"tenant\":\"{s}\",\"collection\":\"{s}\",\"webhook_url\":\"{s}\",\"signature\":\"{s}\",\"payload\":{s}}}",
+            .{
+                entry.seq,
+                entry.tenant(),
+                entry.collectionName(),
+                entry.webhook(),
+                &entry.signature_hex,
+                entry.payloadSlice(),
+            },
+        ) catch {};
+    }
+    w.writeAll("]}") catch {};
+    return ok(getBodyBuf()[0..fbs.pos]);
+}
+
+fn requestTenant(raw: []const u8, query: []const u8) []const u8 {
+    return header(raw, "X-Tenant-Id: ") orelse qparam(query, "tenant") orelse collection.DEFAULT_TENANT;
+}
+
+fn requestAsOf(raw: []const u8, query: []const u8) ?i64 {
+    const value = header(raw, "X-As-Of: ") orelse qparam(query, "as_of") orelse return null;
+    return parseAsOfTimestamp(value);
+}
+
+fn header(raw: []const u8, needle: []const u8) ?[]const u8 {
+    const pos = std.mem.indexOf(u8, raw, needle) orelse return null;
+    const start = pos + needle.len;
+    const end = std.mem.indexOfScalarPos(u8, raw, start, '\r') orelse
+        std.mem.indexOfScalarPos(u8, raw, start, '\n') orelse raw.len;
+    const value = raw[start..end];
+    return if (value.len > 0) value else null;
+}
+
+fn parseAsOfTimestamp(value: []const u8) ?i64 {
+    const parsed = std.fmt.parseInt(i64, value, 10) catch return null;
+    if (parsed < 0) return null;
+    return if (parsed < 1_000_000_000_000) parsed * 1000 else parsed;
+}
+
+fn resourceStateName(state: activity.ResourceState) []const u8 {
+    return switch (state) {
+        .deep_sleep => "deep_sleep",
+        .light_sleep => "light_sleep",
+        .warm => "warm",
+        .hot => "hot",
+    };
 }
 
 // ─── response helpers ────────────────────────────────────────────────────
@@ -341,6 +564,7 @@ fn err(code: u16, msg: []const u8) usize {
     const body = std.fmt.bufPrint(&scratch, "{{\"error\":\"{s}\"}}", .{msg}) catch msg;
     const status = switch (code) {
         400 => "Bad Request",
+        429 => "Too Many Requests",
         404 => "Not Found",
         else => "Internal Server Error",
     };
@@ -386,4 +610,15 @@ fn qparam(query: []const u8, key: []const u8) ?[]const u8 {
     while (end < query.len and query[end] != '&') end += 1;
     if (end == start) return null;
     return query[start..end];
+}
+
+test "parse as_of accepts seconds and milliseconds" {
+    try std.testing.expectEqual(@as(?i64, 1_700_000_000_000), parseAsOfTimestamp("1700000000"));
+    try std.testing.expectEqual(@as(?i64, 1_700_000_000_123), parseAsOfTimestamp("1700000000123"));
+    try std.testing.expectEqual(@as(?i64, null), parseAsOfTimestamp("not-a-timestamp"));
+}
+
+test "request tenant prefers header over query" {
+    const raw = "GET /db/users?tenant=query-tenant HTTP/1.1\r\nX-Tenant-Id: header-tenant\r\n\r\n";
+    try std.testing.expectEqualStrings("header-tenant", requestTenant(raw, "tenant=query-tenant"));
 }

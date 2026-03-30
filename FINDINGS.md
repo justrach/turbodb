@@ -225,9 +225,100 @@ All crypto functions are available via:
 - **C ABI**: `turbodb_sha256(data, len, out)` (10 exported symbols in libturbodb)
 - **Python**: `from turbodb import crypto; crypto.sha256_hex(b"data")`
 
+
 ---
 
-## 6. Reproducing These Results
+## 6. Calvin Replication — Cluster Test Results
+
+### What is Calvin?
+
+Calvin is a deterministic replication protocol (Yale, 2012) that eliminates Two-Phase Commit (2PC). Instead of letting each node negotiate transaction ordering:
+
+1. A **sequencer** (leader) assigns a global total order to all transactions
+2. The ordered batch is **broadcast** to all replicas
+3. Every node **executes deterministically** in the same order
+4. All nodes converge to **identical state** — no voting, no 2PC, no distributed locks
+
+### Test: In-Process E2E (2 databases, 1 process)
+
+```
+zig build test-calvin
+```
+
+| Step | What happened |
+|------|---------------|
+| Open 2 databases | Separate mmap + WAL at `/tmp/calvin_test_leader` and `/tmp/calvin_test_replica` |
+| Submit 5 txns | 3 users + 2 orders → sequencer |
+| Drain batch | epoch=0, seq_start=0, 5 transactions |
+| Serialize | 419 bytes (simulated network payload) |
+| Leader executes | Applied 5 inserts to leader DB |
+| Replica deserializes + executes | Same 5 inserts applied to replica DB |
+| **Verify consistency** | **5/5 documents byte-identical** |
+
+```
+PASS  users/alice   → leader={"name":"Alice","age":30}      replica={"name":"Alice","age":30}
+PASS  users/bob     → leader={"name":"Bob","age":25}        replica={"name":"Bob","age":25}
+PASS  users/charlie → leader={"name":"Charlie","age":35}    replica={"name":"Charlie","age":35}
+PASS  orders/ord-001 → leader={"user":"alice","total":99.99} replica={"user":"alice","total":99.99}
+PASS  orders/ord-002 → leader={"user":"bob","total":42.50}  replica={"user":"bob","total":42.50}
+```
+
+### Test: 3-Node Docker Cluster (Colima)
+
+```bash
+bash bench/test_calvin_cluster.sh
+```
+
+| Component | Details |
+|-----------|---------|
+| **node-0** | Leader/sequencer, port 27017, Calvin node_id=0 |
+| **node-1** | Replica, port 27018, Calvin node_id=1 |
+| **node-2** | Replica, port 27019, Calvin node_id=2 |
+| **Image** | `turbodb-node:latest` — 3.1MB static binary on Debian slim |
+| **Binary** | Cross-compiled: `zig build -Dtarget=aarch64-linux -Doptimize=ReleaseFast` |
+
+Results:
+- All 3 nodes healthy (wire protocol accepting connections)
+- Calvin replication active on all nodes (leader=true/false logged correctly)
+- In-container E2E test: **5/5 PASS, CONSISTENT**
+- Wire protocol reachable from host on all 3 ports
+
+### Calvin vs 2PC — Why this matters
+
+| | Calvin (TurboDB) | 2PC (Traditional) |
+|---|---|---|
+| Network round-trips | 1 broadcast | 2 (prepare + commit) |
+| Locks between nodes | None | Held during entire 2PC |
+| Coordinator failure | Sequencer handoff | All nodes stuck waiting |
+| Throughput | Batch-amortized | Per-transaction overhead |
+| Latency | Batch window (5ms default) | 2 RTTs minimum |
+| Complexity | Sequencer + deterministic exec | Coordinator + participant + recovery log |
+
+### Running the cluster yourself
+
+```bash
+# 1. Cross-compile for Linux
+zig build -Doptimize=ReleaseFast -Dtarget=aarch64-linux
+
+# 2. Build Docker image
+docker build -f bench/docker/turbodb-cluster.Dockerfile -t turbodb-node .
+
+# 3. Start 3-node cluster
+docker compose -f bench/docker/calvin-cluster.yml up -d
+
+# 4. Run E2E test
+docker compose -f bench/docker/calvin-cluster.yml run --rm tester
+
+# 5. Tear down
+docker compose -f bench/docker/calvin-cluster.yml down -v
+
+# Or all-in-one:
+bash bench/test_calvin_cluster.sh
+```
+
+---
+
+## 7. Reproducing These Results
 
 ```bash
 # Full regression benchmark (21 subsystems)
@@ -244,6 +335,15 @@ python3 bench/triple_bench.py --turbodb-port 27030
 
 # Just TurboDB vs MongoDB
 python3 bench/bench.py
+
+# Calvin replication E2E test (in-process, 2 databases)
+zig build test-calvin
+
+# Calvin 3-node Docker cluster test
+bash bench/test_calvin_cluster.sh
+
+# All unit tests (27 subsystems, ~200 tests)
+zig build test-all
 ```
 
 ### Environment

@@ -32,33 +32,70 @@ pub const Db = struct {
         return self.inner.collection(name);
     }
 
+    pub fn collectionForTenant(self: *Db, tenant_id: []const u8, name: []const u8) !*Collection {
+        return self.inner.collectionForTenant(tenant_id, name);
+    }
+
     /// Shorthand: insert into a collection.
     pub fn insert(self: *Db, col_name: []const u8, key: []const u8, value: []const u8) !u64 {
-        const col = try self.inner.collection(col_name);
+        return self.insertForTenant(collection_mod.DEFAULT_TENANT, col_name, key, value);
+    }
+
+    pub fn insertForTenant(self: *Db, tenant_id: []const u8, col_name: []const u8, key: []const u8, value: []const u8) !u64 {
+        try self.inner.recordTenantOperation(tenant_id);
+        try self.inner.ensureTenantStorageAvailable(tenant_id, value.len);
+        const col = try self.inner.collectionForTenant(tenant_id, col_name);
         return col.insert(key, value);
     }
 
     /// Shorthand: get from a collection.
     pub fn get(self: *Db, col_name: []const u8, key: []const u8) !?Doc {
-        const col = try self.inner.collection(col_name);
+        return self.getForTenant(collection_mod.DEFAULT_TENANT, col_name, key);
+    }
+
+    pub fn getForTenant(self: *Db, tenant_id: []const u8, col_name: []const u8, key: []const u8) !?Doc {
+        try self.inner.recordTenantOperation(tenant_id);
+        const col = try self.inner.collectionForTenant(tenant_id, col_name);
         return col.get(key);
+    }
+
+    pub fn getForTenantAsOf(self: *Db, tenant_id: []const u8, col_name: []const u8, key: []const u8, ts_ms: i64) !?Doc {
+        try self.inner.recordTenantOperation(tenant_id);
+        const col = try self.inner.collectionForTenant(tenant_id, col_name);
+        return col.getAsOfTimestamp(key, ts_ms);
     }
 
     /// Shorthand: update in a collection.
     pub fn update(self: *Db, col_name: []const u8, key: []const u8, value: []const u8) !bool {
-        const col = try self.inner.collection(col_name);
+        return self.updateForTenant(collection_mod.DEFAULT_TENANT, col_name, key, value);
+    }
+
+    pub fn updateForTenant(self: *Db, tenant_id: []const u8, col_name: []const u8, key: []const u8, value: []const u8) !bool {
+        try self.inner.recordTenantOperation(tenant_id);
+        try self.inner.ensureTenantStorageAvailable(tenant_id, value.len);
+        const col = try self.inner.collectionForTenant(tenant_id, col_name);
         return col.update(key, value);
     }
 
     /// Shorthand: delete from a collection.
     pub fn delete(self: *Db, col_name: []const u8, key: []const u8) !bool {
-        const col = try self.inner.collection(col_name);
+        return self.deleteForTenant(collection_mod.DEFAULT_TENANT, col_name, key);
+    }
+
+    pub fn deleteForTenant(self: *Db, tenant_id: []const u8, col_name: []const u8, key: []const u8) !bool {
+        try self.inner.recordTenantOperation(tenant_id);
+        const col = try self.inner.collectionForTenant(tenant_id, col_name);
         return col.delete(key);
     }
 
     /// Shorthand: search (trigram-indexed).
     pub fn search(self: *Db, col_name: []const u8, query: []const u8, limit: u32, alloc: std.mem.Allocator) !Collection.TextSearchResult {
-        const col = try self.inner.collection(col_name);
+        return self.searchForTenant(collection_mod.DEFAULT_TENANT, col_name, query, limit, alloc);
+    }
+
+    pub fn searchForTenant(self: *Db, tenant_id: []const u8, col_name: []const u8, query: []const u8, limit: u32, alloc: std.mem.Allocator) !Collection.TextSearchResult {
+        try self.inner.recordTenantOperation(tenant_id);
+        const col = try self.inner.collectionForTenant(tenant_id, col_name);
         return col.searchText(query, limit, alloc);
     }
 };
@@ -97,4 +134,22 @@ test "embedded client: open, insert, get, search" {
 
     // Cleanup
     std.fs.cwd().deleteTree(tmp_dir) catch {};
+}
+
+test "embedded client isolates tenants" {
+    const alloc = std.testing.allocator;
+    const tmp_dir = "/tmp/turbodb_client_tenants";
+    std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    var db = try Db.open(alloc, tmp_dir);
+    defer db.close();
+    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+
+    _ = try db.insertForTenant("tenant-a", "users", "u1", "{\"name\":\"alice\"}");
+    _ = try db.insertForTenant("tenant-b", "users", "u1", "{\"name\":\"bob\"}");
+
+    const a_doc = (try db.getForTenant("tenant-a", "users", "u1")).?;
+    const b_doc = (try db.getForTenant("tenant-b", "users", "u1")).?;
+    try std.testing.expectEqualStrings("{\"name\":\"alice\"}", a_doc.value);
+    try std.testing.expectEqualStrings("{\"name\":\"bob\"}", b_doc.value);
 }

@@ -53,6 +53,10 @@ pub const PageFile = struct {
         self.mm.close();
     }
 
+    pub fn sync(self: *PageFile) !void {
+        try self.mm.syncSync();
+    }
+
     /// Allocate a fresh page. Returns the page number.
     pub fn allocPage(self: *PageFile, ptype: PageType) !u32 {
         self.mu.lock();

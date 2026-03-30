@@ -251,6 +251,27 @@ pub fn build(b: *std.Build) void {
     const partbench_step = b.step("bench-partition", "Run partition scaling benchmark");
     partbench_step.dependOn(&partbench_run.step);
 
+    // ── Calvin E2E test ─────────────────────────────────────────────────────
+    const calvin_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/test_calvin_e2e.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    wireStorage(calvin_test_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+
+    const calvin_test_exe = b.addExecutable(.{
+        .name = "test-calvin",
+        .root_module = calvin_test_mod,
+    });
+    b.installArtifact(calvin_test_exe);
+
+    const calvin_test_run = b.addRunArtifact(calvin_test_exe);
+    calvin_test_run.step.dependOn(b.getInstallStep());
+    const calvin_test_step = b.step("test-calvin", "Run Calvin replication E2E test");
+    calvin_test_step.dependOn(&calvin_test_run.step);
+
+
     // ── Test steps ──────────────────────────────────────────────────────────
 
     // Helper: add a test module with storage imports
@@ -295,6 +316,10 @@ pub fn build(b: *std.Build) void {
         "src/partition.zig",
         "src/columnar.zig",
         "src/mvcc.zig",
+        "src/activity.zig",
+        "src/cdc.zig",
+        "src/branching.zig",
+        "src/marketplace.zig",
         "src/crypto.zig",
         "src/vector.zig",
         "src/auth.zig",
@@ -306,6 +331,8 @@ pub fn build(b: *std.Build) void {
         "src/replication/calvin.zig",
         "src/replication/shard.zig",
         "src/replication/router.zig",
+        "src/replication/peer.zig",
+        "src/replication/integration.zig",
     };
 
     const test_all_step = b.step("test-all", "Run all tests (core + new subsystems)");

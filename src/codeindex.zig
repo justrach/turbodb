@@ -35,6 +35,7 @@ pub const WordIndex = struct {
         // Free per-file word sets
         var fw_iter = self.file_words.iterator();
         while (fw_iter.next()) |entry| {
+            self.allocator.free(entry.key_ptr.*);
             entry.value_ptr.deinit();
         }
         self.file_words.deinit();
@@ -68,7 +69,9 @@ pub const WordIndex = struct {
         }
 
         words_set.deinit();
-        _ = self.file_words.remove(path);
+        if (self.file_words.fetchRemove(path)) |removed| {
+            self.allocator.free(removed.key);
+        }
     }
 
 
@@ -201,13 +204,17 @@ pub const TrigramIndex = struct {
     pub fn deinit(self: *TrigramIndex) void {
         var iter = self.index.iterator();
         while (iter.next()) |entry| {
+            var path_iter = entry.value_ptr.iterator();
+            while (path_iter.next()) |path_entry| {
+                self.allocator.free(path_entry.key_ptr.*);
+            }
             entry.value_ptr.deinit();
         }
         self.index.deinit();
 
         var ft_iter = self.file_trigrams.iterator();
         while (ft_iter.next()) |entry| {
-            if (self.owns_paths) self.allocator.free(entry.key_ptr.*);
+            self.allocator.free(entry.key_ptr.*);
             entry.value_ptr.deinit(self.allocator);
         }
         self.file_trigrams.deinit();
@@ -217,7 +224,9 @@ pub const TrigramIndex = struct {
         const trigrams = self.file_trigrams.getPtr(path) orelse return;
         for (trigrams.items) |tri| {
             if (self.index.getPtr(tri)) |file_set| {
-                _ = file_set.remove(path);
+                if (file_set.fetchRemove(path)) |removed| {
+                    self.allocator.free(removed.key);
+                }
                 if (file_set.count() == 0) {
                     file_set.deinit();
                     _ = self.index.remove(tri);
@@ -225,7 +234,9 @@ pub const TrigramIndex = struct {
             }
         }
         trigrams.deinit(self.allocator);
-        _ = self.file_trigrams.remove(path);
+        if (self.file_trigrams.fetchRemove(path)) |removed| {
+            self.allocator.free(removed.key);
+        }
     }
 
     pub fn indexFile(self: *TrigramIndex, path: []const u8, content: []const u8) !void {
@@ -1518,4 +1529,3 @@ pub const SparseNgramIndex = struct {
         return @intCast(self.file_ngrams.count());
     }
 };
-
