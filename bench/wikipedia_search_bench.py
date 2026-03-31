@@ -321,6 +321,71 @@ class MySQLEngine(Engine):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+# ClickHouse
+# ═══════════════════════════════════════════════════════════════════════════════
+
+class ClickHouseEngine(Engine):
+    name = "ClickHouse"
+
+    def setup(self, docs):
+        import clickhouse_connect
+        self.client = clickhouse_connect.get_client(host='localhost')
+        self.client.command("DROP TABLE IF EXISTS wiki_bench.articles")
+        self.client.command("CREATE DATABASE IF NOT EXISTS wiki_bench")
+        self.client.command("""
+            CREATE TABLE wiki_bench.articles (
+                key String,
+                title String,
+                text String,
+                length UInt32
+            ) ENGINE = MergeTree()
+            ORDER BY key
+        """)
+
+    def _create_indexes(self):
+        # ClickHouse doesn't have secondary indexes in the traditional sense.
+        # MergeTree primary key (ORDER BY key) handles point lookups.
+        # For full-text we use hasToken/multiSearchAny which scan but are SIMD-fast.
+        pass
+
+    def insert_one(self, key, title, text, length):
+        self.client.insert("wiki_bench.articles",
+                          [[key, title, text, length]],
+                          column_names=["key", "title", "text", "length"])
+
+    def get_one(self, key):
+        result = self.client.query("SELECT key, title, length FROM wiki_bench.articles WHERE key = {k:String}", parameters={"k": key})
+        return result.first_row if result.row_count > 0 else None
+
+    def scan_page(self, limit, offset):
+        result = self.client.query(f"SELECT key, title, length FROM wiki_bench.articles LIMIT {limit} OFFSET {offset}")
+        return result.result_rows
+
+    def search_fts(self, query, limit=20):
+        # ClickHouse full-text: use hasToken for word matching (tokenized)
+        tokens = query.split()
+        conditions = " AND ".join(f"hasTokenCaseInsensitive(text, {{t{i}:String}})" for i in range(len(tokens)))
+        params = {f"t{i}": t for i, t in enumerate(tokens)}
+        result = self.client.query(
+            f"SELECT key, title FROM wiki_bench.articles WHERE {conditions} LIMIT {limit}",
+            parameters=params)
+        return result.result_rows
+
+    def search_substr(self, query, limit=20):
+        result = self.client.query(
+            "SELECT key, title FROM wiki_bench.articles WHERE positionCaseInsensitive(text, {q:String}) > 0 LIMIT {lim:UInt32}",
+            parameters={"q": query, "lim": limit})
+        return result.result_rows
+
+    def teardown(self):
+        if hasattr(self, 'client'):
+            try:
+                self.client.command("DROP TABLE IF EXISTS wiki_bench.articles")
+                self.client.close()
+            except: pass
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 # Benchmark runner
 # ═══════════════════════════════════════════════════════════════════════════════
 
@@ -476,7 +541,7 @@ def main():
     # Use same random seed for fair comparison
     random.seed(42)
 
-    engines = [TurboDBEngine(), PostgresEngine(), MongoEngine(), MySQLEngine()]
+    engines = [TurboDBEngine(), PostgresEngine(), MongoEngine(), MySQLEngine(), ClickHouseEngine()]
     all_results = {}
 
     for eng in engines:
