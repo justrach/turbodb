@@ -243,9 +243,7 @@ pub const Collection = struct {
             const owned_val = self.alloc.dupe(u8, value) catch null;
             if (owned_key != null and owned_val != null) {
                 if (!self.index_queue.push(owned_key.?, owned_val.?)) {
-                    // Queue full — index synchronously as fallback.
-                    self.tri.indexFile(owned_key.?, owned_val.?) catch {};
-                    self.words.indexFile(owned_key.?, owned_val.?) catch {};
+                    // Queue full — drop index entry (search is best-effort).
                     self.alloc.free(owned_key.?);
                     self.alloc.free(owned_val.?);
                 }
