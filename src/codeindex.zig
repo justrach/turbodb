@@ -80,6 +80,9 @@ pub const WordIndex = struct {
         // Clean up old entries first
         self.removeFile(path);
 
+        // Dupe path so hits survive after the caller's buffer is freed.
+        const owned_path = try self.allocator.dupe(u8, path);
+
         var words_set = std.StringHashMap(void).init(self.allocator);
         errdefer words_set.deinit();
         var line_num: u32 = 0;
@@ -101,7 +104,7 @@ pub const WordIndex = struct {
 
                 if (gop.value_ptr.items.len > 0) {
                     const last = gop.value_ptr.items[gop.value_ptr.items.len - 1];
-                    if (std.mem.eql(u8, last.path, path) and last.line_num == line_num) {
+                    if (std.mem.eql(u8, last.path, owned_path) and last.line_num == line_num) {
                         // Avoid duplicate hits for repeated words on the same line.
                         const wgop = try words_set.getOrPut(word);
                         if (!wgop.found_existing) wgop.key_ptr.* = gop.key_ptr.*;
@@ -110,7 +113,7 @@ pub const WordIndex = struct {
                 }
 
                 try gop.value_ptr.append(self.allocator, .{
-                    .path = path,
+                    .path = owned_path,
                     .line_num = line_num,
                 });
 
@@ -123,7 +126,6 @@ pub const WordIndex = struct {
             }
         }
 
-        const owned_path = try self.allocator.dupe(u8, path);
         try self.file_words.put(owned_path, words_set);
     }
 

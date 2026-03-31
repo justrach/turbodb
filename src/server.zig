@@ -251,7 +251,9 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
     // Route: /search/:col?q=...
     if (std.mem.startsWith(u8, path, "/search/") and std.mem.eql(u8, method, "GET")) {
         const col_name = path[8..];
-        const q = qparam(query, "q") orelse return err(400, "missing q parameter");
+        const q_raw = qparam(query, "q") orelse return err(400, "missing q parameter");
+        var decode_buf: [4096]u8 = undefined;
+        const q = urlDecode(q_raw, &decode_buf) orelse q_raw;
         const limit_val: u32 = qparamInt(query, "limit") orelse 50;
         return handleSearch(srv, requestTenant(raw, query), col_name, q, limit_val, alloc);
     }
@@ -416,8 +418,8 @@ fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query
     var fbs = std.io.fixedBufferStream(getBodyBuf());
     const w = fbs.writer();
     std.fmt.format(w,
-        "{{\"query\":\"{s}\",\"hits\":{d},\"candidates\":{d},\"total_files\":{d},\"results\":[",
-        .{ query, result.docs.len, result.candidate_paths.len, result.total_files }) catch {};
+        "{{\"query\":\"{s}\",\"hits\":{d},\"candidates\":{d},\"total_docs\":{d},\"total_files\":{d},\"results\":[",
+        .{ query, result.docs.len, result.candidate_paths.len, result.total_files, result.total_files }) catch {};
     for (result.docs, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
         std.fmt.format(w,
@@ -610,6 +612,47 @@ fn qparam(query: []const u8, key: []const u8) ?[]const u8 {
     while (end < query.len and query[end] != '&') end += 1;
     if (end == start) return null;
     return query[start..end];
+}
+
+/// Decode percent-encoded URL string (%20 → space, + → space, %XX → byte).
+/// Returns decoded slice within `buf`, or null if buffer too small.
+fn urlDecode(encoded: []const u8, buf: []u8) ?[]const u8 {
+    var i: usize = 0;
+    var o: usize = 0;
+    while (i < encoded.len) {
+        if (o >= buf.len) return null;
+        if (encoded[i] == '+') {
+            buf[o] = ' ';
+            i += 1;
+        } else if (encoded[i] == '%' and i + 2 < encoded.len) {
+            const hi = hexVal(encoded[i + 1]) orelse {
+                buf[o] = encoded[i];
+                i += 1;
+                o += 1;
+                continue;
+            };
+            const lo = hexVal(encoded[i + 2]) orelse {
+                buf[o] = encoded[i];
+                i += 1;
+                o += 1;
+                continue;
+            };
+            buf[o] = @as(u8, hi) << 4 | @as(u8, lo);
+            i += 3;
+        } else {
+            buf[o] = encoded[i];
+            i += 1;
+        }
+        o += 1;
+    }
+    return buf[0..o];
+}
+
+fn hexVal(c: u8) ?u4 {
+    if (c >= '0' and c <= '9') return @intCast(c - '0');
+    if (c >= 'a' and c <= 'f') return @intCast(c - 'a' + 10);
+    if (c >= 'A' and c <= 'F') return @intCast(c - 'A' + 10);
+    return null;
 }
 
 test "parse as_of accepts seconds and milliseconds" {

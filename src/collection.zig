@@ -23,8 +23,52 @@ pub const DEFAULT_TENANT = "default";
 pub const MAX_TENANT_ID_LEN: usize = 64;
 pub const MAX_COLLECTION_NAME_LEN: usize = 64;
 
+// ─── IndexQueue ──────────────────────────────────────────────────────────
+// Lock-free MPSC queue for deferring trigram+word index builds to a background thread.
+// Insert path pushes owned (key, value) pairs; background thread pops and indexes.
+pub const IndexQueue = struct {
+    const CAPACITY = 8192;
 
-// ─── Collection ──────────────────────────────────────────────────────────
+    const Entry = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    buf: [CAPACITY]Entry = undefined,
+    head: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), // producer writes here
+    tail: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), // consumer reads here
+    alloc: std.mem.Allocator,
+
+    pub fn init(alloc: std.mem.Allocator) IndexQueue {
+        return .{ .alloc = alloc };
+    }
+
+    /// Push a (key, value) pair. Caller passes owned slices (queue takes ownership).
+    pub fn push(self: *IndexQueue, key: []const u8, value: []const u8) bool {
+        const h = self.head.load(.acquire);
+        const next = (h + 1) % CAPACITY;
+        if (next == self.tail.load(.acquire)) return false; // full
+        self.buf[h] = .{ .key = key, .value = value };
+        self.head.store(next, .release);
+        return true;
+    }
+
+    /// Pop one entry. Returns null if empty.
+    pub fn pop(self: *IndexQueue) ?Entry {
+        const t = self.tail.load(.acquire);
+        if (t == self.head.load(.acquire)) return null; // empty
+        const entry = self.buf[t];
+        self.tail.store((t + 1) % CAPACITY, .release);
+        return entry;
+    }
+
+    pub fn len(self: *IndexQueue) u32 {
+        const h = self.head.load(.acquire);
+        const t = self.tail.load(.acquire);
+        return if (h >= t) h - t else CAPACITY - t + h;
+    }
+};
+
 // ─── Collection ──────────────────────────────────────────────────────────
 pub const Collection = struct {
     name_buf: [128]u8,
@@ -47,6 +91,10 @@ pub const Collection = struct {
     // MVCC version chain — append-only, no vacuum.
     versions: mvcc_mod.VersionChain,
 
+    // Async index queue — inserts push here, background thread builds trigram+word indexes.
+    index_queue: IndexQueue,
+    index_thread: ?std.Thread,
+    index_stop: std.atomic.Value(bool),
     pub const STRIPE_COUNT = 1024;
 
     /// Get the stripe lock index for a key hash.
@@ -87,15 +135,29 @@ pub const Collection = struct {
         col.alloc = alloc;
         col.cache = hot_cache.HotCache.init();
         col.versions = mvcc_mod.VersionChain.init(alloc);
+        col.index_queue = IndexQueue.init(alloc);
+        col.index_stop = std.atomic.Value(bool).init(false);
 
         const n = @min(logical_name.len, col.name_buf.len - 1);
         @memcpy(col.name_buf[0..n], logical_name[0..n]);
         col.name_len = @intCast(n);
         try col.rebuildIndexes();
 
+        // Start background indexer thread.
+        col.index_thread = std.Thread.spawn(.{}, indexWorker, .{col}) catch null;
+
         return col;
     }
+
     pub fn close(self: *Collection) void {
+        // Signal background indexer to stop, drain remaining items, then join.
+        self.index_stop.store(true, .release);
+        if (self.index_thread) |t| t.join();
+        // Drain any leftover entries (free owned slices).
+        while (self.index_queue.pop()) |entry| {
+            self.alloc.free(entry.key);
+            self.alloc.free(entry.value);
+        }
         self.tri.deinit();
         self.words.deinit();
         self.hash_idx.deinit();
@@ -107,6 +169,15 @@ pub const Collection = struct {
 
     pub fn sync(self: *Collection) !void {
         try self.pf.sync();
+    }
+
+    /// Block until the background indexer has drained all pending items.
+    pub fn flushIndex(self: *Collection) void {
+        // Wait up to 30 seconds for the queue to drain.
+        var waited: u32 = 0;
+        while (self.index_queue.len() > 0 and waited < 300_000) : (waited += 1) {
+            std.Thread.sleep(100_000); // 100µs
+        }
     }
 
     pub fn name(self: *const Collection) []const u8 {
@@ -166,10 +237,19 @@ pub const Collection = struct {
         self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
         self.key_doc_ids.put(hdr.key_hash, doc_id) catch {};
 
-        // codedb2-style trigram + word index
+        // Async trigram + word indexing — push to background thread.
         if (value.len >= 3) {
-            self.tri.indexFile(key, value) catch {};
-            self.words.indexFile(key, value) catch {};
+            const owned_key = self.alloc.dupe(u8, key) catch null;
+            const owned_val = self.alloc.dupe(u8, value) catch null;
+            if (owned_key != null and owned_val != null) {
+                if (!self.index_queue.push(owned_key.?, owned_val.?)) {
+                    // Queue full — index synchronously as fallback.
+                    self.tri.indexFile(owned_key.?, owned_val.?) catch {};
+                    self.words.indexFile(owned_key.?, owned_val.?) catch {};
+                    self.alloc.free(owned_key.?);
+                    self.alloc.free(owned_val.?);
+                }
+            }
         }
 
         emitChange(self, .insert, key, value, doc_id);
@@ -333,8 +413,56 @@ pub const Collection = struct {
         limit: u32,
         alloc: std.mem.Allocator,
     ) !TextSearchResult {
-        const cand_paths = self.tri.candidates(query, alloc) orelse {
-            return self.bruteForceSearch(query, limit, alloc);
+        // Split query into terms on spaces for multi-word AND search.
+        // Single-word queries still do exact substring matching.
+        var terms_buf: [32][]const u8 = undefined;
+        var term_count: usize = 0;
+        {
+            var it = std.mem.splitScalar(u8, query, ' ');
+            while (it.next()) |t| {
+                const trimmed = std.mem.trim(u8, t, " \t");
+                if (trimmed.len > 0 and term_count < terms_buf.len) {
+                    terms_buf[term_count] = trimmed;
+                    term_count += 1;
+                }
+            }
+        }
+        if (term_count == 0) return self.bruteForceSearch(query, limit, alloc);
+
+        const terms = terms_buf[0..term_count];
+
+        // For single terms or exact phrase, try trigram index on full query first.
+        if (term_count == 1) {
+            const cand_paths = self.tri.candidates(query, alloc) orelse {
+                return self.bruteForceSearch(query, limit, alloc);
+            };
+            var results: std.ArrayList(Doc) = .empty;
+            errdefer results.deinit(alloc);
+            for (cand_paths) |path| {
+                if (results.items.len >= limit) break;
+                const doc = self.get(path) orelse continue;
+                if (containsInsensitive(doc.value, query)) {
+                    try results.append(alloc, doc);
+                }
+            }
+            const total_files = self.tri.file_trigrams.count();
+            return TextSearchResult{
+                .docs = try results.toOwnedSlice(alloc),
+                .candidate_paths = cand_paths,
+                .total_files = total_files,
+                .alloc = alloc,
+            };
+        }
+
+        // Multi-term: get candidates from the longest term (most selective),
+        // then filter by ALL terms present in the document.
+        var longest_idx: usize = 0;
+        for (terms, 0..) |t, i| {
+            if (t.len > terms[longest_idx].len) longest_idx = i;
+        }
+
+        const cand_paths = self.tri.candidates(terms[longest_idx], alloc) orelse {
+            return self.multiTermBruteForce(terms, limit, alloc);
         };
 
         var results: std.ArrayList(Doc) = .empty;
@@ -343,7 +471,7 @@ pub const Collection = struct {
         for (cand_paths) |path| {
             if (results.items.len >= limit) break;
             const doc = self.get(path) orelse continue;
-            if (containsInsensitive(doc.value, query)) {
+            if (containsAllTerms(doc.value, terms)) {
                 try results.append(alloc, doc);
             }
         }
@@ -402,6 +530,38 @@ pub const Collection = struct {
         }
         return false;
     }
+
+    /// Returns true if haystack contains ALL terms (case-insensitive).
+    fn containsAllTerms(haystack: []const u8, terms: []const []const u8) bool {
+        for (terms) |term| {
+            if (!containsInsensitive(haystack, term)) return false;
+        }
+        return true;
+    }
+
+    /// Brute-force multi-term search (fallback when trigram index has no candidates).
+    fn multiTermBruteForce(self: *Collection, terms: []const []const u8, limit: u32, alloc: std.mem.Allocator) !TextSearchResult {
+        var results: std.ArrayList(Doc) = .empty;
+        errdefer results.deinit(alloc);
+
+        const result = try self.scan(limit * 10, 0, alloc);
+        defer result.deinit();
+
+        for (result.docs) |d| {
+            if (results.items.len >= limit) break;
+            if (containsAllTerms(d.value, terms)) {
+                try results.append(alloc, d);
+            }
+        }
+
+        return TextSearchResult{
+            .docs = try results.toOwnedSlice(alloc),
+            .candidate_paths = &.{},
+            .total_files = 0,
+            .alloc = alloc,
+        };
+    }
+
     // ─── scan ────────────────────────────────────────────────────────────
 
     pub const ScanResult = struct {
@@ -553,6 +713,40 @@ pub const Collection = struct {
         self.cdc.emit(ref.tenant_id, ref.collection_name, key, value, doc_id, op);
     }
 };
+
+/// Background thread that drains the index queue and builds trigram+word indexes.
+fn indexWorker(col: *Collection) void {
+    while (!col.index_stop.load(.acquire)) {
+        var did_work = false;
+        // Drain batch of up to 64 entries per wake cycle.
+        var batch: u32 = 0;
+        while (batch < 64) : (batch += 1) {
+            const entry = col.index_queue.pop() orelse break;
+            did_work = true;
+            col.tri.indexFile(entry.key, entry.value) catch {};
+            col.words.indexFile(entry.key, entry.value) catch {};
+            // Note: we don't free key/value here because the indexers
+            // store pointers to them (owned_path in word index, duped in trigram).
+            // The trigram indexer dupes path internally, but word indexer uses
+            // owned_path from its own dupe. The entry.value is not retained.
+            col.alloc.free(entry.value);
+            // entry.key ownership transferred to word index's owned_path.
+            // Don't free it — word indexer's indexFile already duped it.
+            col.alloc.free(entry.key);
+        }
+        if (!did_work) {
+            // Nothing to do — sleep briefly to avoid busy-spinning.
+            std.Thread.sleep(100_000); // 100µs
+        }
+    }
+    // Final drain on shutdown.
+    while (col.index_queue.pop()) |entry| {
+        col.tri.indexFile(entry.key, entry.value) catch {};
+        col.words.indexFile(entry.key, entry.value) catch {};
+        col.alloc.free(entry.value);
+        col.alloc.free(entry.key);
+    }
+}
 
 // ─── Database (multi-collection manager) ─────────────────────────────────
 

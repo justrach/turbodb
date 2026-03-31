@@ -238,6 +238,11 @@ export fn turbodb_search(
     return 0;
 }
 
+export fn turbodb_flush_index(col_handle: *anyopaque) void {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    col.flushIndex();
+}
+
 // ── Version info ────────────────────────────────────────────────────────────
 
 export fn turbodb_version() [*:0]const u8 {
