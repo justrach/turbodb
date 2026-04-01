@@ -949,7 +949,7 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
     }
 
     /// Returns the number of indexed files (for staleness checks).
-    pub fn fileCount(self: *TrigramIndex) u32 {
+    pub fn fileCount(self: *const TrigramIndex) u32 {
         return @intCast(self.file_trigrams.count());
     }
 

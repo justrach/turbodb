@@ -220,6 +220,11 @@ pub const Collection = struct {
         return self.name_buf[0..self.name_len];
     }
 
+    /// Return the number of live indexed documents (excludes deleted docs).
+    pub fn docCount(self: *const Collection) u64 {
+        return @intCast(self.tri.fileCount());
+    }
+
     pub fn storageBytes(self: *const Collection) usize {
         return self.pf.mm.len;
     }
@@ -768,11 +773,13 @@ fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
     const BATCH = 64;
     var batch_keys: [BATCH][]const u8 = undefined;
     var batch_vals: [BATCH][]const u8 = undefined;
-    // Reusable trigram set — cleared between documents, never freed until shutdown.
     var reusable_tris = std.AutoHashMap(codeindex.Trigram, void).init(col.alloc);
     defer reusable_tris.deinit();
 
     while (!col.index_stop.load(.acquire)) {
+        // Signal "working" BEFORE popping so flushIndex doesn't see
+        // an empty queue + zero count between pop and processing.
+        _ = col.indexing_count.fetchAdd(1, .release);
         var n: usize = 0;
         while (n < BATCH) {
             const entry = queue.pop() orelse break;
@@ -781,10 +788,10 @@ fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
             n += 1;
         }
         if (n == 0) {
+            _ = col.indexing_count.fetchSub(1, .release);
             std.Thread.yield() catch {};
             continue;
         }
-        _ = col.indexing_count.fetchAdd(1, .release);
         // Batch trigram indexing (single lock acquisition for all docs).
         col.tri.indexBatch(batch_keys[0..n], batch_vals[0..n], &reusable_tris) catch {};
         // Word indexing (per-doc, no batching needed).

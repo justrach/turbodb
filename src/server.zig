@@ -425,7 +425,7 @@ fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query
     }
     std.fmt.format(w,
         "\",\"hits\":{d},\"candidates\":{d},\"total_docs\":{d},\"total_files\":{d},\"results\":[",
-        .{ result.docs.len, result.candidate_paths.len, col.key_doc_ids.count(), result.total_files }) catch {};
+        .{ result.docs.len, result.candidate_paths.len, col.docCount(), result.total_files }) catch {};
     for (result.docs, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
         std.fmt.format(w,
