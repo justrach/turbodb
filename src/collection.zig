@@ -44,13 +44,21 @@ pub const IndexQueue = struct {
     }
 
     /// Push a (key, value) pair. Caller passes owned slices (queue takes ownership).
+    /// Lock-free for multiple concurrent producers via CAS loop on head.
     pub fn push(self: *IndexQueue, key: []const u8, value: []const u8) bool {
-        const h = self.head.load(.acquire);
-        const next = (h + 1) % CAPACITY;
-        if (next == self.tail.load(.acquire)) return false; // full
-        self.buf[h] = .{ .key = key, .value = value };
-        self.head.store(next, .release);
-        return true;
+        while (true) {
+            const h = self.head.load(.acquire);
+            const next = (h + 1) % CAPACITY;
+            if (next == self.tail.load(.acquire)) return false; // full
+            // Try to atomically claim this slot
+            if (self.head.cmpxchgWeak(h, next, .release, .monotonic)) |_| {
+                // CAS failed — another producer won, retry
+                continue;
+            }
+            // We won the slot — write data
+            self.buf[h] = .{ .key = key, .value = value };
+            return true;
+        }
     }
 
     /// Pop one entry. Returns null if empty.
@@ -100,6 +108,7 @@ pub const Collection = struct {
     index_thread2: ?std.Thread,
     index_stop: std.atomic.Value(bool),
     queue_toggle: std.atomic.Value(u32),
+    indexing_count: std.atomic.Value(u32),
 
     /// Get the stripe lock index for a key hash.
     fn stripeIndex(key_hash: u64) usize {
@@ -143,6 +152,7 @@ pub const Collection = struct {
         col.index_queue2 = IndexQueue.init(alloc);
         col.index_stop = std.atomic.Value(bool).init(false);
         col.queue_toggle = std.atomic.Value(u32).init(0);
+        col.indexing_count = std.atomic.Value(u32).init(0);
 
         const n = @min(logical_name.len, col.name_buf.len - 1);
         @memcpy(col.name_buf[0..n], logical_name[0..n]);
@@ -183,10 +193,11 @@ pub const Collection = struct {
         try self.pf.sync();
     }
 
-    /// Block until the background indexers have drained all pending items.
+    /// Block until the background indexers have drained all pending items
+    /// and finished processing the current batch.
     pub fn flushIndex(self: *Collection) void {
         var waited: u32 = 0;
-        while ((self.index_queue.len() > 0 or self.index_queue2.len() > 0) and waited < 300_000) : (waited += 1) {
+        while ((self.index_queue.len() > 0 or self.index_queue2.len() > 0 or self.indexing_count.load(.acquire) > 0) and waited < 300_000) : (waited += 1) {
             std.Thread.sleep(100_000); // 100µs
         }
     }
@@ -751,11 +762,13 @@ fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
             std.Thread.yield() catch {};
             continue;
         }
+        _ = col.indexing_count.fetchAdd(1, .release);
         col.tri.indexBatch(batch_keys[0..n], batch_vals[0..n], &reusable_tris) catch {};
         for (0..n) |i| {
             col.alloc.free(batch_vals[i]);
             col.alloc.free(batch_keys[i]);
         }
+        _ = col.indexing_count.fetchSub(1, .release);
     }
     // Final drain on shutdown.
     while (queue.pop()) |entry| {

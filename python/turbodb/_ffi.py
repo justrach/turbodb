@@ -164,6 +164,10 @@ _lib.turbodb_search.argtypes = [
 ]
 _lib.turbodb_search.restype = ctypes.c_int
 
+# turbodb_flush_index(col) -> void
+_lib.turbodb_flush_index.argtypes = [ctypes.c_void_p]
+_lib.turbodb_flush_index.restype = None
+
 # ── Crypto ───────────────────────────────────────────────────────────────────
 
 # turbodb_sha256(data, len, out)
