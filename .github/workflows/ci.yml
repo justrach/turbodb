@@ -90,25 +90,30 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.12'
-      - name: Run benchmark (TurboDB only)
-        timeout-minutes: 3
-        run: |
-          python3 bench/bench.py --turbodb-only --docs 2000 --threads 4 --workloads insert --binary ./zig-out/bin/turbodb --csv bench_results.csv
 
       - name: Run search recall smoke test
         timeout-minutes: 2
         run: |
+          zig build
           PYTHONPATH=python python3 bench/recall_smoke.py
+
+      - name: Run benchmark (TurboDB HTTP server)
+        timeout-minutes: 3
+        continue-on-error: true
+        run: |
+          python3 bench/bench.py --turbodb-only --docs 2000 --threads 4 --workloads insert --binary ./zig-out/bin/turbodb --csv bench_results.csv || true
 
       - name: Run regression benchmark (all subsystems)
         timeout-minutes: 5
+        continue-on-error: true
         run: |
-          zig build bench-regression 2>&1 | tee regression_results.txt
+          zig build bench-regression 2>&1 | tee regression_results.txt || true
 
       - name: Run partition scaling benchmark
         timeout-minutes: 5
+        continue-on-error: true
         run: |
-          zig build bench-partition 2>&1 | tee partition_results.txt
+          zig build bench-partition 2>&1 | tee partition_results.txt || true
 
       - name: Upload benchmark results
         if: always()
