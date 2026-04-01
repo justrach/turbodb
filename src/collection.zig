@@ -34,13 +34,18 @@ pub const IndexQueue = struct {
         value: []const u8,
     };
 
-    buf: [CAPACITY]Entry = undefined,
-    head: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), // producer writes here
-    tail: std.atomic.Value(u32) = std.atomic.Value(u32).init(0), // consumer reads here
+    buf: []Entry,
+    head: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
+    tail: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     alloc: std.mem.Allocator,
 
     pub fn init(alloc: std.mem.Allocator) IndexQueue {
-        return .{ .alloc = alloc };
+        const buf = alloc.alloc(Entry, CAPACITY) catch @panic("IndexQueue: OOM");
+        return .{ .buf = buf, .alloc = alloc };
+    }
+
+    pub fn deinit(self: *IndexQueue) void {
+        self.alloc.free(self.buf);
     }
 
     /// Push a (key, value) pair. Caller passes owned slices (queue takes ownership).
@@ -181,6 +186,8 @@ pub const Collection = struct {
             self.alloc.free(entry.key);
             self.alloc.free(entry.value);
         }
+        self.index_queue.deinit();
+        self.index_queue2.deinit();
         self.tri.deinit();
         self.words.deinit();
         self.hash_idx.deinit();
