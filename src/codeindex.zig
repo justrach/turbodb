@@ -229,6 +229,26 @@ fn postingGet(list: *const PostingList, file_id: u32) ?PostingMask {
     return list.items[idx].mask;
 }
 
+/// Insert a PostingEntry into a PostingList maintaining sorted file_id order.
+fn postingSortedInsert(list: *PostingList, alloc: std.mem.Allocator, entry: PostingEntry) void {
+    // Find insertion point via binary search
+    var lo: usize = 0;
+    var hi: usize = list.items.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (list.items[mid].file_id < entry.file_id) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    // lo is the insertion index
+    list.insert(alloc, lo, entry) catch {
+        // Fallback: append (breaks ordering but doesn't lose data)
+        list.append(alloc, entry) catch {};
+    };
+}
+
 
 pub const TrigramIndex = struct {
     /// trigram → dense sorted posting list
@@ -361,7 +381,7 @@ pub const TrigramIndex = struct {
             if (!idx_gop.found_existing) {
                 idx_gop.value_ptr.* = .{};
             }
-            idx_gop.value_ptr.append(self.allocator, .{ .file_id = file_id, .mask = PostingMask{ .loc_mask = 0xFF, .next_mask = 0xFF } }) catch {};
+            postingSortedInsert(idx_gop.value_ptr, self.allocator, .{ .file_id = file_id, .mask = PostingMask{ .loc_mask = 0xFF, .next_mask = 0xFF } });
         }
 
         try self.file_trigrams.put(file_id, tri_list);
@@ -436,7 +456,7 @@ pub const TrigramIndex = struct {
                 if (!idx_gop.found_existing) {
                     idx_gop.value_ptr.* = .{};
                 }
-                idx_gop.value_ptr.append(self.allocator, .{ .file_id = file_id, .mask = PostingMask{ .loc_mask = 0xFF, .next_mask = 0xFF } }) catch {};
+                postingSortedInsert(idx_gop.value_ptr, self.allocator, .{ .file_id = file_id, .mask = PostingMask{ .loc_mask = 0xFF, .next_mask = 0xFF } });
             }
 
             self.file_trigrams.put(file_id, tri_list) catch {};

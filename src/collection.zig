@@ -27,7 +27,7 @@ pub const MAX_COLLECTION_NAME_LEN: usize = 64;
 // Lock-free MPSC queue for deferring trigram+word index builds to a background thread.
 // Insert path pushes owned (key, value) pairs; background thread pops and indexes.
 pub const IndexQueue = struct {
-    const CAPACITY = 32768; // 32K entries per queue (2 queues = 64K total)
+    const CAPACITY = 32768; // 32K entries per queue
 
     const Entry = struct {
         key: []const u8,
@@ -35,43 +35,48 @@ pub const IndexQueue = struct {
     };
 
     buf: []Entry,
+    ready: []std.atomic.Value(u8), // per-slot readiness flag (0=empty, 1=filled)
     head: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     tail: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
     alloc: std.mem.Allocator,
 
     pub fn init(alloc: std.mem.Allocator) IndexQueue {
         const buf = alloc.alloc(Entry, CAPACITY) catch @panic("IndexQueue: OOM");
-        return .{ .buf = buf, .alloc = alloc };
+        const ready = alloc.alloc(std.atomic.Value(u8), CAPACITY) catch @panic("IndexQueue: OOM");
+        for (ready) |*r| r.* = std.atomic.Value(u8).init(0);
+        return .{ .buf = buf, .ready = ready, .alloc = alloc };
     }
 
     pub fn deinit(self: *IndexQueue) void {
         self.alloc.free(self.buf);
+        self.alloc.free(self.ready);
     }
 
-    /// Push a (key, value) pair. Caller passes owned slices (queue takes ownership).
-    /// Lock-free for multiple concurrent producers via CAS loop on head.
+    /// Push a (key, value) pair. Lock-free MPSC via CAS + per-slot ready flag.
     pub fn push(self: *IndexQueue, key: []const u8, value: []const u8) bool {
         while (true) {
             const h = self.head.load(.acquire);
             const next = (h + 1) % CAPACITY;
             if (next == self.tail.load(.acquire)) return false; // full
-            // Write slot data BEFORE publishing — consumer sees head after CAS,
-            // so the payload must be fully written first.
-            self.buf[h] = .{ .key = key, .value = value };
             // Atomically claim this slot by advancing head.
-            if (self.head.cmpxchgWeak(h, next, .release, .monotonic)) |_| {
-                // CAS failed — another producer won this slot, retry
-                continue;
+            if (self.head.cmpxchgWeak(h, next, .acq_rel, .monotonic)) |_| {
+                continue; // CAS failed — another producer won, retry
             }
+            // We own slot h — write data then signal readiness.
+            self.buf[h] = .{ .key = key, .value = value };
+            self.ready[h].store(1, .release);
             return true;
         }
     }
 
-    /// Pop one entry. Returns null if empty.
+    /// Pop one entry. Returns null if empty or next slot not yet ready.
     pub fn pop(self: *IndexQueue) ?Entry {
         const t = self.tail.load(.acquire);
         if (t == self.head.load(.acquire)) return null; // empty
+        // Wait for the producer to finish writing this slot.
+        if (self.ready[t].load(.acquire) == 0) return null;
         const entry = self.buf[t];
+        self.ready[t].store(0, .release);
         self.tail.store((t + 1) % CAPACITY, .release);
         return entry;
     }
@@ -165,9 +170,10 @@ pub const Collection = struct {
         col.name_len = @intCast(n);
         try col.rebuildIndexes();
 
-        // Start background indexer threads (one per queue).
+        // Start background indexer thread. If spawn fails, inserts fall back to sync
+        // indexing via the queue-full path (queue stays empty, retries exhaust immediately).
         col.index_thread = std.Thread.spawn(.{}, indexWorkerQ, .{ col, &col.index_queue }) catch null;
-        col.index_thread2 = null; // Disabled second worker for debugging
+        col.index_thread2 = null; // Second worker slot — available for future use
 
         return col;
     }
