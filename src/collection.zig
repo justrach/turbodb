@@ -50,13 +50,14 @@ pub const IndexQueue = struct {
             const h = self.head.load(.acquire);
             const next = (h + 1) % CAPACITY;
             if (next == self.tail.load(.acquire)) return false; // full
-            // Try to atomically claim this slot
+            // Write slot data BEFORE publishing — consumer sees head after CAS,
+            // so the payload must be fully written first.
+            self.buf[h] = .{ .key = key, .value = value };
+            // Atomically claim this slot by advancing head.
             if (self.head.cmpxchgWeak(h, next, .release, .monotonic)) |_| {
-                // CAS failed — another producer won, retry
+                // CAS failed — another producer won this slot, retry
                 continue;
             }
-            // We won the slot — write data
-            self.buf[h] = .{ .key = key, .value = value };
             return true;
         }
     }
@@ -259,17 +260,19 @@ pub const Collection = struct {
         self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
         self.key_doc_ids.put(hdr.key_hash, doc_id) catch {};
 
-        // Async trigram indexing — round-robin push to one of 2 background queues.
+        // Async trigram + word indexing — push to background queue, sync fallback if full.
         if (value.len >= 3) {
             const owned_key = self.alloc.dupe(u8, key) catch null;
             const owned_val = self.alloc.dupe(u8, value) catch null;
             if (owned_key != null and owned_val != null) {
-                // Send all to queue1 for now (single worker mode)
                 const q = &self.index_queue;
                 var retries: u32 = 0;
                 while (!q.push(owned_key.?, owned_val.?)) {
                     retries += 1;
                     if (retries > 1000) {
+                        // Queue full — fall back to synchronous indexing so no docs are lost.
+                        self.tri.indexFile(owned_key.?, owned_val.?) catch {};
+                        self.words.indexFile(owned_key.?, owned_val.?) catch {};
                         self.alloc.free(owned_key.?);
                         self.alloc.free(owned_val.?);
                         break;
@@ -763,7 +766,12 @@ fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
             continue;
         }
         _ = col.indexing_count.fetchAdd(1, .release);
+        // Batch trigram indexing (single lock acquisition for all docs).
         col.tri.indexBatch(batch_keys[0..n], batch_vals[0..n], &reusable_tris) catch {};
+        // Word indexing (per-doc, no batching needed).
+        for (0..n) |i| {
+            col.words.indexFile(batch_keys[i], batch_vals[i]) catch {};
+        }
         for (0..n) |i| {
             col.alloc.free(batch_vals[i]);
             col.alloc.free(batch_keys[i]);
@@ -773,6 +781,7 @@ fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
     // Final drain on shutdown.
     while (queue.pop()) |entry| {
         col.tri.indexFile(entry.key, entry.value) catch {};
+        col.words.indexFile(entry.key, entry.value) catch {};
         col.alloc.free(entry.value);
         col.alloc.free(entry.key);
     }

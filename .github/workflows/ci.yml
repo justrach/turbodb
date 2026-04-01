@@ -93,7 +93,12 @@ jobs:
       - name: Run benchmark (TurboDB only)
         timeout-minutes: 3
         run: |
-          python3 bench/bench.py --turbodb-only --docs 2000 --threads 4 --workloads insert,get --binary ./zig-out/bin/turbodb --csv bench_results.csv
+          python3 bench/bench.py --turbodb-only --docs 2000 --threads 4 --workloads insert --binary ./zig-out/bin/turbodb --csv bench_results.csv
+
+      - name: Run search recall smoke test
+        timeout-minutes: 2
+        run: |
+          PYTHONPATH=python python3 bench/recall_smoke.py
 
       - name: Run regression benchmark (all subsystems)
         timeout-minutes: 5

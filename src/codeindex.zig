@@ -300,7 +300,7 @@ pub const TrigramIndex = struct {
         for (trigrams.items) |tri| {
             if (self.index.getPtr(tri)) |file_set| {
                 if (postingFind(file_set, file_id)) |idx| {
-                    _ = file_set.swapRemove(idx);
+                    _ = file_set.orderedRemove(idx);
                 }
                 if (file_set.items.len == 0) {
                     file_set.deinit(self.allocator);
