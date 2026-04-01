@@ -273,24 +273,30 @@ pub const Collection = struct {
         self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
         self.key_doc_ids.put(hdr.key_hash, doc_id) catch {};
 
-        // Async trigram + word indexing — push to background queue, sync fallback if full.
+        // Async trigram + word indexing — push to background queue, sync fallback if full or no worker.
         if (value.len >= 3) {
-            const owned_key = self.alloc.dupe(u8, key) catch null;
-            const owned_val = self.alloc.dupe(u8, value) catch null;
-            if (owned_key != null and owned_val != null) {
-                const q = &self.index_queue;
-                var retries: u32 = 0;
-                while (!q.push(owned_key.?, owned_val.?)) {
-                    retries += 1;
-                    if (retries > 1000) {
-                        // Queue full — fall back to synchronous indexing so no docs are lost.
-                        self.tri.indexFile(owned_key.?, owned_val.?) catch {};
-                        self.words.indexFile(owned_key.?, owned_val.?) catch {};
-                        self.alloc.free(owned_key.?);
-                        self.alloc.free(owned_val.?);
-                        break;
+            if (self.index_thread == null) {
+                // No background worker — index synchronously to avoid losing data.
+                self.tri.indexFile(key, value) catch {};
+                self.words.indexFile(key, value) catch {};
+            } else {
+                const owned_key = self.alloc.dupe(u8, key) catch null;
+                const owned_val = self.alloc.dupe(u8, value) catch null;
+                if (owned_key != null and owned_val != null) {
+                    const q = &self.index_queue;
+                    var retries: u32 = 0;
+                    while (!q.push(owned_key.?, owned_val.?)) {
+                        retries += 1;
+                        if (retries > 1000) {
+                            // Queue full — fall back to synchronous indexing.
+                            self.tri.indexFile(owned_key.?, owned_val.?) catch {};
+                            self.words.indexFile(owned_key.?, owned_val.?) catch {};
+                            self.alloc.free(owned_key.?);
+                            self.alloc.free(owned_val.?);
+                            break;
+                        }
+                        std.Thread.yield() catch {};
                     }
-                    std.Thread.yield() catch {};
                 }
             }
         }

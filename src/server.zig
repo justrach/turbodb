@@ -417,9 +417,15 @@ fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query
 
     var fbs = std.io.fixedBufferStream(getBodyBuf());
     const w = fbs.writer();
+    // Write JSON header with escaped query string
+    w.writeAll("{\"query\":\"") catch {};
+    for (query) |ch| {
+        if (ch == '"' or ch == '\\') { w.writeByte('\\') catch {}; }
+        w.writeByte(ch) catch {};
+    }
     std.fmt.format(w,
-        "{{\"query\":\"{s}\",\"hits\":{d},\"candidates\":{d},\"total_docs\":{d},\"total_files\":{d},\"results\":[",
-        .{ query, result.docs.len, result.candidate_paths.len, result.total_files, result.total_files }) catch {};
+        "\",\"hits\":{d},\"candidates\":{d},\"total_docs\":{d},\"total_files\":{d},\"results\":[",
+        .{ result.docs.len, result.candidate_paths.len, col.key_doc_ids.count(), result.total_files }) catch {};
     for (result.docs, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
         std.fmt.format(w,
