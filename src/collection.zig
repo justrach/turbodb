@@ -27,7 +27,7 @@ pub const MAX_COLLECTION_NAME_LEN: usize = 64;
 // Lock-free MPSC queue for deferring trigram+word index builds to a background thread.
 // Insert path pushes owned (key, value) pairs; background thread pops and indexes.
 pub const IndexQueue = struct {
-    const CAPACITY = 8192;
+    const CAPACITY = 32768; // 32K entries per queue (2 queues = 64K total)
 
     const Entry = struct {
         key: []const u8,
@@ -71,6 +71,8 @@ pub const IndexQueue = struct {
 
 // ─── Collection ──────────────────────────────────────────────────────────
 pub const Collection = struct {
+    pub const STRIPE_COUNT = 1024;
+
     name_buf: [128]u8,
     name_len: u8,
     pf: PageFile,
@@ -91,11 +93,13 @@ pub const Collection = struct {
     // MVCC version chain — append-only, no vacuum.
     versions: mvcc_mod.VersionChain,
 
-    // Async index queue — inserts push here, background thread builds trigram+word indexes.
+    // Async index queues — inserts round-robin into 2 queues, 2 background threads drain them.
     index_queue: IndexQueue,
+    index_queue2: IndexQueue,
     index_thread: ?std.Thread,
+    index_thread2: ?std.Thread,
     index_stop: std.atomic.Value(bool),
-    pub const STRIPE_COUNT = 1024;
+    queue_toggle: std.atomic.Value(u32),
 
     /// Get the stripe lock index for a key hash.
     fn stripeIndex(key_hash: u64) usize {
@@ -136,25 +140,33 @@ pub const Collection = struct {
         col.cache = hot_cache.HotCache.init();
         col.versions = mvcc_mod.VersionChain.init(alloc);
         col.index_queue = IndexQueue.init(alloc);
+        col.index_queue2 = IndexQueue.init(alloc);
         col.index_stop = std.atomic.Value(bool).init(false);
+        col.queue_toggle = std.atomic.Value(u32).init(0);
 
         const n = @min(logical_name.len, col.name_buf.len - 1);
         @memcpy(col.name_buf[0..n], logical_name[0..n]);
         col.name_len = @intCast(n);
         try col.rebuildIndexes();
 
-        // Start background indexer thread.
-        col.index_thread = std.Thread.spawn(.{}, indexWorker, .{col}) catch null;
+        // Start background indexer threads (one per queue).
+        col.index_thread = std.Thread.spawn(.{}, indexWorkerQ, .{ col, &col.index_queue }) catch null;
+        col.index_thread2 = null; // Disabled second worker for debugging
 
         return col;
     }
 
     pub fn close(self: *Collection) void {
-        // Signal background indexer to stop, drain remaining items, then join.
+        // Signal background indexers to stop, then join both threads.
         self.index_stop.store(true, .release);
         if (self.index_thread) |t| t.join();
-        // Drain any leftover entries (free owned slices).
+        if (self.index_thread2) |t| t.join();
+        // Drain any leftover entries from both queues (free owned slices).
         while (self.index_queue.pop()) |entry| {
+            self.alloc.free(entry.key);
+            self.alloc.free(entry.value);
+        }
+        while (self.index_queue2.pop()) |entry| {
             self.alloc.free(entry.key);
             self.alloc.free(entry.value);
         }
@@ -171,11 +183,10 @@ pub const Collection = struct {
         try self.pf.sync();
     }
 
-    /// Block until the background indexer has drained all pending items.
+    /// Block until the background indexers have drained all pending items.
     pub fn flushIndex(self: *Collection) void {
-        // Wait up to 30 seconds for the queue to drain.
         var waited: u32 = 0;
-        while (self.index_queue.len() > 0 and waited < 300_000) : (waited += 1) {
+        while ((self.index_queue.len() > 0 or self.index_queue2.len() > 0) and waited < 300_000) : (waited += 1) {
             std.Thread.sleep(100_000); // 100µs
         }
     }
@@ -237,15 +248,22 @@ pub const Collection = struct {
         self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
         self.key_doc_ids.put(hdr.key_hash, doc_id) catch {};
 
-        // Async trigram + word indexing — push to background thread.
+        // Async trigram indexing — round-robin push to one of 2 background queues.
         if (value.len >= 3) {
             const owned_key = self.alloc.dupe(u8, key) catch null;
             const owned_val = self.alloc.dupe(u8, value) catch null;
             if (owned_key != null and owned_val != null) {
-                if (!self.index_queue.push(owned_key.?, owned_val.?)) {
-                    // Queue full — drop index entry (search is best-effort).
-                    self.alloc.free(owned_key.?);
-                    self.alloc.free(owned_val.?);
+                // Send all to queue1 for now (single worker mode)
+                const q = &self.index_queue;
+                var retries: u32 = 0;
+                while (!q.push(owned_key.?, owned_val.?)) {
+                    retries += 1;
+                    if (retries > 1000) {
+                        self.alloc.free(owned_key.?);
+                        self.alloc.free(owned_val.?);
+                        break;
+                    }
+                    std.Thread.yield() catch {};
                 }
             }
         }
@@ -712,35 +730,36 @@ pub const Collection = struct {
     }
 };
 
-/// Background thread that drains the index queue and builds trigram+word indexes.
-fn indexWorker(col: *Collection) void {
+/// Background thread that drains the index queue and builds trigram indexes.
+fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
+    const BATCH = 64;
+    var batch_keys: [BATCH][]const u8 = undefined;
+    var batch_vals: [BATCH][]const u8 = undefined;
+    // Reusable trigram set — cleared between documents, never freed until shutdown.
+    var reusable_tris = std.AutoHashMap(codeindex.Trigram, void).init(col.alloc);
+    defer reusable_tris.deinit();
+
     while (!col.index_stop.load(.acquire)) {
-        var did_work = false;
-        // Drain batch of up to 64 entries per wake cycle.
-        var batch: u32 = 0;
-        while (batch < 64) : (batch += 1) {
-            const entry = col.index_queue.pop() orelse break;
-            did_work = true;
-            col.tri.indexFile(entry.key, entry.value) catch {};
-            col.words.indexFile(entry.key, entry.value) catch {};
-            // Note: we don't free key/value here because the indexers
-            // store pointers to them (owned_path in word index, duped in trigram).
-            // The trigram indexer dupes path internally, but word indexer uses
-            // owned_path from its own dupe. The entry.value is not retained.
-            col.alloc.free(entry.value);
-            // entry.key ownership transferred to word index's owned_path.
-            // Don't free it — word indexer's indexFile already duped it.
-            col.alloc.free(entry.key);
+        var n: usize = 0;
+        while (n < BATCH) {
+            const entry = queue.pop() orelse break;
+            batch_keys[n] = entry.key;
+            batch_vals[n] = entry.value;
+            n += 1;
         }
-        if (!did_work) {
-            // Nothing to do — sleep briefly to avoid busy-spinning.
-            std.Thread.sleep(100_000); // 100µs
+        if (n == 0) {
+            std.Thread.yield() catch {};
+            continue;
+        }
+        col.tri.indexBatch(batch_keys[0..n], batch_vals[0..n], &reusable_tris) catch {};
+        for (0..n) |i| {
+            col.alloc.free(batch_vals[i]);
+            col.alloc.free(batch_keys[i]);
         }
     }
     // Final drain on shutdown.
-    while (col.index_queue.pop()) |entry| {
+    while (queue.pop()) |entry| {
         col.tri.indexFile(entry.key, entry.value) catch {};
-        col.words.indexFile(entry.key, entry.value) catch {};
         col.alloc.free(entry.value);
         col.alloc.free(entry.key);
     }

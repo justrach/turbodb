@@ -9,3 +9,6 @@ __pycache__/
 # ClickHouse local data
 access/
 preprocessed_configs/
+
+# Internal optimization docs (untracked)
+optimizations/
