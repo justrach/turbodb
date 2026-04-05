@@ -267,30 +267,100 @@ pub const VectorColumn = struct {
         if (self.quant == null) {
             const q = try alloc.create(turboquant.TurboQuant);
             errdefer alloc.destroy(q);
-            q.* = try turboquant.TurboQuant.init(alloc, self.dims, 4, seed); // bit_width doesn't matter, we only use rotation
+            q.* = try turboquant.TurboQuant.init(alloc, self.dims, 4, seed);
             self.quant = q;
         }
         self.i8_enabled = true;
 
-        // Quantize all existing vectors to INT8
         const d: usize = self.dims;
+        const n: u32 = self.count;
         self.i8data.deinit(alloc);
         self.i8data = .empty;
         self.i8scales.deinit(alloc);
         self.i8scales = .empty;
 
-        try self.i8data.resize(alloc, @as(usize, self.count) * d);
-        try self.i8scales.resize(alloc, self.count);
+        try self.i8data.resize(alloc, @as(usize, n) * d);
+        try self.i8scales.resize(alloc, n);
 
-        for (0..self.count) |i| {
-            const vec = self.get(@intCast(i)) orelse continue;
-            self.i8scales.items[i] = turboquant.quantizeVecToInt8(
-                self.quant.?.rotation,
-                d,
-                vec,
-                self.i8data.items[i * d ..][0..d],
-            );
+        // Parallel quantization — split across CPU cores
+        const max_threads: u32 = @intCast(@min(std.Thread.getCpuCount() catch 4, 8));
+        const n_threads: u32 = @min(max_threads, @max(1, n / 100));
+
+        if (n_threads <= 1) {
+            // Single-threaded fallback
+            for (0..n) |i| {
+                const vec = self.get(@intCast(i)) orelse continue;
+                self.i8scales.items[i] = turboquant.quantizeVecToInt8(
+                    self.quant.?.rotation, d, vec,
+                    self.i8data.items[i * d ..][0..d],
+                );
+            }
+            return;
         }
+
+        const QuantArgs = struct {
+            rotation: []const f32,
+            fp32_data: []const f32,
+            i8data: []i8,
+            i8scales: []f32,
+            dims: usize,
+            start: u32,
+            end: u32,
+        };
+
+        const quant_worker = struct {
+            fn run(args: QuantArgs) void {
+                const dd = args.dims;
+                var i: u32 = args.start;
+                while (i < args.end) : (i += 1) {
+                    const offset = @as(usize, i) * dd;
+                    const vec = args.fp32_data[offset..][0..dd];
+                    args.i8scales[i] = turboquant.quantizeVecToInt8(
+                        args.rotation, dd, vec,
+                        args.i8data[offset..][0..dd],
+                    );
+                }
+            }
+        }.run;
+
+        const threads = alloc.alloc(std.Thread, n_threads) catch {
+            // Fallback to single-threaded
+            for (0..n) |i| {
+                const vec = self.get(@intCast(i)) orelse continue;
+                self.i8scales.items[i] = turboquant.quantizeVecToInt8(
+                    self.quant.?.rotation, d, vec,
+                    self.i8data.items[i * d ..][0..d],
+                );
+            }
+            return;
+        };
+        defer alloc.free(threads);
+
+        const chunk = n / n_threads;
+        for (0..n_threads) |t| {
+            const start: u32 = @intCast(t * chunk);
+            const end: u32 = if (t == n_threads - 1) n else @intCast((t + 1) * chunk);
+            threads[t] = std.Thread.spawn(.{}, quant_worker, .{QuantArgs{
+                .rotation = self.quant.?.rotation,
+                .fp32_data = self.data.items,
+                .i8data = self.i8data.items,
+                .i8scales = self.i8scales.items,
+                .dims = d,
+                .start = start,
+                .end = end,
+            }}) catch {
+                // If spawn fails, do remaining single-threaded
+                for (start..end) |i| {
+                    const vec = self.get(@intCast(i)) orelse continue;
+                    self.i8scales.items[i] = turboquant.quantizeVecToInt8(
+                        self.quant.?.rotation, d, vec,
+                        self.i8data.items[i * d ..][0..d],
+                    );
+                }
+                continue;
+            };
+        }
+        for (threads) |t| t.join();
     }
 
     /// INT8 SIMD search: quantize query to i8, scan all i8 vectors with SIMD dot product.
