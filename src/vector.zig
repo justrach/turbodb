@@ -215,16 +215,19 @@ pub const VectorColumn = struct {
         const rotated_q = try q.rotateQuery(alloc, effective_query);
         defer alloc.free(rotated_q);
 
-        // Scan all quantized vectors with pre-rotated query — O(d) per vector, no rotation.
+        // Build ADC lookup table ONCE — O(d * 2^b), then scan is just table lookups.
+        const dist_table = switch (metric) {
+            .l2 => try q.buildL2Table(alloc, rotated_q),
+            .dot_product, .cosine => try q.buildDotTable(alloc, rotated_q),
+        };
+        defer alloc.free(dist_table);
+
+        // Scan all quantized vectors — just table lookups per byte, extremely fast.
         var i: u32 = 0;
         while (i < self.count) : (i += 1) {
             const qvec = self.qdata.items[@as(usize, i) * bpv ..][0..bpv];
-
-            const score = switch (metric) {
-                .l2 => -q.scanL2Rotated(rotated_q, qvec),
-                .dot_product => q.scanDotRotated(rotated_q, qvec),
-                .cosine => q.scanDotRotated(rotated_q, qvec),
-            };
+            const raw = q.scanWithTable(dist_table, qvec);
+            const score = if (metric == .l2) -raw else raw;
 
             if (heap_size < candidate_k) {
                 candidates[heap_size] = .{ .index = i, .score = score };

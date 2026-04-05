@@ -267,7 +267,7 @@ pub const TurboQuant = struct {
     }
 
     /// Pre-rotate a query vector: y_q = Π · q. Caller owns the returned slice.
-    /// Call this ONCE per search, then use scanL2Rotated/scanDotRotated per vector.
+    /// Call this ONCE per search, then use buildDistTable + scanWithTable per vector.
     pub fn rotateQuery(self: *const TurboQuant, allocator: Allocator, query: []const f32) ![]f32 {
         const d: usize = @intCast(self.dims);
         const yq = try allocator.alloc(f32, d);
@@ -275,49 +275,110 @@ pub const TurboQuant = struct {
         return yq;
     }
 
-    /// Fast L2 distance from pre-rotated query to a quantized vector.
-    /// O(d) with no rotation — just codebook lookups + SIMD subtraction.
+    /// Build an ADC (Asymmetric Distance Computation) lookup table for L2.
+    /// dist_table[j * nc + k] = (rotated_query[j] - centroid[k])^2
+    /// Call ONCE per query, then scanWithTable is a trivial table lookup per coordinate.
+    pub fn buildL2Table(self: *const TurboQuant, allocator: Allocator, rotated_query: []const f32) ![]f32 {
+        const d: usize = @intCast(self.dims);
+        const nc: usize = self.num_centroids;
+        const cb = self.codebook;
+        const table = try allocator.alloc(f32, d * nc);
+        for (0..d) |j| {
+            const qj = rotated_query[j];
+            for (0..nc) |k| {
+                const diff = qj - cb[k];
+                table[j * nc + k] = diff * diff;
+            }
+        }
+        return table;
+    }
+
+    /// Build an ADC lookup table for dot product.
+    /// dot_table[j * nc + k] = rotated_query[j] * centroid[k]
+    pub fn buildDotTable(self: *const TurboQuant, allocator: Allocator, rotated_query: []const f32) ![]f32 {
+        const d: usize = @intCast(self.dims);
+        const nc: usize = self.num_centroids;
+        const cb = self.codebook;
+        const table = try allocator.alloc(f32, d * nc);
+        for (0..d) |j| {
+            const qj = rotated_query[j];
+            for (0..nc) |k| {
+                table[j * nc + k] = qj * cb[k];
+            }
+        }
+        return table;
+    }
+
+    /// Ultra-fast scan: just table lookups per coordinate. O(d) with tiny constant.
+    /// For 4-bit: 2 coords per byte, each is a table lookup + accumulate.
+    pub fn scanWithTable(self: *const TurboQuant, table: []const f32, quantized: []const u8) f32 {
+        const d: usize = @intCast(self.dims);
+        const nc: usize = self.num_centroids;
+        const bw = self.bit_width;
+        var sum: f32 = 0;
+
+        if (bw == 4) {
+            // Fast path for 4-bit: 2 nibbles per byte, no bit-shifting needed
+            var j: usize = 0;
+            var byte_idx: usize = 0;
+            while (j + 2 <= d) : ({
+                j += 2;
+                byte_idx += 1;
+            }) {
+                const b = quantized[byte_idx];
+                const lo: usize = b & 0x0F;
+                const hi: usize = (b >> 4) & 0x0F;
+                sum += table[j * nc + lo];
+                sum += table[(j + 1) * nc + hi];
+            }
+            if (j < d) {
+                sum += table[j * nc + @as(usize, quantized[byte_idx] & 0x0F)];
+            }
+        } else if (bw == 2) {
+            // Fast path for 2-bit: 4 values per byte
+            var j: usize = 0;
+            var byte_idx: usize = 0;
+            while (j + 4 <= d) : ({
+                j += 4;
+                byte_idx += 1;
+            }) {
+                const b = quantized[byte_idx];
+                sum += table[j * nc + @as(usize, b & 0x03)];
+                sum += table[(j + 1) * nc + @as(usize, (b >> 2) & 0x03)];
+                sum += table[(j + 2) * nc + @as(usize, (b >> 4) & 0x03)];
+                sum += table[(j + 3) * nc + @as(usize, (b >> 6) & 0x03)];
+            }
+            while (j < d) : (j += 1) {
+                sum += table[j * nc + @as(usize, unpackBits(quantized, j, bw))];
+            }
+        } else {
+            // Generic path
+            for (0..d) |j| {
+                sum += table[j * nc + @as(usize, unpackBits(quantized, j, bw))];
+            }
+        }
+        return sum;
+    }
+
+    // Keep the old methods for backward compat / single-vector queries
     pub fn scanL2Rotated(self: *const TurboQuant, rotated_query: []const f32, quantized: []const u8) f32 {
         const d: usize = @intCast(self.dims);
         const bw = self.bit_width;
         const cb = self.codebook;
-        var j: usize = 0;
-        var v_sum: V8 = @splat(0.0);
-        while (j + 8 <= d) : (j += 8) {
-            const yq_v: V8 = rotated_query[j..][0..8].*;
-            var cb_v: V8 = undefined;
-            inline for (0..8) |k| {
-                cb_v[k] = cb[unpackBits(quantized, j + k, bw)];
-            }
-            const diff = yq_v - cb_v;
-            v_sum += diff * diff;
-        }
-        var sum = @reduce(.Add, v_sum);
-        while (j < d) : (j += 1) {
+        var sum: f32 = 0;
+        for (0..d) |j| {
             const diff = rotated_query[j] - cb[unpackBits(quantized, j, bw)];
             sum += diff * diff;
         }
         return sum;
     }
 
-    /// Fast dot product from pre-rotated query to a quantized vector.
-    /// O(d) with no rotation — just codebook lookups + SIMD multiply.
     pub fn scanDotRotated(self: *const TurboQuant, rotated_query: []const f32, quantized: []const u8) f32 {
         const d: usize = @intCast(self.dims);
         const bw = self.bit_width;
         const cb = self.codebook;
-        var j: usize = 0;
-        var v_sum: V8 = @splat(0.0);
-        while (j + 8 <= d) : (j += 8) {
-            const yq_v: V8 = rotated_query[j..][0..8].*;
-            var cb_v: V8 = undefined;
-            inline for (0..8) |k| {
-                cb_v[k] = cb[unpackBits(quantized, j + k, bw)];
-            }
-            v_sum += yq_v * cb_v;
-        }
-        var sum = @reduce(.Add, v_sum);
-        while (j < d) : (j += 1) {
+        var sum: f32 = 0;
+        for (0..d) |j| {
             sum += rotated_query[j] * cb[unpackBits(quantized, j, bw)];
         }
         return sum;
