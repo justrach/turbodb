@@ -648,25 +648,32 @@ fn generateOrthogonalMatrix(m: []f32, d: usize, rng: *std.Random.Xoshiro256) voi
 pub fn int8DotProduct(a: []const i8, b: []const i8) i32 {
     std.debug.assert(a.len == b.len);
     const n = a.len;
-    const LANE = 16; // 16 i8 → 16 i16 multiply → accumulate
-    const lanes = n / LANE;
-    var acc: @Vector(16, i32) = @splat(0);
+
+    // Process 32 i8 elements at a time with 2 independent accumulators
+    // to hide multiply latency and maximize throughput.
+    const LANE = 16;
+    const lanes = n / (LANE * 2); // 32 elements per iteration
+    var acc0: @Vector(LANE, i32) = @splat(0);
+    var acc1: @Vector(LANE, i32) = @splat(0);
 
     for (0..lanes) |i| {
-        const va: @Vector(16, i8) = a[i * LANE ..][0..LANE].*;
-        const vb: @Vector(16, i8) = b[i * LANE ..][0..LANE].*;
-        // Widen i8 to i16 for safe multiply (i8*i8 max = 16129, fits i16)
-        const wa: @Vector(16, i16) = @intCast(va);
-        const wb: @Vector(16, i16) = @intCast(vb);
-        const prod: @Vector(16, i16) = wa * wb;
-        // Widen to i32 and accumulate
-        const prod32: @Vector(16, i32) = @intCast(prod);
-        acc += prod32;
+        // First 16 elements → acc0
+        const va0: @Vector(LANE, i8) = a[i * LANE * 2 ..][0..LANE].*;
+        const vb0: @Vector(LANE, i8) = b[i * LANE * 2 ..][0..LANE].*;
+        const prod0: @Vector(LANE, i16) = @as(@Vector(LANE, i16), @intCast(va0)) * @as(@Vector(LANE, i16), @intCast(vb0));
+        acc0 += @as(@Vector(LANE, i32), @intCast(prod0));
+
+        // Second 16 elements → acc1 (independent chain, no stall)
+        const va1: @Vector(LANE, i8) = a[i * LANE * 2 + LANE ..][0..LANE].*;
+        const vb1: @Vector(LANE, i8) = b[i * LANE * 2 + LANE ..][0..LANE].*;
+        const prod1: @Vector(LANE, i16) = @as(@Vector(LANE, i16), @intCast(va1)) * @as(@Vector(LANE, i16), @intCast(vb1));
+        acc1 += @as(@Vector(LANE, i32), @intCast(prod1));
     }
 
-    var result: i32 = @reduce(.Add, acc);
-    // Scalar tail
-    for (lanes * LANE..n) |i| {
+    var result: i32 = @reduce(.Add, acc0) + @reduce(.Add, acc1);
+
+    // Tail: remaining elements (up to 31)
+    for (lanes * LANE * 2..n) |i| {
         result += @as(i32, a[i]) * @as(i32, b[i]);
     }
     return result;

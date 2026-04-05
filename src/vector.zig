@@ -302,20 +302,38 @@ pub const VectorColumn = struct {
 
         const q_scale = turboquant.quantizeVecToInt8(self.quant.?.rotation, d, query, q_i8);
 
-        // Scan all vectors using INT8 dot product
+        // Pre-compute 1/(q_scale * vec_scale) for each vector — avoids division in hot loop.
+        // Division is ~20 cycles, multiply is ~4 cycles.
+        const inv_scales = try alloc.alloc(f32, self.count);
+        defer alloc.free(inv_scales);
+        const inv_q = 1.0 / q_scale;
+        for (0..self.count) |idx| {
+            inv_scales[idx] = inv_q / self.i8scales.items[idx];
+        }
+
+        // Scan all vectors using INT8 dot product with prefetching
         var results = try alloc.alloc(SearchResult, actual_k);
         var heap_size: u32 = 0;
+        const i8items = self.i8data.items;
 
         var i: u32 = 0;
         while (i < self.count) : (i += 1) {
-            const vec_i8 = self.i8data.items[@as(usize, i) * d ..][0..d];
+            const offset = @as(usize, i) * d;
+            const vec_i8 = i8items[offset..][0..d];
+
+            // Prefetch next vector's data into L1 cache while we compute current
+            if (i + 1 < self.count) {
+                const next_ptr: [*]const u8 = @ptrCast(i8items[(offset + d)..].ptr);
+                @prefetch(next_ptr, .{ .rw = .read, .locality = 3 });
+                // Also prefetch 2nd cache line of next vector (d > 64)
+                if (d > 64) @prefetch(next_ptr + 64, .{ .rw = .read, .locality = 3 });
+                if (d > 128) @prefetch(next_ptr + 128, .{ .rw = .read, .locality = 3 });
+            }
+
             const int_dot = turboquant.int8DotProduct(q_i8, vec_i8);
 
-            // Convert back to approximate FP32 score
-            const vec_scale = self.i8scales.items[i];
-            const score_raw = @as(f32, @floatFromInt(int_dot)) / (q_scale * vec_scale);
-
-            // For L2: negate so higher = closer (same convention as FP32 search)
+            // Convert to FP32 score using precomputed inverse scale (multiply, not divide)
+            const score_raw = @as(f32, @floatFromInt(int_dot)) * inv_scales[i];
             const score = if (metric == .l2) -score_raw else score_raw;
 
             if (heap_size < actual_k) {
