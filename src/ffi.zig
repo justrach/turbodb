@@ -355,6 +355,13 @@ export fn turbodb_vector_enable_quantization(handle: *anyopaque, bit_width: u8, 
     return 0;
 }
 
+/// Enable quantized-only mode: FWHT rotation, no FP32 storage.
+export fn turbodb_vector_enable_quantized_only(handle: *anyopaque, bit_width: u8, seed: u64) c_int {
+    const col: *vector.VectorColumn = @ptrCast(@alignCast(handle));
+    col.enableQuantizedOnly(alloc, bit_width, seed) catch return -1;
+    return 0;
+}
+
 /// Quantized search: fast asymmetric scan + FP32 re-rank.
 /// metric: 0=cosine, 1=dot_product, 2=l2. Returns actual result count.
 export fn turbodb_vector_search_quantized(

@@ -44,6 +44,8 @@ pub const VectorColumn = struct {
     qdata: std.ArrayListUnmanaged(u8) = .empty,
     /// Bytes per quantized vector (0 if quantization not enabled).
     bytes_per_vec: u32 = 0,
+    /// When true, only quantized data is stored (no FP32, no norms). Saves ~8x memory.
+    quantized_only: bool = false,
 
     pub fn init(dims: u32) VectorColumn {
         return .{ .dims = dims };
@@ -63,6 +65,18 @@ pub const VectorColumn = struct {
     /// Append a vector. Must be exactly `dims` floats.
     pub fn append(self: *VectorColumn, alloc: Allocator, vec: []const f32) !void {
         if (vec.len != self.dims) return error.DimensionMismatch;
+
+        if (self.quantized_only and self.quant != null) {
+            // Quantized-only mode: skip FP32 data and norms
+            self.count += 1;
+            const q = self.quant.?;
+            const bpv = q.bytes_per_vec;
+            const old_len = self.qdata.items.len;
+            try self.qdata.resize(alloc, old_len + bpv);
+            q.quantize(vec, self.qdata.items[old_len..][0..bpv]);
+            return;
+        }
+
         try self.data.appendSlice(alloc, vec);
         // Pre-compute and cache the L2 norm for fast cosine later.
         try self.norms.append(alloc, l2Norm(vec));
@@ -173,6 +187,41 @@ pub const VectorColumn = struct {
         }
     }
 
+    /// Enable quantized-only mode: uses FWHT rotation, stores only quantized data.
+    /// Frees FP32 data and norms to save memory.
+    pub fn enableQuantizedOnly(self: *VectorColumn, alloc: Allocator, bit_width: u8, seed: u64) !void {
+        // Clean up previous quantizer if any.
+        if (self.quant) |old| {
+            old.deinit();
+            alloc.destroy(old);
+        }
+
+        const q = try alloc.create(turboquant.TurboQuant);
+        errdefer alloc.destroy(q);
+        q.* = try turboquant.TurboQuant.init(alloc, self.dims, bit_width, seed);
+        self.quant = q;
+        self.bytes_per_vec = q.bytes_per_vec;
+        self.quantized_only = true;
+
+        // Quantize all existing vectors before freeing FP32 data.
+        const bpv = q.bytes_per_vec;
+        self.qdata.deinit(alloc);
+        self.qdata = .empty;
+        try self.qdata.resize(alloc, @as(usize, self.count) * bpv);
+        @memset(self.qdata.items, 0);
+
+        for (0..self.count) |i| {
+            const vec = self.get(@intCast(i)) orelse continue;
+            q.quantize(vec, self.qdata.items[i * bpv ..][0..bpv]);
+        }
+
+        // Free FP32 data since we won't use it
+        self.data.deinit(alloc);
+        self.data = .empty;
+        self.norms.deinit(alloc);
+        self.norms = .empty;
+    }
+
     /// Fast quantized search: asymmetric distance for candidate selection,
     /// then re-rank top 2K with exact FP32 distance.
     pub fn searchQuantized(
@@ -243,6 +292,24 @@ pub const VectorColumn = struct {
                 candidates[0] = .{ .index = i, .score = score };
                 heapifyDown(candidates[0..heap_size], 0);
             }
+        }
+
+        // Quantized-only mode: skip Phase 2 re-ranking, return Phase 1 results directly.
+        if (self.quantized_only) {
+            const actual_k = @min(k, heap_size);
+            var results = try alloc.alloc(SearchResult, actual_k);
+            // Sort candidates by score descending and take top-k
+            std.mem.sort(SearchResult, candidates[0..heap_size], {}, struct {
+                fn cmp(_: void, a: SearchResult, b: SearchResult) bool {
+                    return a.score > b.score;
+                }
+            }.cmp);
+            @memcpy(results[0..actual_k], candidates[0..actual_k]);
+            // Un-negate L2 scores.
+            if (metric == .l2) {
+                for (results[0..actual_k]) |*r| r.score = -r.score;
+            }
+            return results[0..actual_k];
         }
 
         // Phase 2: Re-rank candidates using exact FP32 distance.
