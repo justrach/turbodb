@@ -10,5 +10,5 @@ __pycache__/
 access/
 preprocessed_configs/
 
-# Internal optimization docs (untracked)
-optimizations/
+# Optimization docs (tracked)
+# optimizations/
