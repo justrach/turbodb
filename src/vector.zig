@@ -6,16 +6,17 @@
 /// Design:
 ///   - Vectors stored as flat f32 arrays (cache-friendly, SIMD-aligned)
 ///   - All vectors in a column must have the same dimensionality
-///   - Similarity functions process 4 floats at a time via @Vector(4, f32)
+///   - Similarity functions process 8 floats at a time via @Vector(8, f32)
 ///   - Top-K search returns indices sorted by similarity (descending)
 ///
 /// Use cases: embeddings search, RAG, recommendation, image similarity.
 const std = @import("std");
 const Allocator = std.mem.Allocator;
-
-/// SIMD lane width — process 4 f32s at a time.
-const LANE: usize = 4;
-const V4 = @Vector(LANE, f32);
+const turboquant = @import("turboquant.zig");
+/// SIMD lane width — process 8 f32s at a time (AVX2-width).
+const LANE: usize = 8;
+const VL = @Vector(LANE, f32);
+const V8 = @Vector(LANE, f32);
 
 /// Distance metric for similarity search.
 pub const Metric = enum {
@@ -37,6 +38,12 @@ pub const VectorColumn = struct {
     count: u32 = 0,
     /// Optional: pre-computed L2 norms for cosine similarity (avoids re-computing).
     norms: std.ArrayListUnmanaged(f32) = .empty,
+    /// Optional TurboQuant quantizer for compressed search.
+    quant: ?*turboquant.TurboQuant = null,
+    /// Packed quantized vector data (all vectors concatenated).
+    qdata: std.ArrayListUnmanaged(u8) = .empty,
+    /// Bytes per quantized vector (0 if quantization not enabled).
+    bytes_per_vec: u32 = 0,
 
     pub fn init(dims: u32) VectorColumn {
         return .{ .dims = dims };
@@ -45,6 +52,12 @@ pub const VectorColumn = struct {
     pub fn deinit(self: *VectorColumn, alloc: Allocator) void {
         self.data.deinit(alloc);
         self.norms.deinit(alloc);
+        self.qdata.deinit(alloc);
+        if (self.quant) |q| {
+            q.deinit();
+            alloc.destroy(q);
+            self.quant = null;
+        }
     }
 
     /// Append a vector. Must be exactly `dims` floats.
@@ -54,6 +67,14 @@ pub const VectorColumn = struct {
         // Pre-compute and cache the L2 norm for fast cosine later.
         try self.norms.append(alloc, l2Norm(vec));
         self.count += 1;
+
+        // If quantization is enabled, also quantize the new vector.
+        if (self.quant) |q| {
+            const bpv = q.bytes_per_vec;
+            const old_len = self.qdata.items.len;
+            try self.qdata.resize(alloc, old_len + bpv);
+            q.quantize(vec, self.qdata.items[old_len..][0..bpv]);
+        }
     }
 
     /// Get vector at index. Returns slice into internal storage (zero-copy).
@@ -125,25 +146,168 @@ pub const VectorColumn = struct {
         return results[0..heap_size];
     }
 
+    /// Enable quantization on this column. Quantizes all existing vectors.
+    pub fn enableQuantization(self: *VectorColumn, alloc: Allocator, bit_width: u8, seed: u64) !void {
+        // Clean up previous quantizer if any.
+        if (self.quant) |old| {
+            old.deinit();
+            alloc.destroy(old);
+        }
+
+        const q = try alloc.create(turboquant.TurboQuant);
+        errdefer alloc.destroy(q);
+        q.* = try turboquant.TurboQuant.init(alloc, self.dims, bit_width, seed);
+        self.quant = q;
+        self.bytes_per_vec = q.bytes_per_vec;
+
+        // Quantize all existing vectors.
+        const bpv = q.bytes_per_vec;
+        self.qdata.deinit(alloc);
+        self.qdata = .empty;
+        try self.qdata.resize(alloc, @as(usize, self.count) * bpv);
+        @memset(self.qdata.items, 0);
+
+        for (0..self.count) |i| {
+            const vec = self.get(@intCast(i)) orelse continue;
+            q.quantize(vec, self.qdata.items[i * bpv ..][0..bpv]);
+        }
+    }
+
+    /// Fast quantized search: asymmetric distance for candidate selection,
+    /// then re-rank top 2K with exact FP32 distance.
+    pub fn searchQuantized(
+        self: *const VectorColumn,
+        alloc: Allocator,
+        query: []const f32,
+        k: u32,
+        metric: Metric,
+    ) ![]SearchResult {
+        const q = self.quant orelse return self.search(alloc, query, k, metric);
+        if (query.len != self.dims) return error.DimensionMismatch;
+        if (self.count == 0) return &.{};
+
+        // Phase 1: Pre-rotate query ONCE (O(d^2)), then scan all vectors (O(n*d)).
+        const candidate_k = @min(self.count, k * 2); // 2x overselection
+        var candidates = try alloc.alloc(SearchResult, candidate_k);
+        defer alloc.free(candidates);
+        var heap_size: u32 = 0;
+        const bpv = q.bytes_per_vec;
+
+        // For cosine: normalize query before rotation.
+        var norm_query_buf: [1024]f32 = undefined;
+        var norm_query_alloc: ?[]f32 = null;
+        defer if (norm_query_alloc) |nq| alloc.free(nq);
+
+        const effective_query = if (metric == .cosine) blk: {
+            const qnorm = l2Norm(query);
+            if (qnorm == 0.0) break :blk query;
+            const nq = if (query.len <= 1024) norm_query_buf[0..query.len] else blk2: {
+                norm_query_alloc = try alloc.alloc(f32, query.len);
+                break :blk2 norm_query_alloc.?;
+            };
+            for (query, 0..) |v, idx| {
+                nq[idx] = v / qnorm;
+            }
+            break :blk @as([]const f32, nq);
+        } else query;
+
+        // Rotate query ONCE — this is the O(d^2) step, done only once per search.
+        const rotated_q = try q.rotateQuery(alloc, effective_query);
+        defer alloc.free(rotated_q);
+
+        // Scan all quantized vectors with pre-rotated query — O(d) per vector, no rotation.
+        var i: u32 = 0;
+        while (i < self.count) : (i += 1) {
+            const qvec = self.qdata.items[@as(usize, i) * bpv ..][0..bpv];
+
+            const score = switch (metric) {
+                .l2 => -q.scanL2Rotated(rotated_q, qvec),
+                .dot_product => q.scanDotRotated(rotated_q, qvec),
+                .cosine => q.scanDotRotated(rotated_q, qvec),
+            };
+
+            if (heap_size < candidate_k) {
+                candidates[heap_size] = .{ .index = i, .score = score };
+                heap_size += 1;
+                if (heap_size == candidate_k) {
+                    var j: u32 = heap_size / 2;
+                    while (j > 0) {
+                        j -= 1;
+                        heapifyDown(candidates[0..heap_size], j);
+                    }
+                }
+            } else if (score > candidates[0].score) {
+                candidates[0] = .{ .index = i, .score = score };
+                heapifyDown(candidates[0..heap_size], 0);
+            }
+        }
+
+        // Phase 2: Re-rank candidates using exact FP32 distance.
+        const actual_k = @min(k, heap_size);
+        var results = try alloc.alloc(SearchResult, actual_k);
+        var result_heap: u32 = 0;
+        const query_norm = if (metric == .cosine) l2Norm(query) else @as(f32, 0);
+
+        for (candidates[0..heap_size]) |cand| {
+            const vec = self.get(cand.index) orelse continue;
+            const exact_score = switch (metric) {
+                .cosine => cosineSim(query, vec, query_norm, self.norms.items[cand.index]),
+                .dot_product => dotProduct(query, vec),
+                .l2 => -l2Distance(query, vec),
+            };
+
+            if (result_heap < actual_k) {
+                results[result_heap] = .{ .index = cand.index, .score = exact_score };
+                result_heap += 1;
+                if (result_heap == actual_k) {
+                    var j: u32 = result_heap / 2;
+                    while (j > 0) {
+                        j -= 1;
+                        heapifyDown(results[0..result_heap], j);
+                    }
+                }
+            } else if (exact_score > results[0].score) {
+                results[0] = .{ .index = cand.index, .score = exact_score };
+                heapifyDown(results[0..result_heap], 0);
+            }
+        }
+
+        // Sort results by score descending.
+        std.mem.sort(SearchResult, results[0..result_heap], {}, struct {
+            fn cmp(_: void, a: SearchResult, b: SearchResult) bool {
+                return a.score > b.score;
+            }
+        }.cmp);
+
+        // Un-negate L2 scores.
+        if (metric == .l2) {
+            for (results[0..result_heap]) |*r| r.score = -r.score;
+        }
+
+        return results[0..result_heap];
+    }
+
     /// Total memory used by this vector column in bytes.
     pub fn memoryBytes(self: *const VectorColumn) usize {
-        return self.data.items.len * @sizeOf(f32) + self.norms.items.len * @sizeOf(f32);
+        return self.data.items.len * @sizeOf(f32) +
+            self.norms.items.len * @sizeOf(f32) +
+            self.qdata.items.len;
     }
 };
 
 // ── SIMD-accelerated math ────────────────────────────────────────────────────
 
-/// Dot product using @Vector(4, f32) SIMD.
+/// Dot product using @Vector(8, f32) SIMD.
 pub fn dotProduct(a: []const f32, b: []const f32) f32 {
     std.debug.assert(a.len == b.len);
     const n = a.len;
     const lanes = n / LANE;
-    var sum: V4 = @splat(0.0);
+    var sum: V8 = @splat(0.0);
 
     // SIMD main loop
     for (0..lanes) |i| {
-        const va: V4 = a[i * LANE ..][0..LANE].*;
-        const vb: V4 = b[i * LANE ..][0..LANE].*;
+        const va: V8 = a[i * LANE ..][0..LANE].*;
+        const vb: V8 = b[i * LANE ..][0..LANE].*;
         sum += va * vb;
     }
 
@@ -169,11 +333,11 @@ pub fn l2Distance(a: []const f32, b: []const f32) f32 {
     std.debug.assert(a.len == b.len);
     const n = a.len;
     const lanes = n / LANE;
-    var sum: V4 = @splat(0.0);
+    var sum: V8 = @splat(0.0);
 
     for (0..lanes) |i| {
-        const va: V4 = a[i * LANE ..][0..LANE].*;
-        const vb: V4 = b[i * LANE ..][0..LANE].*;
+        const va: V8 = a[i * LANE ..][0..LANE].*;
+        const vb: V8 = b[i * LANE ..][0..LANE].*;
         const diff = va - vb;
         sum += diff * diff;
     }
@@ -333,4 +497,47 @@ test "large vector SIMD" {
     // v1 is most similar to itself
     try std.testing.expectEqual(@as(u32, 0), results[0].index);
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), results[0].score, 0.001);
+}
+
+test "quantized search returns correct results" {
+    const alloc = std.testing.allocator;
+    var col = VectorColumn.init(32);
+    defer col.deinit(alloc);
+
+    // Insert several vectors
+    var vecs: [10][32]f32 = undefined;
+    for (0..10) |vi| {
+        for (0..32) |d| {
+            vecs[vi][d] = if (d == vi) 1.0 else 0.0;
+        }
+        try col.append(alloc, &vecs[vi]);
+    }
+
+    // Enable 4-bit quantization
+    try col.enableQuantization(alloc, 4, 42);
+
+    // Search for vector closest to vecs[0]
+    const results = try col.searchQuantized(alloc, &vecs[0], 3, .cosine);
+    defer alloc.free(results);
+
+    try std.testing.expect(results.len == 3);
+    // First result should be index 0
+    try std.testing.expectEqual(@as(u32, 0), results[0].index);
+}
+
+test "append after quantization also quantizes" {
+    const alloc = std.testing.allocator;
+    var col = VectorColumn.init(16);
+    defer col.deinit(alloc);
+
+    try col.append(alloc, &[_]f32{1} ** 16);
+    try col.enableQuantization(alloc, 2, 99);
+
+    // qdata should have bytes for 1 vector
+    try std.testing.expectEqual(@as(usize, col.bytes_per_vec), col.qdata.items.len);
+
+    // Append another vector — qdata should grow
+    try col.append(alloc, &[_]f32{0.5} ** 16);
+    try std.testing.expectEqual(@as(usize, col.bytes_per_vec * 2), col.qdata.items.len);
+    try std.testing.expectEqual(@as(u32, 2), col.count);
 }

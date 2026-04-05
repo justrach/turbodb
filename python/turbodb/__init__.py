@@ -32,7 +32,7 @@ import json
 import ctypes
 
 __version__ = _ffi.version()
-__all__ = ["Database", "Collection", "crypto", "__version__"]
+__all__ = ["Database", "Collection", "VectorColumn", "crypto", "__version__"]
 
 
 class Collection:
@@ -196,7 +196,103 @@ class TenantDatabase:
         self._collections.pop(f"{self._tenant_id}/{name}", None)
 
 
-# ── Crypto module ────────────────────────────────────────────────────────────
+class VectorColumn:
+    """A SIMD-accelerated vector column for similarity search.
+
+    Usage::
+
+        from turbodb import VectorColumn
+
+        col = VectorColumn(dims=128)
+        col.append([0.1] * 128)
+        col.append([0.2] * 128)
+
+        results = col.search([0.1] * 128, k=5, metric="cosine")
+        for r in results:
+            print(r["index"], r["score"])
+
+        # Enable quantization for faster search
+        col.enable_quantization(bit_width=4, seed=42)
+        results = col.search_quantized([0.1] * 128, k=5, metric="cosine")
+
+        col.close()
+    """
+
+    def __init__(self, dims: int):
+        self._handle = _ffi._lib.turbodb_vector_create(dims)
+        if not self._handle:
+            raise RuntimeError(f"Failed to create VectorColumn with dims={dims}")
+        self._dims = dims
+
+    @property
+    def dims(self) -> int:
+        return self._dims
+
+    def append(self, vector):
+        """Append a vector (list or tuple of floats). Must match dims."""
+        arr = (ctypes.c_float * len(vector))(*vector)
+        rc = _ffi._lib.turbodb_vector_append(self._handle, arr, len(vector))
+        if rc != 0:
+            raise RuntimeError("Vector append failed (dimension mismatch?)")
+
+    def search(self, query, k: int = 10, metric: str = "cosine"):
+        """Brute-force FP32 search. Returns list of {index, score} dicts."""
+        metric_map = {"cosine": 0, "dot_product": 1, "l2": 2}
+        if metric not in metric_map:
+            raise ValueError(f"Unknown metric '{metric}', use one of {list(metric_map)}")
+        arr = (ctypes.c_float * len(query))(*query)
+        indices = (ctypes.c_uint32 * k)()
+        scores = (ctypes.c_float * k)()
+        n = _ffi._lib.turbodb_vector_search(
+            self._handle, arr, len(query), k, metric_map[metric], indices, scores
+        )
+        if n < 0:
+            raise RuntimeError("Vector search failed")
+        return [{"index": int(indices[i]), "score": float(scores[i])} for i in range(n)]
+
+    def enable_quantization(self, bit_width: int = 4, seed: int = 42):
+        """Enable TurboQuant quantization. Quantizes all existing vectors."""
+        rc = _ffi._lib.turbodb_vector_enable_quantization(self._handle, bit_width, seed)
+        if rc != 0:
+            raise RuntimeError(f"Failed to enable quantization (bit_width={bit_width})")
+
+    def search_quantized(self, query, k: int = 10, metric: str = "cosine"):
+        """Quantized search: fast asymmetric scan + FP32 re-rank."""
+        metric_map = {"cosine": 0, "dot_product": 1, "l2": 2}
+        if metric not in metric_map:
+            raise ValueError(f"Unknown metric '{metric}', use one of {list(metric_map)}")
+        arr = (ctypes.c_float * len(query))(*query)
+        indices = (ctypes.c_uint32 * k)()
+        scores = (ctypes.c_float * k)()
+        n = _ffi._lib.turbodb_vector_search_quantized(
+            self._handle, arr, len(query), k, metric_map[metric], indices, scores
+        )
+        if n < 0:
+            raise RuntimeError("Quantized search failed")
+        return [{"index": int(indices[i]), "score": float(scores[i])} for i in range(n)]
+
+    def count(self) -> int:
+        """Number of vectors in the column."""
+        return _ffi._lib.turbodb_vector_count(self._handle)
+
+    def memory_bytes(self) -> int:
+        """Total memory used by this column in bytes."""
+        return _ffi._lib.turbodb_vector_memory(self._handle)
+
+    def close(self):
+        """Free the vector column."""
+        if self._handle:
+            _ffi._lib.turbodb_vector_free(self._handle)
+            self._handle = None
+
+    def __del__(self):
+        self.close()
+
+    def __repr__(self):
+        count = self.count() if self._handle else 0
+        return f"VectorColumn(dims={self._dims}, count={count})"
+
+
 # Zero-dependency cryptographic functions powered by Zig's std.crypto.
 # No OpenSSL, no pip install — just call them.
 

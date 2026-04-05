@@ -265,6 +265,63 @@ pub const TurboQuant = struct {
 
         return sum;
     }
+
+    /// Pre-rotate a query vector: y_q = Π · q. Caller owns the returned slice.
+    /// Call this ONCE per search, then use scanL2Rotated/scanDotRotated per vector.
+    pub fn rotateQuery(self: *const TurboQuant, allocator: Allocator, query: []const f32) ![]f32 {
+        const d: usize = @intCast(self.dims);
+        const yq = try allocator.alloc(f32, d);
+        matvecMul(self.rotation, query, yq, d);
+        return yq;
+    }
+
+    /// Fast L2 distance from pre-rotated query to a quantized vector.
+    /// O(d) with no rotation — just codebook lookups + SIMD subtraction.
+    pub fn scanL2Rotated(self: *const TurboQuant, rotated_query: []const f32, quantized: []const u8) f32 {
+        const d: usize = @intCast(self.dims);
+        const bw = self.bit_width;
+        const cb = self.codebook;
+        var j: usize = 0;
+        var v_sum: V8 = @splat(0.0);
+        while (j + 8 <= d) : (j += 8) {
+            const yq_v: V8 = rotated_query[j..][0..8].*;
+            var cb_v: V8 = undefined;
+            inline for (0..8) |k| {
+                cb_v[k] = cb[unpackBits(quantized, j + k, bw)];
+            }
+            const diff = yq_v - cb_v;
+            v_sum += diff * diff;
+        }
+        var sum = @reduce(.Add, v_sum);
+        while (j < d) : (j += 1) {
+            const diff = rotated_query[j] - cb[unpackBits(quantized, j, bw)];
+            sum += diff * diff;
+        }
+        return sum;
+    }
+
+    /// Fast dot product from pre-rotated query to a quantized vector.
+    /// O(d) with no rotation — just codebook lookups + SIMD multiply.
+    pub fn scanDotRotated(self: *const TurboQuant, rotated_query: []const f32, quantized: []const u8) f32 {
+        const d: usize = @intCast(self.dims);
+        const bw = self.bit_width;
+        const cb = self.codebook;
+        var j: usize = 0;
+        var v_sum: V8 = @splat(0.0);
+        while (j + 8 <= d) : (j += 8) {
+            const yq_v: V8 = rotated_query[j..][0..8].*;
+            var cb_v: V8 = undefined;
+            inline for (0..8) |k| {
+                cb_v[k] = cb[unpackBits(quantized, j + k, bw)];
+            }
+            v_sum += yq_v * cb_v;
+        }
+        var sum = @reduce(.Add, v_sum);
+        while (j < d) : (j += 1) {
+            sum += rotated_query[j] * cb[unpackBits(quantized, j, bw)];
+        }
+        return sum;
+    }
 };
 
 // ─── Bit packing ────────────────────────────────────────────────────────

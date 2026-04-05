@@ -341,3 +341,43 @@ export fn turbodb_vector_count(handle: *anyopaque) u32 {
     const col: *const vector.VectorColumn = @ptrCast(@alignCast(handle));
     return col.count;
 }
+
+/// Get vector column memory usage in bytes.
+export fn turbodb_vector_memory(handle: *anyopaque) usize {
+    const col: *const vector.VectorColumn = @ptrCast(@alignCast(handle));
+    return col.memoryBytes();
+}
+
+/// Enable quantization on a vector column.
+export fn turbodb_vector_enable_quantization(handle: *anyopaque, bit_width: u8, seed: u64) c_int {
+    const col: *vector.VectorColumn = @ptrCast(@alignCast(handle));
+    col.enableQuantization(alloc, bit_width, seed) catch return -1;
+    return 0;
+}
+
+/// Quantized search: fast asymmetric scan + FP32 re-rank.
+/// metric: 0=cosine, 1=dot_product, 2=l2. Returns actual result count.
+export fn turbodb_vector_search_quantized(
+    handle: *anyopaque,
+    query: [*]const f32,
+    dims: u32,
+    k: u32,
+    metric: u8,
+    out_indices: [*]u32,
+    out_scores: [*]f32,
+) c_int {
+    const col: *const vector.VectorColumn = @ptrCast(@alignCast(handle));
+    const m: vector.Metric = switch (metric) {
+        0 => .cosine,
+        1 => .dot_product,
+        2 => .l2,
+        else => return -1,
+    };
+    const results = col.searchQuantized(alloc, query[0..dims], k, m) catch return -1;
+    defer alloc.free(results);
+    for (results, 0..) |r, i| {
+        out_indices[i] = r.index;
+        out_scores[i] = r.score;
+    }
+    return @intCast(results.len);
+}

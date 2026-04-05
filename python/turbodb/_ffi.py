@@ -221,6 +221,48 @@ _lib.turbodb_ed25519_verify.argtypes = [
 _lib.turbodb_ed25519_verify.restype = ctypes.c_int
 
 
+# ── Vector column ────────────────────────────────────────────────────────────
+
+# turbodb_vector_create(dims) -> *opaque
+_lib.turbodb_vector_create.argtypes = [ctypes.c_uint32]
+_lib.turbodb_vector_create.restype = ctypes.c_void_p
+
+# turbodb_vector_free(handle)
+_lib.turbodb_vector_free.argtypes = [ctypes.c_void_p]
+_lib.turbodb_vector_free.restype = None
+
+# turbodb_vector_append(handle, data, dims) -> c_int
+_lib.turbodb_vector_append.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint32]
+_lib.turbodb_vector_append.restype = ctypes.c_int
+
+# turbodb_vector_search(handle, query, dims, k, metric, out_indices, out_scores) -> c_int
+_lib.turbodb_vector_search.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint32,
+    ctypes.c_uint32, ctypes.c_uint8, ctypes.POINTER(ctypes.c_uint32),
+    ctypes.POINTER(ctypes.c_float),
+]
+_lib.turbodb_vector_search.restype = ctypes.c_int
+
+# turbodb_vector_count(handle) -> u32
+_lib.turbodb_vector_count.argtypes = [ctypes.c_void_p]
+_lib.turbodb_vector_count.restype = ctypes.c_uint32
+
+# turbodb_vector_memory(handle) -> usize
+_lib.turbodb_vector_memory.argtypes = [ctypes.c_void_p]
+_lib.turbodb_vector_memory.restype = ctypes.c_size_t
+
+# turbodb_vector_enable_quantization(handle, bit_width, seed) -> c_int
+_lib.turbodb_vector_enable_quantization.argtypes = [ctypes.c_void_p, ctypes.c_uint8, ctypes.c_uint64]
+_lib.turbodb_vector_enable_quantization.restype = ctypes.c_int
+
+# turbodb_vector_search_quantized(handle, query, dims, k, metric, out_indices, out_scores) -> c_int
+_lib.turbodb_vector_search_quantized.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint32,
+    ctypes.c_uint32, ctypes.c_uint8, ctypes.POINTER(ctypes.c_uint32),
+    ctypes.POINTER(ctypes.c_float),
+]
+_lib.turbodb_vector_search_quantized.restype = ctypes.c_int
+
 
 # ── Public low-level API ────────────────────────────────────────────────────
 
