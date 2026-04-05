@@ -87,7 +87,6 @@ pub const VectorColumn = struct {
         if (vec.len != self.dims) return error.DimensionMismatch;
 
         if (self.quantized_only and self.quant != null) {
-            // Quantized-only mode: skip FP32 data and norms
             self.count += 1;
             const q = self.quant.?;
             const bpv = q.bytes_per_vec;
@@ -98,30 +97,37 @@ pub const VectorColumn = struct {
         }
 
         try self.data.appendSlice(alloc, vec);
-        // Pre-compute and cache the L2 norm for fast cosine later.
         try self.norms.append(alloc, l2Norm(vec));
         self.count += 1;
 
-        // If quantization is enabled, also quantize the new vector.
-        if (self.quant) |q| {
+        // NOTE: INT8 quantization is deferred to enableInt8() for fast insert.
+        // Only quantize on append if 4-bit TurboQuant is enabled (not INT8).
+        if (self.quant != null and !self.i8_enabled) {
+            const q = self.quant.?;
             const bpv = q.bytes_per_vec;
             const old_len = self.qdata.items.len;
             try self.qdata.resize(alloc, old_len + bpv);
             q.quantize(vec, self.qdata.items[old_len..][0..bpv]);
         }
+    }
 
-        // If INT8 is enabled, also quantize the new vector to INT8.
-        if (self.i8_enabled and self.quant != null) {
-            const d: usize = self.dims;
-            const old_len = self.i8data.items.len;
-            try self.i8data.resize(alloc, old_len + d);
-            try self.i8scales.append(alloc, turboquant.quantizeVecToInt8(
-                self.quant.?.rotation,
-                d,
-                vec,
-                self.i8data.items[old_len..][0..d],
-            ));
+    /// Batch append: insert multiple vectors at once with pre-allocated capacity.
+    /// Much faster than calling append() in a loop — one allocation, one copy.
+    pub fn appendBatch(self: *VectorColumn, alloc: Allocator, vecs: []const f32, n_vecs: u32) !void {
+        const d: usize = self.dims;
+        if (vecs.len != @as(usize, n_vecs) * d) return error.DimensionMismatch;
+
+        // Pre-allocate capacity for all vectors at once
+        try self.data.ensureUnusedCapacity(alloc, vecs.len);
+        try self.norms.ensureUnusedCapacity(alloc, n_vecs);
+
+        // Bulk copy + compute norms
+        for (0..n_vecs) |i| {
+            const vec = vecs[i * d ..][0..d];
+            self.data.appendSliceAssumeCapacity(vec);
+            self.norms.appendAssumeCapacity(l2Norm(vec));
         }
+        self.count += n_vecs;
     }
 
     /// Get vector at index. Returns slice into internal storage (zero-copy).

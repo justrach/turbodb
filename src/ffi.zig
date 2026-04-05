@@ -309,6 +309,13 @@ export fn turbodb_vector_append(handle: *anyopaque, data: [*]const f32, dims: u3
     return 0;
 }
 
+/// Batch append: insert n_vecs vectors at once (n_vecs * dims floats contiguous).
+export fn turbodb_vector_append_batch(handle: *anyopaque, data: [*]const f32, dims: u32, n_vecs: u32) c_int {
+    const col: *vector.VectorColumn = @ptrCast(@alignCast(handle));
+    col.appendBatch(alloc, data[0 .. @as(usize, n_vecs) * dims], n_vecs) catch return -1;
+    return 0;
+}
+
 /// Search for top-K similar vectors. Results written to out_indices/out_scores.
 /// metric: 0=cosine, 1=dot_product, 2=l2. Returns actual result count.
 export fn turbodb_vector_search(
