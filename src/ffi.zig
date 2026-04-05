@@ -422,3 +422,65 @@ export fn turbodb_vector_search_int8(
     }
     return @intCast(results.len);
 }
+
+/// Parallel INT8 SIMD search: splits scan across multiple threads.
+/// metric: 0=cosine, 1=dot_product, 2=l2. Returns actual result count.
+export fn turbodb_vector_search_int8_parallel(
+    handle: *anyopaque,
+    query: [*]const f32,
+    dims: u32,
+    k: u32,
+    metric: u8,
+    out_indices: [*]u32,
+    out_scores: [*]f32,
+) c_int {
+    const col: *const vector.VectorColumn = @ptrCast(@alignCast(handle));
+    const m: vector.Metric = switch (metric) {
+        0 => .cosine,
+        1 => .dot_product,
+        2 => .l2,
+        else => return -1,
+    };
+    const results = col.searchInt8Parallel(alloc, query[0..dims], k, m) catch return -1;
+    defer alloc.free(results);
+    for (results, 0..) |r, i| {
+        out_indices[i] = r.index;
+        out_scores[i] = r.score;
+    }
+    return @intCast(results.len);
+}
+
+/// Build IVF (Inverted File Index) for approximate nearest neighbor search.
+export fn turbodb_vector_build_ivf(handle: *anyopaque, n_clusters: u32, seed: u64) c_int {
+    const col: *vector.VectorColumn = @ptrCast(@alignCast(handle));
+    col.buildIVF(alloc, n_clusters, seed) catch return -1;
+    return 0;
+}
+
+/// IVF search: probe only n_probes nearest clusters.
+/// metric: 0=cosine, 1=dot_product, 2=l2. Returns actual result count.
+export fn turbodb_vector_search_ivf(
+    handle: *anyopaque,
+    query: [*]const f32,
+    dims: u32,
+    k: u32,
+    metric: u8,
+    n_probes: u32,
+    out_indices: [*]u32,
+    out_scores: [*]f32,
+) c_int {
+    const col: *const vector.VectorColumn = @ptrCast(@alignCast(handle));
+    const m: vector.Metric = switch (metric) {
+        0 => .cosine,
+        1 => .dot_product,
+        2 => .l2,
+        else => return -1,
+    };
+    const results = col.searchIVF(alloc, query[0..dims], k, m, n_probes) catch return -1;
+    defer alloc.free(results);
+    for (results, 0..) |r, i| {
+        out_indices[i] = r.index;
+        out_scores[i] = r.score;
+    }
+    return @intCast(results.len);
+}

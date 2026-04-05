@@ -275,6 +275,26 @@ _lib.turbodb_vector_search_int8.argtypes = [
 ]
 _lib.turbodb_vector_search_int8.restype = ctypes.c_int
 
+# turbodb_vector_search_int8_parallel(handle, query, dims, k, metric, out_indices, out_scores) -> c_int
+_lib.turbodb_vector_search_int8_parallel.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint32,
+    ctypes.c_uint32, ctypes.c_uint8, ctypes.POINTER(ctypes.c_uint32),
+    ctypes.POINTER(ctypes.c_float),
+]
+_lib.turbodb_vector_search_int8_parallel.restype = ctypes.c_int
+
+# turbodb_vector_build_ivf(handle, n_clusters, seed) -> c_int
+_lib.turbodb_vector_build_ivf.argtypes = [ctypes.c_void_p, ctypes.c_uint32, ctypes.c_uint64]
+_lib.turbodb_vector_build_ivf.restype = ctypes.c_int
+
+# turbodb_vector_search_ivf(handle, query, dims, k, metric, n_probes, out_indices, out_scores) -> c_int
+_lib.turbodb_vector_search_ivf.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_float), ctypes.c_uint32,
+    ctypes.c_uint32, ctypes.c_uint8, ctypes.c_uint32,
+    ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_float),
+]
+_lib.turbodb_vector_search_ivf.restype = ctypes.c_int
+
 
 # ── Public low-level API ────────────────────────────────────────────────────
 

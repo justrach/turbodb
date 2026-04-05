@@ -292,6 +292,42 @@ class VectorColumn:
             raise RuntimeError("INT8 search failed")
         return [{"index": int(indices[i]), "score": float(scores[i])} for i in range(n)]
 
+    def search_int8_parallel(self, query, k: int = 10, metric: str = "cosine"):
+        """Parallel INT8 SIMD search: splits scan across multiple threads."""
+        metric_map = {"cosine": 0, "dot_product": 1, "l2": 2}
+        if metric not in metric_map:
+            raise ValueError(f"Unknown metric '{metric}', use one of {list(metric_map)}")
+        arr = (ctypes.c_float * len(query))(*query)
+        indices = (ctypes.c_uint32 * k)()
+        scores = (ctypes.c_float * k)()
+        n = _ffi._lib.turbodb_vector_search_int8_parallel(
+            self._handle, arr, len(query), k, metric_map[metric], indices, scores
+        )
+        if n < 0:
+            raise RuntimeError("Parallel INT8 search failed")
+        return [{"index": int(indices[i]), "score": float(scores[i])} for i in range(n)]
+
+    def build_ivf(self, n_clusters: int = 16, seed: int = 42):
+        """Build IVF (Inverted File Index) for approximate nearest neighbor search."""
+        rc = _ffi._lib.turbodb_vector_build_ivf(self._handle, n_clusters, seed)
+        if rc != 0:
+            raise RuntimeError(f"Failed to build IVF (n_clusters={n_clusters})")
+
+    def search_ivf(self, query, k: int = 10, metric: str = "cosine", n_probes: int = 4):
+        """IVF search: probe only n_probes nearest clusters instead of full scan."""
+        metric_map = {"cosine": 0, "dot_product": 1, "l2": 2}
+        if metric not in metric_map:
+            raise ValueError(f"Unknown metric '{metric}', use one of {list(metric_map)}")
+        arr = (ctypes.c_float * len(query))(*query)
+        indices = (ctypes.c_uint32 * k)()
+        scores = (ctypes.c_float * k)()
+        n = _ffi._lib.turbodb_vector_search_ivf(
+            self._handle, arr, len(query), k, metric_map[metric], n_probes, indices, scores
+        )
+        if n < 0:
+            raise RuntimeError("IVF search failed")
+        return [{"index": int(indices[i]), "score": float(scores[i])} for i in range(n)]
+
     def count(self) -> int:
         """Number of vectors in the column."""
         return _ffi._lib.turbodb_vector_count(self._handle)
