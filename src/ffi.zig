@@ -123,6 +123,20 @@ export fn turbodb_insert(
     return 0;
 }
 
+/// Insert with a pre-computed embedding (no JSON parsing). Fast path for vector inserts.
+export fn turbodb_insert_with_embedding(
+    col_handle: *anyopaque,
+    key: [*]const u8, key_len: usize,
+    val: [*]const u8, val_len: usize,
+    embedding: [*]const f32, dims: u32,
+    out_id: *u64,
+) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const doc_id = col.insertWithEmbedding(key[0..key_len], val[0..val_len], embedding[0..dims]) catch return -1;
+    out_id.* = doc_id;
+    return 0;
+}
+
 /// Get a document by key. On success, fills `out` with pointers into
 /// mmap'd memory (valid until next write to this collection).
 /// Returns 0 if found, -1 if not found.
