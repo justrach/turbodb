@@ -46,6 +46,12 @@ pub const VectorColumn = struct {
     bytes_per_vec: u32 = 0,
     /// When true, only quantized data is stored (no FP32, no norms). Saves ~8x memory.
     quantized_only: bool = false,
+    /// INT8 quantized vector data (all vectors concatenated, dims i8 per vector).
+    i8data: std.ArrayListUnmanaged(i8) = .empty,
+    /// Per-vector scale factors for INT8 quantization.
+    i8scales: std.ArrayListUnmanaged(f32) = .empty,
+    /// Whether INT8 search is enabled.
+    i8_enabled: bool = false,
 
     pub fn init(dims: u32) VectorColumn {
         return .{ .dims = dims };
@@ -55,6 +61,8 @@ pub const VectorColumn = struct {
         self.data.deinit(alloc);
         self.norms.deinit(alloc);
         self.qdata.deinit(alloc);
+        self.i8data.deinit(alloc);
+        self.i8scales.deinit(alloc);
         if (self.quant) |q| {
             q.deinit();
             alloc.destroy(q);
@@ -88,6 +96,19 @@ pub const VectorColumn = struct {
             const old_len = self.qdata.items.len;
             try self.qdata.resize(alloc, old_len + bpv);
             q.quantize(vec, self.qdata.items[old_len..][0..bpv]);
+        }
+
+        // If INT8 is enabled, also quantize the new vector to INT8.
+        if (self.i8_enabled and self.quant != null) {
+            const d: usize = self.dims;
+            const old_len = self.i8data.items.len;
+            try self.i8data.resize(alloc, old_len + d);
+            try self.i8scales.append(alloc, turboquant.quantizeVecToInt8(
+                self.quant.?.rotation,
+                d,
+                vec,
+                self.i8data.items[old_len..][0..d],
+            ));
         }
     }
 
@@ -220,6 +241,109 @@ pub const VectorColumn = struct {
         self.data = .empty;
         self.norms.deinit(alloc);
         self.norms = .empty;
+    }
+
+    /// Enable INT8 direct distance computation. Quantizes all existing vectors to i8.
+    pub fn enableInt8(self: *VectorColumn, alloc: Allocator, seed: u64) !void {
+        // Need a TurboQuant just for the rotation matrix
+        if (self.quant == null) {
+            const q = try alloc.create(turboquant.TurboQuant);
+            errdefer alloc.destroy(q);
+            q.* = try turboquant.TurboQuant.init(alloc, self.dims, 4, seed); // bit_width doesn't matter, we only use rotation
+            self.quant = q;
+        }
+        self.i8_enabled = true;
+
+        // Quantize all existing vectors to INT8
+        const d: usize = self.dims;
+        self.i8data.deinit(alloc);
+        self.i8data = .empty;
+        self.i8scales.deinit(alloc);
+        self.i8scales = .empty;
+
+        try self.i8data.resize(alloc, @as(usize, self.count) * d);
+        try self.i8scales.resize(alloc, self.count);
+
+        for (0..self.count) |i| {
+            const vec = self.get(@intCast(i)) orelse continue;
+            self.i8scales.items[i] = turboquant.quantizeVecToInt8(
+                self.quant.?.rotation,
+                d,
+                vec,
+                self.i8data.items[i * d ..][0..d],
+            );
+        }
+    }
+
+    /// INT8 SIMD search: quantize query to i8, scan all i8 vectors with SIMD dot product.
+    /// 4x less memory than FP32, processes 16 i8 lanes vs 8 f32 lanes per SIMD op.
+    pub fn searchInt8(
+        self: *const VectorColumn,
+        alloc: Allocator,
+        query: []const f32,
+        k: u32,
+        metric: Metric,
+    ) ![]SearchResult {
+        if (!self.i8_enabled or self.quant == null) return self.search(alloc, query, k, metric);
+        if (query.len != self.dims) return error.DimensionMismatch;
+        if (self.count == 0) return &.{};
+
+        const d: usize = self.dims;
+        const actual_k = @min(k, self.count);
+
+        // Rotate and quantize query to INT8 (once per search)
+        var q_i8_stack: [2048]i8 = undefined;
+        var q_i8_heap: ?[]i8 = null;
+        const q_i8 = if (d <= 2048) q_i8_stack[0..d] else blk: {
+            q_i8_heap = try alloc.alloc(i8, d);
+            break :blk q_i8_heap.?;
+        };
+        defer if (q_i8_heap) |hb| alloc.free(hb);
+
+        const q_scale = turboquant.quantizeVecToInt8(self.quant.?.rotation, d, query, q_i8);
+
+        // Scan all vectors using INT8 dot product
+        var results = try alloc.alloc(SearchResult, actual_k);
+        var heap_size: u32 = 0;
+
+        var i: u32 = 0;
+        while (i < self.count) : (i += 1) {
+            const vec_i8 = self.i8data.items[@as(usize, i) * d ..][0..d];
+            const int_dot = turboquant.int8DotProduct(q_i8, vec_i8);
+
+            // Convert back to approximate FP32 score
+            const vec_scale = self.i8scales.items[i];
+            const score_raw = @as(f32, @floatFromInt(int_dot)) / (q_scale * vec_scale);
+
+            // For L2: negate so higher = closer (same convention as FP32 search)
+            const score = if (metric == .l2) -score_raw else score_raw;
+
+            if (heap_size < actual_k) {
+                results[heap_size] = .{ .index = i, .score = score };
+                heap_size += 1;
+                if (heap_size == actual_k) {
+                    var j: u32 = heap_size / 2;
+                    while (j > 0) {
+                        j -= 1;
+                        heapifyDown(results[0..heap_size], j);
+                    }
+                }
+            } else if (score > results[0].score) {
+                results[0] = .{ .index = i, .score = score };
+                heapifyDown(results[0..heap_size], 0);
+            }
+        }
+
+        // Sort descending
+        std.mem.sort(SearchResult, results[0..heap_size], {}, struct {
+            fn cmp(_: void, a: SearchResult, b: SearchResult) bool {
+                return a.score > b.score;
+            }
+        }.cmp);
+        if (metric == .l2) {
+            for (results[0..heap_size]) |*r| r.score = -r.score;
+        }
+        return results[0..heap_size];
     }
 
     /// Fast quantized search: asymmetric distance for candidate selection,
@@ -361,7 +485,9 @@ pub const VectorColumn = struct {
     pub fn memoryBytes(self: *const VectorColumn) usize {
         return self.data.items.len * @sizeOf(f32) +
             self.norms.items.len * @sizeOf(f32) +
-            self.qdata.items.len;
+            self.qdata.items.len +
+            self.i8data.items.len +
+            self.i8scales.items.len * @sizeOf(f32);
     }
 };
 

@@ -271,6 +271,27 @@ class VectorColumn:
             raise RuntimeError("Quantized search failed")
         return [{"index": int(indices[i]), "score": float(scores[i])} for i in range(n)]
 
+    def enable_int8(self, seed: int = 42):
+        """Enable INT8 SIMD direct distance computation. Quantizes all existing vectors to i8."""
+        rc = _ffi._lib.turbodb_vector_enable_int8(self._handle, seed)
+        if rc != 0:
+            raise RuntimeError("Failed to enable INT8 mode")
+
+    def search_int8(self, query, k: int = 10, metric: str = "cosine"):
+        """INT8 SIMD search: 4x less memory, 16 i8 lanes vs 8 f32 lanes per SIMD op."""
+        metric_map = {"cosine": 0, "dot_product": 1, "l2": 2}
+        if metric not in metric_map:
+            raise ValueError(f"Unknown metric '{metric}', use one of {list(metric_map)}")
+        arr = (ctypes.c_float * len(query))(*query)
+        indices = (ctypes.c_uint32 * k)()
+        scores = (ctypes.c_float * k)()
+        n = _ffi._lib.turbodb_vector_search_int8(
+            self._handle, arr, len(query), k, metric_map[metric], indices, scores
+        )
+        if n < 0:
+            raise RuntimeError("INT8 search failed")
+        return [{"index": int(indices[i]), "score": float(scores[i])} for i in range(n)]
+
     def count(self) -> int:
         """Number of vectors in the column."""
         return _ffi._lib.turbodb_vector_count(self._handle)

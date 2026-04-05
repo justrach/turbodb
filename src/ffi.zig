@@ -388,3 +388,37 @@ export fn turbodb_vector_search_quantized(
     }
     return @intCast(results.len);
 }
+
+/// Enable INT8 direct distance computation on a vector column.
+export fn turbodb_vector_enable_int8(handle: *anyopaque, seed: u64) c_int {
+    const col: *vector.VectorColumn = @ptrCast(@alignCast(handle));
+    col.enableInt8(alloc, seed) catch return -1;
+    return 0;
+}
+
+/// INT8 SIMD search: quantize query to i8, scan with 16-lane SIMD dot product.
+/// metric: 0=cosine, 1=dot_product, 2=l2. Returns actual result count.
+export fn turbodb_vector_search_int8(
+    handle: *anyopaque,
+    query: [*]const f32,
+    dims: u32,
+    k: u32,
+    metric: u8,
+    out_indices: [*]u32,
+    out_scores: [*]f32,
+) c_int {
+    const col: *const vector.VectorColumn = @ptrCast(@alignCast(handle));
+    const m: vector.Metric = switch (metric) {
+        0 => .cosine,
+        1 => .dot_product,
+        2 => .l2,
+        else => return -1,
+    };
+    const results = col.searchInt8(alloc, query[0..dims], k, m) catch return -1;
+    defer alloc.free(results);
+    for (results, 0..) |r, i| {
+        out_indices[i] = r.index;
+        out_scores[i] = r.score;
+    }
+    return @intCast(results.len);
+}

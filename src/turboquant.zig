@@ -641,6 +641,70 @@ fn generateOrthogonalMatrix(m: []f32, d: usize, rng: *std.Random.Xoshiro256) voi
     }
 }
 
+// ─── INT8 SIMD direct distance computation ──────────────────────────────
+
+/// INT8 dot product using SIMD. Widens i8→i16 to avoid overflow, accumulates to i32.
+/// Processes 16 i8 elements at a time (widened to i16 for safe multiplication).
+pub fn int8DotProduct(a: []const i8, b: []const i8) i32 {
+    std.debug.assert(a.len == b.len);
+    const n = a.len;
+    const LANE = 16; // 16 i8 → 16 i16 multiply → accumulate
+    const lanes = n / LANE;
+    var acc: @Vector(16, i32) = @splat(0);
+
+    for (0..lanes) |i| {
+        const va: @Vector(16, i8) = a[i * LANE ..][0..LANE].*;
+        const vb: @Vector(16, i8) = b[i * LANE ..][0..LANE].*;
+        // Widen i8 to i16 for safe multiply (i8*i8 max = 16129, fits i16)
+        const wa: @Vector(16, i16) = @intCast(va);
+        const wb: @Vector(16, i16) = @intCast(vb);
+        const prod: @Vector(16, i16) = wa * wb;
+        // Widen to i32 and accumulate
+        const prod32: @Vector(16, i32) = @intCast(prod);
+        acc += prod32;
+    }
+
+    var result: i32 = @reduce(.Add, acc);
+    // Scalar tail
+    for (lanes * LANE..n) |i| {
+        result += @as(i32, a[i]) * @as(i32, b[i]);
+    }
+    return result;
+}
+
+/// Quantize an FP32 vector to INT8 after rotation. Returns scale factor.
+pub fn quantizeVecToInt8(rotation: []const f32, dims: usize, vector: []const f32, out: []i8) f32 {
+    // 1. Rotate
+    var stack_buf: [2048]f32 = undefined;
+    var heap_buf: ?[]f32 = null;
+    const rotated = if (dims <= 2048) stack_buf[0..dims] else blk: {
+        heap_buf = std.heap.page_allocator.alloc(f32, dims) catch return 0;
+        break :blk heap_buf.?;
+    };
+    defer if (heap_buf) |hb| std.heap.page_allocator.free(hb);
+
+    matvecMul(rotation, vector, rotated, dims);
+
+    // 2. Find max abs value
+    var max_abs: f32 = 0;
+    for (rotated) |v| {
+        const abs_v = @abs(v);
+        if (abs_v > max_abs) max_abs = abs_v;
+    }
+    if (max_abs == 0) max_abs = 1.0;
+
+    // 3. Scale to [-127, 127] and round
+    const scale = 127.0 / max_abs;
+    for (0..dims) |i| {
+        const scaled = rotated[i] * scale;
+        const rounded = @round(scaled);
+        const clamped = @max(-127.0, @min(127.0, rounded));
+        out[i] = @intFromFloat(clamped);
+    }
+
+    return scale;
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────
 
 test "bit packing round-trip" {
@@ -734,4 +798,21 @@ test "orthogonal matrix is orthogonal" {
             try std.testing.expect(@abs(dot - expected) < 0.1);
         }
     }
+}
+
+test "int8 dot product" {
+    const a = [_]i8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    const b = [_]i8{ 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1 };
+    const result = int8DotProduct(&a, &b);
+    // sum of i*(17-i) for i=1..16 = 816
+    try std.testing.expectEqual(@as(i32, 816), result);
+}
+
+test "int8 dot product with scalar tail" {
+    // 20 elements: 16 SIMD + 4 scalar tail
+    const a = [_]i8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 1, 1, 1, 1 };
+    const b = [_]i8{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 10, 20, 30, 40 };
+    const result = int8DotProduct(&a, &b);
+    // SIMD part: sum(1..16) = 136, tail: 1*10+1*20+1*30+1*40 = 100
+    try std.testing.expectEqual(@as(i32, 236), result);
 }
