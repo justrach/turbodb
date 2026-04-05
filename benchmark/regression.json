@@ -1,0 +1,53 @@
+{
+  "version": "1.0",
+  "date": "2026-04-05",
+  "branch": "feat/turboquant-fast",
+  "description": "Baseline regression targets for TurboDB vector search performance",
+  "machine": "Apple Silicon (M-series), 8+ cores",
+  "notes": "All numbers are upper bounds — regressions fail if slower than these targets",
+
+  "insert": {
+    "description": "Batch insert via appendBatch FFI (no quantization during insert)",
+    "targets": [
+      {"dims": 1536, "n": 10000,   "min_vps": 400000, "measured_vps": 931999},
+      {"dims": 1536, "n": 100000,  "min_vps": 200000, "measured_vps": 427866},
+      {"dims": 768,  "n": 100000,  "min_vps": 400000, "measured_vps": 931999}
+    ]
+  },
+
+  "search_int8_parallel": {
+    "description": "INT8 SIMD parallel scan (8 threads), cosine similarity, top-10",
+    "targets": [
+      {"dims": 768,  "n": 10000,   "max_ms": 3.0,   "measured_ms": 1.0},
+      {"dims": 768,  "n": 50000,   "max_ms": 8.0,   "measured_ms": 3.0},
+      {"dims": 768,  "n": 100000,  "max_ms": 15.0,  "measured_ms": 5.4},
+      {"dims": 1536, "n": 10000,   "max_ms": 5.0,   "measured_ms": 2.4},
+      {"dims": 1536, "n": 50000,   "max_ms": 15.0,  "measured_ms": 7.2},
+      {"dims": 1536, "n": 100000,  "max_ms": 25.0,  "measured_ms": 10.7},
+      {"dims": 1536, "n": 1000000, "max_ms": 150.0, "measured_ms": 94.0}
+    ]
+  },
+
+  "recall": {
+    "description": "Recall@10 of INT8 parallel search vs FP32 brute force ground truth",
+    "targets": [
+      {"dims": 768,  "n": 10000,   "min_recall": 0.95, "measured": 0.99},
+      {"dims": 768,  "n": 50000,   "min_recall": 0.93, "measured": 0.98},
+      {"dims": 768,  "n": 100000,  "min_recall": 0.93, "measured": 0.98},
+      {"dims": 1536, "n": 10000,   "min_recall": 0.93, "measured": 0.98},
+      {"dims": 1536, "n": 100000,  "min_recall": 0.93, "measured": 0.97},
+      {"dims": 1536, "n": 1000000, "min_recall": 0.90, "measured": 1.00}
+    ]
+  },
+
+  "vs_zvec": {
+    "description": "TurboDB must match or beat Zvec 0.3.0 search latency at these scales",
+    "targets": [
+      {"dims": 768,  "n": 10000,   "max_ratio": 1.5, "measured_ratio": 0.71, "note": "ratio = turbodb_ms / zvec_ms, lower is better"},
+      {"dims": 768,  "n": 50000,   "max_ratio": 1.0, "measured_ratio": 0.60},
+      {"dims": 768,  "n": 100000,  "max_ratio": 1.0, "measured_ratio": 0.53},
+      {"dims": 1536, "n": 50000,   "max_ratio": 1.0, "measured_ratio": 0.76},
+      {"dims": 1536, "n": 100000,  "max_ratio": 1.0, "measured_ratio": 0.58}
+    ]
+  }
+}

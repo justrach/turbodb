@@ -37,6 +37,32 @@ const CODEBOOK_4BIT = [_]f32{
     0.1284,  0.3880,  0.6568,  0.9424,  1.2562,  1.6180,  2.0690,  2.7326,
 };
 
+/// Fast Walsh-Hadamard Transform (in-place, normalized).
+/// n must be a power of 2.
+fn fwht(data: []f32, n: usize) void {
+    var h: usize = 1;
+    while (h < n) : (h *= 2) {
+        var i: usize = 0;
+        while (i < n) : (i += h * 2) {
+            for (0..h) |j| {
+                const x = data[i + j];
+                const y = data[i + j + h];
+                data[i + j] = x + y;
+                data[i + j + h] = x - y;
+            }
+        }
+    }
+    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(n)));
+    for (data[0..n]) |*v| v.* *= scale;
+}
+
+/// Next power of 2 >= n.
+fn nextPow2(n: usize) usize {
+    var p: usize = 1;
+    while (p < n) p *= 2;
+    return p;
+}
+
 /// TurboQuant quantizer for a fixed dimension and bit-width.
 pub const TurboQuant = struct {
     dims: u32,
@@ -46,22 +72,41 @@ pub const TurboQuant = struct {
     codebook: []f32, // scaled centroids for this dims (num_centroids entries)
     boundaries: []f32, // decision boundaries between centroids (num_centroids - 1 entries)
     bytes_per_vec: u32, // ceil(dims * bit_width / 8)
+    sign_flips: []i8, // random ±1 diagonal for SRHT (3 rounds × padded_dims)
+    padded_dims: u32, // next power of 2 >= dims
+    use_fwht: bool = false,
     allocator: Allocator,
 
     pub fn init(allocator: Allocator, dims: u32, bit_width: u8, seed: u64) !TurboQuant {
+        return initWithFwht(allocator, dims, bit_width, seed, false);
+    }
+
+    pub fn initWithFwht(allocator: Allocator, dims: u32, bit_width: u8, seed: u64, use_fwht_flag: bool) !TurboQuant {
         if (bit_width < 1 or bit_width > 4) return error.InvalidBitWidth;
         if (dims == 0) return error.InvalidDimension;
 
         const nc: u32 = @as(u32, 1) << @intCast(bit_width);
         const d: usize = @intCast(dims);
+        const pd: usize = nextPow2(d);
 
-        // Allocate rotation matrix (d × d)
-        const rotation = try allocator.alloc(f32, d * d);
-        errdefer allocator.free(rotation);
-
-        // Generate random orthogonal matrix via Gram-Schmidt on random Gaussian columns
         var rng = std.Random.Xoshiro256.init(seed);
-        generateOrthogonalMatrix(rotation, d, &rng);
+        const r = rng.random();
+
+        // Allocate rotation matrix (only if NOT using FWHT)
+        var rotation: []f32 = &.{};
+        if (!use_fwht_flag) {
+            rotation = try allocator.alloc(f32, d * d);
+            errdefer allocator.free(rotation);
+            var rng2 = std.Random.Xoshiro256.init(seed);
+            generateOrthogonalMatrix(rotation, d, &rng2);
+        }
+
+        // Allocate sign_flips for SRHT (3 rounds × padded_dims)
+        const sign_flips = try allocator.alloc(i8, 3 * pd);
+        errdefer allocator.free(sign_flips);
+        for (sign_flips) |*s| {
+            s.* = if (r.boolean()) @as(i8, 1) else @as(i8, -1);
+        }
 
         // Build scaled codebook: centroid_i = base_centroid_i / sqrt(d)
         const codebook = try allocator.alloc(f32, nc);
@@ -96,31 +141,56 @@ pub const TurboQuant = struct {
             .codebook = codebook,
             .boundaries = boundaries,
             .bytes_per_vec = bpv,
+            .sign_flips = sign_flips,
+            .padded_dims = @intCast(pd),
+            .use_fwht = use_fwht_flag,
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *TurboQuant) void {
-        self.allocator.free(self.rotation);
+        if (self.rotation.len > 0) self.allocator.free(self.rotation);
         self.allocator.free(self.codebook);
         self.allocator.free(self.boundaries);
+        self.allocator.free(self.sign_flips);
     }
 
     /// Quantize a d-dimensional FP32 vector to packed b-bit indices.
     /// `out` must have length >= self.bytes_per_vec.
-    pub fn quantize(self: *const TurboQuant, vector: []const f32, out: []u8) void {
+    pub fn quantize(self: *const TurboQuant, vector_data: []const f32, out: []u8) void {
         const d: usize = @intCast(self.dims);
-        if (vector.len < d) return;
+        if (vector_data.len < d) return;
 
-        // Step 1: Rotate — y = Π · x (matrix-vector multiply)
-        // Use stack buffer for small dims, heap for large
+        // Step 1: Rotate — either dense matrix or SRHT
         var rotated_buf: [1024]f32 = undefined;
         const rotated = if (d <= 1024) rotated_buf[0..d] else blk: {
             break :blk self.allocator.alloc(f32, d) catch return;
         };
         defer if (d > 1024) self.allocator.free(rotated);
 
-        matvecMul(self.rotation, vector, rotated, d);
+        if (self.use_fwht) {
+            // SRHT rotation: 3 rounds of sign-flip + FWHT
+            const pd: usize = @intCast(self.padded_dims);
+            var pad_buf: [1024]f32 = undefined;
+            const buf = if (pd <= 1024) pad_buf[0..pd] else blk: {
+                break :blk self.allocator.alloc(f32, pd) catch return;
+            };
+            defer if (pd > 1024) self.allocator.free(buf);
+
+            @memcpy(buf[0..d], vector_data);
+            @memset(buf[d..pd], 0);
+
+            for (0..3) |round| {
+                const signs = self.sign_flips[round * pd ..][0..pd];
+                for (0..pd) |i| {
+                    buf[i] *= @as(f32, @floatFromInt(signs[i]));
+                }
+                fwht(buf, pd);
+            }
+            @memcpy(rotated, buf[0..d]);
+        } else {
+            matvecMul(self.rotation, vector_data, rotated, d);
+        }
 
         // Step 2: Quantize each coordinate to nearest centroid index
         @memset(out[0..self.bytes_per_vec], 0);
@@ -268,11 +338,41 @@ pub const TurboQuant = struct {
 
     /// Pre-rotate a query vector: y_q = Π · q. Caller owns the returned slice.
     /// Call this ONCE per search, then use buildDistTable + scanWithTable per vector.
-    pub fn rotateQuery(self: *const TurboQuant, allocator: Allocator, query: []const f32) ![]f32 {
+    /// Automatically uses FWHT rotation when use_fwht is true.
+    pub fn rotateQuery(self: *const TurboQuant, allocator_arg: Allocator, query: []const f32) ![]f32 {
+        if (self.use_fwht) {
+            return self.rotateQueryFast(allocator_arg, query);
+        }
         const d: usize = @intCast(self.dims);
-        const yq = try allocator.alloc(f32, d);
+        const yq = try allocator_arg.alloc(f32, d);
         matvecMul(self.rotation, query, yq, d);
         return yq;
+    }
+
+    /// Rotate query using SRHT (3 rounds of sign-flip + FWHT). O(d log d).
+    pub fn rotateQueryFast(self: *const TurboQuant, allocator_arg: Allocator, query: []const f32) ![]f32 {
+        const d: usize = @intCast(self.dims);
+        const pd: usize = @intCast(self.padded_dims);
+        const buf = try allocator_arg.alloc(f32, pd);
+        defer allocator_arg.free(buf);
+
+        // Copy query into padded buffer, zero-pad
+        @memcpy(buf[0..d], query);
+        @memset(buf[d..pd], 0);
+
+        // 3 rounds of SRHT: sign-flip + FWHT
+        for (0..3) |round| {
+            const signs = self.sign_flips[round * pd ..][0..pd];
+            for (0..pd) |i| {
+                buf[i] *= @as(f32, @floatFromInt(signs[i]));
+            }
+            fwht(buf, pd);
+        }
+
+        // Return only first d elements (truncate padding)
+        const result = try allocator_arg.alloc(f32, d);
+        @memcpy(result, buf[0..d]);
+        return result;
     }
 
     /// Build an ADC (Asymmetric Distance Computation) lookup table for L2.
@@ -318,26 +418,61 @@ pub const TurboQuant = struct {
         var sum: f32 = 0;
 
         if (bw == 4) {
-            // Fast path for 4-bit: 2 nibbles per byte, no bit-shifting needed
+            // Fast path for 4-bit: 4-accumulator unrolling (8 coords per iteration)
             var j: usize = 0;
             var byte_idx: usize = 0;
+            var s0: f32 = 0;
+            var s1: f32 = 0;
+            var s2: f32 = 0;
+            var s3: f32 = 0;
+            while (j + 8 <= d) : ({
+                j += 8;
+                byte_idx += 4;
+            }) {
+                const b0 = quantized[byte_idx];
+                const b1 = quantized[byte_idx + 1];
+                const b2 = quantized[byte_idx + 2];
+                const b3 = quantized[byte_idx + 3];
+                s0 += table[j * nc + @as(usize, b0 & 0x0F)] + table[(j + 1) * nc + @as(usize, (b0 >> 4) & 0x0F)];
+                s1 += table[(j + 2) * nc + @as(usize, b1 & 0x0F)] + table[(j + 3) * nc + @as(usize, (b1 >> 4) & 0x0F)];
+                s2 += table[(j + 4) * nc + @as(usize, b2 & 0x0F)] + table[(j + 5) * nc + @as(usize, (b2 >> 4) & 0x0F)];
+                s3 += table[(j + 6) * nc + @as(usize, b3 & 0x0F)] + table[(j + 7) * nc + @as(usize, (b3 >> 4) & 0x0F)];
+            }
+            sum = s0 + s1 + s2 + s3;
+            // Handle remaining 2 coords at a time
             while (j + 2 <= d) : ({
                 j += 2;
                 byte_idx += 1;
             }) {
                 const b = quantized[byte_idx];
-                const lo: usize = b & 0x0F;
-                const hi: usize = (b >> 4) & 0x0F;
-                sum += table[j * nc + lo];
-                sum += table[(j + 1) * nc + hi];
+                sum += table[j * nc + @as(usize, b & 0x0F)] + table[(j + 1) * nc + @as(usize, (b >> 4) & 0x0F)];
             }
             if (j < d) {
                 sum += table[j * nc + @as(usize, quantized[byte_idx] & 0x0F)];
             }
         } else if (bw == 2) {
-            // Fast path for 2-bit: 4 values per byte
+            // Fast path for 2-bit: 4-accumulator unrolling (16 coords per iteration)
             var j: usize = 0;
             var byte_idx: usize = 0;
+            var s0: f32 = 0;
+            var s1: f32 = 0;
+            var s2: f32 = 0;
+            var s3: f32 = 0;
+            while (j + 16 <= d) : ({
+                j += 16;
+                byte_idx += 4;
+            }) {
+                const b0 = quantized[byte_idx];
+                const b1 = quantized[byte_idx + 1];
+                const b2 = quantized[byte_idx + 2];
+                const b3 = quantized[byte_idx + 3];
+                s0 += table[j * nc + @as(usize, b0 & 0x03)] + table[(j + 1) * nc + @as(usize, (b0 >> 2) & 0x03)] + table[(j + 2) * nc + @as(usize, (b0 >> 4) & 0x03)] + table[(j + 3) * nc + @as(usize, (b0 >> 6) & 0x03)];
+                s1 += table[(j + 4) * nc + @as(usize, b1 & 0x03)] + table[(j + 5) * nc + @as(usize, (b1 >> 2) & 0x03)] + table[(j + 6) * nc + @as(usize, (b1 >> 4) & 0x03)] + table[(j + 7) * nc + @as(usize, (b1 >> 6) & 0x03)];
+                s2 += table[(j + 8) * nc + @as(usize, b2 & 0x03)] + table[(j + 9) * nc + @as(usize, (b2 >> 2) & 0x03)] + table[(j + 10) * nc + @as(usize, (b2 >> 4) & 0x03)] + table[(j + 11) * nc + @as(usize, (b2 >> 6) & 0x03)];
+                s3 += table[(j + 12) * nc + @as(usize, b3 & 0x03)] + table[(j + 13) * nc + @as(usize, (b3 >> 2) & 0x03)] + table[(j + 14) * nc + @as(usize, (b3 >> 4) & 0x03)] + table[(j + 15) * nc + @as(usize, (b3 >> 6) & 0x03)];
+            }
+            sum = s0 + s1 + s2 + s3;
+            // Handle remaining 4 coords at a time
             while (j + 4 <= d) : ({
                 j += 4;
                 byte_idx += 1;
@@ -506,6 +641,77 @@ fn generateOrthogonalMatrix(m: []f32, d: usize, rng: *std.Random.Xoshiro256) voi
     }
 }
 
+// ─── INT8 SIMD direct distance computation ──────────────────────────────
+
+/// INT8 dot product using SIMD. Widens i8→i16 to avoid overflow, accumulates to i32.
+/// Processes 16 i8 elements at a time (widened to i16 for safe multiplication).
+pub fn int8DotProduct(a: []const i8, b: []const i8) i32 {
+    std.debug.assert(a.len == b.len);
+    const n = a.len;
+
+    // Process 32 i8 elements at a time with 2 independent accumulators
+    // to hide multiply latency and maximize throughput.
+    const LANE = 16;
+    const lanes = n / (LANE * 2); // 32 elements per iteration
+    var acc0: @Vector(LANE, i32) = @splat(0);
+    var acc1: @Vector(LANE, i32) = @splat(0);
+
+    for (0..lanes) |i| {
+        // First 16 elements → acc0
+        const va0: @Vector(LANE, i8) = a[i * LANE * 2 ..][0..LANE].*;
+        const vb0: @Vector(LANE, i8) = b[i * LANE * 2 ..][0..LANE].*;
+        const prod0: @Vector(LANE, i16) = @as(@Vector(LANE, i16), @intCast(va0)) * @as(@Vector(LANE, i16), @intCast(vb0));
+        acc0 += @as(@Vector(LANE, i32), @intCast(prod0));
+
+        // Second 16 elements → acc1 (independent chain, no stall)
+        const va1: @Vector(LANE, i8) = a[i * LANE * 2 + LANE ..][0..LANE].*;
+        const vb1: @Vector(LANE, i8) = b[i * LANE * 2 + LANE ..][0..LANE].*;
+        const prod1: @Vector(LANE, i16) = @as(@Vector(LANE, i16), @intCast(va1)) * @as(@Vector(LANE, i16), @intCast(vb1));
+        acc1 += @as(@Vector(LANE, i32), @intCast(prod1));
+    }
+
+    var result: i32 = @reduce(.Add, acc0) + @reduce(.Add, acc1);
+
+    // Tail: remaining elements (up to 31)
+    for (lanes * LANE * 2..n) |i| {
+        result += @as(i32, a[i]) * @as(i32, b[i]);
+    }
+    return result;
+}
+
+/// Quantize an FP32 vector to INT8 after rotation. Returns scale factor.
+pub fn quantizeVecToInt8(rotation: []const f32, dims: usize, vector: []const f32, out: []i8) f32 {
+    // 1. Rotate
+    var stack_buf: [2048]f32 = undefined;
+    var heap_buf: ?[]f32 = null;
+    const rotated = if (dims <= 2048) stack_buf[0..dims] else blk: {
+        heap_buf = std.heap.page_allocator.alloc(f32, dims) catch return 0;
+        break :blk heap_buf.?;
+    };
+    defer if (heap_buf) |hb| std.heap.page_allocator.free(hb);
+
+    matvecMul(rotation, vector, rotated, dims);
+
+    // 2. Find max abs value
+    var max_abs: f32 = 0;
+    for (rotated) |v| {
+        const abs_v = @abs(v);
+        if (abs_v > max_abs) max_abs = abs_v;
+    }
+    if (max_abs == 0) max_abs = 1.0;
+
+    // 3. Scale to [-127, 127] and round
+    const scale = 127.0 / max_abs;
+    for (0..dims) |i| {
+        const scaled = rotated[i] * scale;
+        const rounded = @round(scaled);
+        const clamped = @max(-127.0, @min(127.0, rounded));
+        out[i] = @intFromFloat(clamped);
+    }
+
+    return scale;
+}
+
 // ─── Tests ──────────────────────────────────────────────────────────────
 
 test "bit packing round-trip" {
@@ -599,4 +805,21 @@ test "orthogonal matrix is orthogonal" {
             try std.testing.expect(@abs(dot - expected) < 0.1);
         }
     }
+}
+
+test "int8 dot product" {
+    const a = [_]i8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16 };
+    const b = [_]i8{ 16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1 };
+    const result = int8DotProduct(&a, &b);
+    // sum of i*(17-i) for i=1..16 = 816
+    try std.testing.expectEqual(@as(i32, 816), result);
+}
+
+test "int8 dot product with scalar tail" {
+    // 20 elements: 16 SIMD + 4 scalar tail
+    const a = [_]i8{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 1, 1, 1, 1 };
+    const b = [_]i8{ 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 10, 20, 30, 40 };
+    const result = int8DotProduct(&a, &b);
+    // SIMD part: sum(1..16) = 136, tail: 1*10+1*20+1*30+1*40 = 100
+    try std.testing.expectEqual(@as(i32, 236), result);
 }

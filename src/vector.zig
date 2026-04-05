@@ -44,6 +44,21 @@ pub const VectorColumn = struct {
     qdata: std.ArrayListUnmanaged(u8) = .empty,
     /// Bytes per quantized vector (0 if quantization not enabled).
     bytes_per_vec: u32 = 0,
+    /// When true, only quantized data is stored (no FP32, no norms). Saves ~8x memory.
+    quantized_only: bool = false,
+    /// INT8 quantized vector data (all vectors concatenated, dims i8 per vector).
+    i8data: std.ArrayListUnmanaged(i8) = .empty,
+    /// Per-vector scale factors for INT8 quantization.
+    i8scales: std.ArrayListUnmanaged(f32) = .empty,
+    /// Whether INT8 search is enabled.
+    i8_enabled: bool = false,
+    // IVF (Inverted File Index) fields
+    n_clusters: u32 = 0,
+    ivf_centroids_i8: std.ArrayListUnmanaged(i8) = .empty,
+    ivf_centroid_scales: std.ArrayListUnmanaged(f32) = .empty,
+    ivf_lists: std.ArrayListUnmanaged(u32) = .empty, // vector indices grouped by cluster
+    ivf_offsets: std.ArrayListUnmanaged(u32) = .empty, // start offset per cluster in ivf_lists
+    ivf_sizes: std.ArrayListUnmanaged(u32) = .empty, // count per cluster
 
     pub fn init(dims: u32) VectorColumn {
         return .{ .dims = dims };
@@ -53,6 +68,13 @@ pub const VectorColumn = struct {
         self.data.deinit(alloc);
         self.norms.deinit(alloc);
         self.qdata.deinit(alloc);
+        self.i8data.deinit(alloc);
+        self.i8scales.deinit(alloc);
+        self.ivf_centroids_i8.deinit(alloc);
+        self.ivf_centroid_scales.deinit(alloc);
+        self.ivf_lists.deinit(alloc);
+        self.ivf_offsets.deinit(alloc);
+        self.ivf_sizes.deinit(alloc);
         if (self.quant) |q| {
             q.deinit();
             alloc.destroy(q);
@@ -63,18 +85,49 @@ pub const VectorColumn = struct {
     /// Append a vector. Must be exactly `dims` floats.
     pub fn append(self: *VectorColumn, alloc: Allocator, vec: []const f32) !void {
         if (vec.len != self.dims) return error.DimensionMismatch;
+
+        if (self.quantized_only and self.quant != null) {
+            self.count += 1;
+            const q = self.quant.?;
+            const bpv = q.bytes_per_vec;
+            const old_len = self.qdata.items.len;
+            try self.qdata.resize(alloc, old_len + bpv);
+            q.quantize(vec, self.qdata.items[old_len..][0..bpv]);
+            return;
+        }
+
         try self.data.appendSlice(alloc, vec);
-        // Pre-compute and cache the L2 norm for fast cosine later.
         try self.norms.append(alloc, l2Norm(vec));
         self.count += 1;
 
-        // If quantization is enabled, also quantize the new vector.
-        if (self.quant) |q| {
+        // NOTE: INT8 quantization is deferred to enableInt8() for fast insert.
+        // Only quantize on append if 4-bit TurboQuant is enabled (not INT8).
+        if (self.quant != null and !self.i8_enabled) {
+            const q = self.quant.?;
             const bpv = q.bytes_per_vec;
             const old_len = self.qdata.items.len;
             try self.qdata.resize(alloc, old_len + bpv);
             q.quantize(vec, self.qdata.items[old_len..][0..bpv]);
         }
+    }
+
+    /// Batch append: insert multiple vectors at once with pre-allocated capacity.
+    /// Much faster than calling append() in a loop — one allocation, one copy.
+    pub fn appendBatch(self: *VectorColumn, alloc: Allocator, vecs: []const f32, n_vecs: u32) !void {
+        const d: usize = self.dims;
+        if (vecs.len != @as(usize, n_vecs) * d) return error.DimensionMismatch;
+
+        // Pre-allocate capacity for all vectors at once
+        try self.data.ensureUnusedCapacity(alloc, vecs.len);
+        try self.norms.ensureUnusedCapacity(alloc, n_vecs);
+
+        // Bulk copy + compute norms
+        for (0..n_vecs) |i| {
+            const vec = vecs[i * d ..][0..d];
+            self.data.appendSliceAssumeCapacity(vec);
+            self.norms.appendAssumeCapacity(l2Norm(vec));
+        }
+        self.count += n_vecs;
     }
 
     /// Get vector at index. Returns slice into internal storage (zero-copy).
@@ -173,6 +226,162 @@ pub const VectorColumn = struct {
         }
     }
 
+    /// Enable quantized-only mode: uses FWHT rotation, stores only quantized data.
+    /// Frees FP32 data and norms to save memory.
+    pub fn enableQuantizedOnly(self: *VectorColumn, alloc: Allocator, bit_width: u8, seed: u64) !void {
+        // Clean up previous quantizer if any.
+        if (self.quant) |old| {
+            old.deinit();
+            alloc.destroy(old);
+        }
+
+        const q = try alloc.create(turboquant.TurboQuant);
+        errdefer alloc.destroy(q);
+        q.* = try turboquant.TurboQuant.init(alloc, self.dims, bit_width, seed);
+        self.quant = q;
+        self.bytes_per_vec = q.bytes_per_vec;
+        self.quantized_only = true;
+
+        // Quantize all existing vectors before freeing FP32 data.
+        const bpv = q.bytes_per_vec;
+        self.qdata.deinit(alloc);
+        self.qdata = .empty;
+        try self.qdata.resize(alloc, @as(usize, self.count) * bpv);
+        @memset(self.qdata.items, 0);
+
+        for (0..self.count) |i| {
+            const vec = self.get(@intCast(i)) orelse continue;
+            q.quantize(vec, self.qdata.items[i * bpv ..][0..bpv]);
+        }
+
+        // Free FP32 data since we won't use it
+        self.data.deinit(alloc);
+        self.data = .empty;
+        self.norms.deinit(alloc);
+        self.norms = .empty;
+    }
+
+    /// Enable INT8 direct distance computation. Quantizes all existing vectors to i8.
+    pub fn enableInt8(self: *VectorColumn, alloc: Allocator, seed: u64) !void {
+        // Need a TurboQuant just for the rotation matrix
+        if (self.quant == null) {
+            const q = try alloc.create(turboquant.TurboQuant);
+            errdefer alloc.destroy(q);
+            q.* = try turboquant.TurboQuant.init(alloc, self.dims, 4, seed); // bit_width doesn't matter, we only use rotation
+            self.quant = q;
+        }
+        self.i8_enabled = true;
+
+        // Quantize all existing vectors to INT8
+        const d: usize = self.dims;
+        self.i8data.deinit(alloc);
+        self.i8data = .empty;
+        self.i8scales.deinit(alloc);
+        self.i8scales = .empty;
+
+        try self.i8data.resize(alloc, @as(usize, self.count) * d);
+        try self.i8scales.resize(alloc, self.count);
+
+        for (0..self.count) |i| {
+            const vec = self.get(@intCast(i)) orelse continue;
+            self.i8scales.items[i] = turboquant.quantizeVecToInt8(
+                self.quant.?.rotation,
+                d,
+                vec,
+                self.i8data.items[i * d ..][0..d],
+            );
+        }
+    }
+
+    /// INT8 SIMD search: quantize query to i8, scan all i8 vectors with SIMD dot product.
+    /// 4x less memory than FP32, processes 16 i8 lanes vs 8 f32 lanes per SIMD op.
+    pub fn searchInt8(
+        self: *const VectorColumn,
+        alloc: Allocator,
+        query: []const f32,
+        k: u32,
+        metric: Metric,
+    ) ![]SearchResult {
+        if (!self.i8_enabled or self.quant == null) return self.search(alloc, query, k, metric);
+        if (query.len != self.dims) return error.DimensionMismatch;
+        if (self.count == 0) return &.{};
+
+        const d: usize = self.dims;
+        const actual_k = @min(k, self.count);
+
+        // Rotate and quantize query to INT8 (once per search)
+        var q_i8_stack: [2048]i8 = undefined;
+        var q_i8_heap: ?[]i8 = null;
+        const q_i8 = if (d <= 2048) q_i8_stack[0..d] else blk: {
+            q_i8_heap = try alloc.alloc(i8, d);
+            break :blk q_i8_heap.?;
+        };
+        defer if (q_i8_heap) |hb| alloc.free(hb);
+
+        const q_scale = turboquant.quantizeVecToInt8(self.quant.?.rotation, d, query, q_i8);
+
+        // Pre-compute 1/(q_scale * vec_scale) for each vector — avoids division in hot loop.
+        // Division is ~20 cycles, multiply is ~4 cycles.
+        const inv_scales = try alloc.alloc(f32, self.count);
+        defer alloc.free(inv_scales);
+        const inv_q = 1.0 / q_scale;
+        for (0..self.count) |idx| {
+            inv_scales[idx] = inv_q / self.i8scales.items[idx];
+        }
+
+        // Scan all vectors using INT8 dot product with prefetching
+        var results = try alloc.alloc(SearchResult, actual_k);
+        var heap_size: u32 = 0;
+        const i8items = self.i8data.items;
+
+        var i: u32 = 0;
+        while (i < self.count) : (i += 1) {
+            const offset = @as(usize, i) * d;
+            const vec_i8 = i8items[offset..][0..d];
+
+            // Prefetch next vector's data into L1 cache while we compute current
+            if (i + 1 < self.count) {
+                const next_ptr: [*]const u8 = @ptrCast(i8items[(offset + d)..].ptr);
+                @prefetch(next_ptr, .{ .rw = .read, .locality = 3 });
+                // Also prefetch 2nd cache line of next vector (d > 64)
+                if (d > 64) @prefetch(next_ptr + 64, .{ .rw = .read, .locality = 3 });
+                if (d > 128) @prefetch(next_ptr + 128, .{ .rw = .read, .locality = 3 });
+            }
+
+            const int_dot = turboquant.int8DotProduct(q_i8, vec_i8);
+
+            // Convert to FP32 score using precomputed inverse scale (multiply, not divide)
+            const score_raw = @as(f32, @floatFromInt(int_dot)) * inv_scales[i];
+            const score = if (metric == .l2) -score_raw else score_raw;
+
+            if (heap_size < actual_k) {
+                results[heap_size] = .{ .index = i, .score = score };
+                heap_size += 1;
+                if (heap_size == actual_k) {
+                    var j: u32 = heap_size / 2;
+                    while (j > 0) {
+                        j -= 1;
+                        heapifyDown(results[0..heap_size], j);
+                    }
+                }
+            } else if (score > results[0].score) {
+                results[0] = .{ .index = i, .score = score };
+                heapifyDown(results[0..heap_size], 0);
+            }
+        }
+
+        // Sort descending
+        std.mem.sort(SearchResult, results[0..heap_size], {}, struct {
+            fn cmp(_: void, a: SearchResult, b: SearchResult) bool {
+                return a.score > b.score;
+            }
+        }.cmp);
+        if (metric == .l2) {
+            for (results[0..heap_size]) |*r| r.score = -r.score;
+        }
+        return results[0..heap_size];
+    }
+
     /// Fast quantized search: asymmetric distance for candidate selection,
     /// then re-rank top 2K with exact FP32 distance.
     pub fn searchQuantized(
@@ -245,6 +454,24 @@ pub const VectorColumn = struct {
             }
         }
 
+        // Quantized-only mode: skip Phase 2 re-ranking, return Phase 1 results directly.
+        if (self.quantized_only) {
+            const actual_k = @min(k, heap_size);
+            var results = try alloc.alloc(SearchResult, actual_k);
+            // Sort candidates by score descending and take top-k
+            std.mem.sort(SearchResult, candidates[0..heap_size], {}, struct {
+                fn cmp(_: void, a: SearchResult, b: SearchResult) bool {
+                    return a.score > b.score;
+                }
+            }.cmp);
+            @memcpy(results[0..actual_k], candidates[0..actual_k]);
+            // Un-negate L2 scores.
+            if (metric == .l2) {
+                for (results[0..actual_k]) |*r| r.score = -r.score;
+            }
+            return results[0..actual_k];
+        }
+
         // Phase 2: Re-rank candidates using exact FP32 distance.
         const actual_k = @min(k, heap_size);
         var results = try alloc.alloc(SearchResult, actual_k);
@@ -290,13 +517,463 @@ pub const VectorColumn = struct {
         return results[0..result_heap];
     }
 
+    /// Parallel INT8 SIMD search: splits scan across multiple threads.
+    /// Falls back to single-threaded searchInt8 for small datasets or if threading fails.
+    pub fn searchInt8Parallel(
+        self: *const VectorColumn,
+        alloc: Allocator,
+        query: []const f32,
+        k: u32,
+        metric: Metric,
+    ) ![]SearchResult {
+        if (!self.i8_enabled or self.quant == null) return self.search(alloc, query, k, metric);
+        if (query.len != self.dims) return error.DimensionMismatch;
+        if (self.count == 0) return &.{};
+
+        const d: usize = self.dims;
+        const actual_k = @min(k, self.count);
+
+        // Quantize query to INT8 — heap-allocate if dims > 2048
+        var q_i8_stack: [2048]i8 = undefined;
+        var q_i8_heap: ?[]i8 = null;
+        const q_i8 = if (d <= 2048) q_i8_stack[0..d] else blk: {
+            q_i8_heap = try alloc.alloc(i8, d);
+            break :blk q_i8_heap.?;
+        };
+        defer if (q_i8_heap) |hb| alloc.free(hb);
+
+        const q_scale = turboquant.quantizeVecToInt8(self.quant.?.rotation, d, query, q_i8);
+        const inv_q = 1.0 / q_scale;
+
+        // Determine thread count
+        const max_threads: u32 = @intCast(@min(std.Thread.getCpuCount() catch 4, 8));
+        const n_threads: u32 = @min(max_threads, @max(1, self.count / 1000));
+
+        if (n_threads <= 1) {
+            // Fall back to single-threaded
+            return self.searchInt8(alloc, query, k, metric);
+        }
+
+        // Allocate per-thread results
+        const thread_results = try alloc.alloc([]SearchResult, n_threads);
+        defer {
+            for (thread_results) |tr| alloc.free(tr);
+            alloc.free(thread_results);
+        }
+        const thread_counts = try alloc.alloc(u32, n_threads);
+        defer alloc.free(thread_counts);
+
+        for (0..n_threads) |t| {
+            thread_results[t] = try alloc.alloc(SearchResult, actual_k);
+            thread_counts[t] = 0;
+        }
+
+        // Spawn threads
+        const threads = try alloc.alloc(std.Thread, n_threads);
+        defer alloc.free(threads);
+
+        const negate = metric == .l2;
+        const chunk = self.count / n_threads;
+
+        for (0..n_threads) |t| {
+            const start: u32 = @intCast(t * chunk);
+            const end: u32 = if (t == n_threads - 1) self.count else @intCast((t + 1) * chunk);
+
+            threads[t] = std.Thread.spawn(.{}, parallelSearchWorker, .{ParallelSearchArgs{
+                .i8items = self.i8data.items,
+                .i8scales = self.i8scales.items,
+                .inv_q_scale = inv_q,
+                .q_i8 = q_i8,
+                .dims = d,
+                .start = start,
+                .end = end,
+                .k = actual_k,
+                .negate = negate,
+                .out_results = thread_results[t],
+                .out_count = &thread_counts[t],
+            }}) catch return self.searchInt8(alloc, query, k, metric);
+        }
+
+        // Join all
+        for (threads) |t| t.join();
+
+        // Merge heaps
+        var final = try alloc.alloc(SearchResult, actual_k);
+        var heap_size: u32 = 0;
+
+        for (0..n_threads) |t| {
+            for (thread_results[t][0..thread_counts[t]]) |r| {
+                if (heap_size < actual_k) {
+                    final[heap_size] = r;
+                    heap_size += 1;
+                    if (heap_size == actual_k) {
+                        var j: u32 = heap_size / 2;
+                        while (j > 0) {
+                            j -= 1;
+                            heapifyDown(final[0..heap_size], j);
+                        }
+                    }
+                } else if (r.score > final[0].score) {
+                    final[0] = r;
+                    heapifyDown(final[0..heap_size], 0);
+                }
+            }
+        }
+
+        std.mem.sort(SearchResult, final[0..heap_size], {}, struct {
+            fn cmp(_: void, a: SearchResult, b: SearchResult) bool {
+                return a.score > b.score;
+            }
+        }.cmp);
+        if (metric == .l2) {
+            for (final[0..heap_size]) |*r| r.score = -r.score;
+        }
+        return final[0..heap_size];
+    }
+
+    /// Build an IVF (Inverted File Index) for approximate nearest neighbor search.
+    /// Uses k-means clustering on INT8 vectors to partition the dataset.
+    pub fn buildIVF(self: *VectorColumn, alloc: Allocator, n_clusters: u32, seed: u64) !void {
+        if (!self.i8_enabled) return error.Int8NotEnabled;
+        const d: usize = self.dims;
+        const n: u32 = self.count;
+        if (n == 0) return;
+
+        // Initialize centroids by random selection
+        var rng = std.Random.Xoshiro256.init(seed);
+        const rand = rng.random();
+
+        // Allocate centroid storage as FP32 for mean computation
+        const centroids_f32 = try alloc.alloc(f32, @as(usize, n_clusters) * d);
+        defer alloc.free(centroids_f32);
+
+        // Pick random initial centroids from existing vectors
+        for (0..n_clusters) |c| {
+            const idx = rand.intRangeAtMost(u32, 0, n - 1);
+            const src = self.i8data.items[@as(usize, idx) * d ..][0..d];
+            const scale = self.i8scales.items[idx];
+            for (0..d) |j| {
+                centroids_f32[c * d + j] = @as(f32, @floatFromInt(src[j])) / scale;
+            }
+        }
+
+        // K-means iterations (10 rounds)
+        const assignments = try alloc.alloc(u32, n);
+        defer alloc.free(assignments);
+
+        // Temp centroid i8 + scale for distance computation
+        const cent_i8 = try alloc.alloc(i8, @as(usize, n_clusters) * d);
+        defer alloc.free(cent_i8);
+        const cent_scales = try alloc.alloc(f32, n_clusters);
+        defer alloc.free(cent_scales);
+
+        // Allocate counts ONCE outside the loop to avoid leak
+        const counts = try alloc.alloc(u32, n_clusters);
+        defer alloc.free(counts);
+
+        for (0..10) |_| {
+            // Convert centroids to i8 for fast distance
+            for (0..n_clusters) |c| {
+                var max_abs: f32 = 0;
+                for (0..d) |j| {
+                    const v = @abs(centroids_f32[c * d + j]);
+                    if (v > max_abs) max_abs = v;
+                }
+                if (max_abs == 0) max_abs = 1;
+                const scale = 127.0 / max_abs;
+                cent_scales[c] = scale;
+                for (0..d) |j| {
+                    const val = centroids_f32[c * d + j] * scale;
+                    cent_i8[c * d + j] = @intFromFloat(@max(-127.0, @min(127.0, @round(val))));
+                }
+            }
+
+            // Assign each vector to nearest centroid
+            for (0..n) |vi| {
+                const vec = self.i8data.items[vi * d ..][0..d];
+                var best_c: u32 = 0;
+                var best_dot: i32 = std.math.minInt(i32);
+                for (0..n_clusters) |c| {
+                    const cdot = turboquant.int8DotProduct(vec, cent_i8[c * d ..][0..d]);
+                    if (cdot > best_dot) {
+                        best_dot = cdot;
+                        best_c = @intCast(c);
+                    }
+                }
+                assignments[vi] = best_c;
+            }
+
+            // Recompute centroids
+            @memset(centroids_f32, 0);
+            @memset(counts, 0);
+
+            for (0..n) |vi| {
+                const c = assignments[vi];
+                counts[c] += 1;
+                const vec = self.i8data.items[vi * d ..][0..d];
+                const vscale = self.i8scales.items[vi];
+                for (0..d) |j| {
+                    centroids_f32[@as(usize, c) * d + j] += @as(f32, @floatFromInt(vec[j])) / vscale;
+                }
+            }
+            for (0..n_clusters) |c| {
+                if (counts[c] > 0) {
+                    const cnt_f: f32 = @floatFromInt(counts[c]);
+                    for (0..d) |j| centroids_f32[c * d + j] /= cnt_f;
+                }
+            }
+        }
+
+        // Build inverted lists
+        self.n_clusters = n_clusters;
+
+        // Store final centroids as i8
+        self.ivf_centroids_i8.deinit(alloc);
+        self.ivf_centroids_i8 = .empty;
+        try self.ivf_centroids_i8.resize(alloc, @as(usize, n_clusters) * d);
+        self.ivf_centroid_scales.deinit(alloc);
+        self.ivf_centroid_scales = .empty;
+        try self.ivf_centroid_scales.resize(alloc, n_clusters);
+
+        // Recompute final i8 centroids
+        for (0..n_clusters) |c| {
+            var max_abs: f32 = 0;
+            for (0..d) |j| {
+                const v = @abs(centroids_f32[c * d + j]);
+                if (v > max_abs) max_abs = v;
+            }
+            if (max_abs == 0) max_abs = 1;
+            const scale = 127.0 / max_abs;
+            self.ivf_centroid_scales.items[c] = scale;
+            for (0..d) |j| {
+                const val = centroids_f32[c * d + j] * scale;
+                self.ivf_centroids_i8.items[c * d + j] = @intFromFloat(@max(-127.0, @min(127.0, @round(val))));
+            }
+        }
+
+        // Build offset/size arrays and sorted vector lists
+        self.ivf_sizes.deinit(alloc);
+        self.ivf_sizes = .empty;
+        try self.ivf_sizes.resize(alloc, n_clusters);
+        self.ivf_offsets.deinit(alloc);
+        self.ivf_offsets = .empty;
+        try self.ivf_offsets.resize(alloc, n_clusters);
+        @memset(self.ivf_sizes.items, 0);
+
+        // Count per cluster
+        for (0..n) |vi| self.ivf_sizes.items[assignments[vi]] += 1;
+
+        // Compute offsets (prefix sum)
+        var off: u32 = 0;
+        for (0..n_clusters) |c| {
+            self.ivf_offsets.items[c] = off;
+            off += self.ivf_sizes.items[c];
+        }
+
+        // Fill inverted lists
+        self.ivf_lists.deinit(alloc);
+        self.ivf_lists = .empty;
+        try self.ivf_lists.resize(alloc, n);
+        const write_pos = try alloc.alloc(u32, n_clusters);
+        defer alloc.free(write_pos);
+        @memcpy(write_pos, self.ivf_offsets.items);
+
+        for (0..n) |vi| {
+            const c = assignments[vi];
+            self.ivf_lists.items[write_pos[c]] = @intCast(vi);
+            write_pos[c] += 1;
+        }
+    }
+
+    /// IVF search: probe only n_probes nearest clusters instead of full scan.
+    /// Falls back to searchInt8 if IVF is not built.
+    pub fn searchIVF(
+        self: *const VectorColumn,
+        alloc: Allocator,
+        query: []const f32,
+        k: u32,
+        metric: Metric,
+        n_probes: u32,
+    ) ![]SearchResult {
+        if (self.n_clusters == 0) return self.searchInt8(alloc, query, k, metric);
+        if (!self.i8_enabled or self.quant == null) return self.search(alloc, query, k, metric);
+        if (query.len != self.dims) return error.DimensionMismatch;
+        if (self.count == 0) return &.{};
+
+        const d: usize = self.dims;
+        const actual_k = @min(k, self.count);
+        const actual_probes = @min(n_probes, self.n_clusters);
+
+        // Quantize query to INT8
+        var q_i8_stack: [2048]i8 = undefined;
+        var q_i8_heap: ?[]i8 = null;
+        const q_i8 = if (d <= 2048) q_i8_stack[0..d] else blk: {
+            q_i8_heap = try alloc.alloc(i8, d);
+            break :blk q_i8_heap.?;
+        };
+        defer if (q_i8_heap) |hb| alloc.free(hb);
+
+        const q_scale = turboquant.quantizeVecToInt8(self.quant.?.rotation, d, query, q_i8);
+        const inv_q = 1.0 / q_scale;
+
+        // Find top n_probes nearest centroids using dot product
+        const probe_ids = try alloc.alloc(u32, actual_probes);
+        defer alloc.free(probe_ids);
+        const probe_scores = try alloc.alloc(i32, actual_probes);
+        defer alloc.free(probe_scores);
+        var probe_count: u32 = 0;
+
+        for (0..self.n_clusters) |c| {
+            const cdot = turboquant.int8DotProduct(q_i8, self.ivf_centroids_i8.items[c * d ..][0..d]);
+
+            if (probe_count < actual_probes) {
+                probe_ids[probe_count] = @intCast(c);
+                probe_scores[probe_count] = cdot;
+                probe_count += 1;
+                // Bubble-sort insert to maintain min-heap-like order (smallest last for easy replacement)
+                if (probe_count == actual_probes) {
+                    // Sort ascending so [0] is the min
+                    var si: u32 = 1;
+                    while (si < probe_count) : (si += 1) {
+                        var sj = si;
+                        while (sj > 0 and probe_scores[sj] < probe_scores[sj - 1]) {
+                            std.mem.swap(i32, &probe_scores[sj], &probe_scores[sj - 1]);
+                            std.mem.swap(u32, &probe_ids[sj], &probe_ids[sj - 1]);
+                            sj -= 1;
+                        }
+                    }
+                }
+            } else if (cdot > probe_scores[0]) {
+                probe_ids[0] = @intCast(c);
+                probe_scores[0] = cdot;
+                // Re-sort to maintain min at [0]
+                var si: u32 = 0;
+                while (si + 1 < probe_count) {
+                    if (probe_scores[si] > probe_scores[si + 1]) {
+                        std.mem.swap(i32, &probe_scores[si], &probe_scores[si + 1]);
+                        std.mem.swap(u32, &probe_ids[si], &probe_ids[si + 1]);
+                        si += 1;
+                    } else break;
+                }
+            }
+        }
+
+        // Scan vectors in selected clusters
+        var results = try alloc.alloc(SearchResult, actual_k);
+        var heap_size: u32 = 0;
+        const negate = metric == .l2;
+
+        for (0..probe_count) |pi| {
+            const cluster_id = probe_ids[pi];
+            const cluster_offset = self.ivf_offsets.items[cluster_id];
+            const cluster_size = self.ivf_sizes.items[cluster_id];
+
+            for (0..cluster_size) |ci| {
+                const vec_idx = self.ivf_lists.items[cluster_offset + ci];
+                const offset = @as(usize, vec_idx) * d;
+                const vec_i8 = self.i8data.items[offset..][0..d];
+
+                const int_dot = turboquant.int8DotProduct(q_i8, vec_i8);
+                const inv_scale = inv_q / self.i8scales.items[vec_idx];
+                const score_raw = @as(f32, @floatFromInt(int_dot)) * inv_scale;
+                const score = if (negate) -score_raw else score_raw;
+
+                if (heap_size < actual_k) {
+                    results[heap_size] = .{ .index = vec_idx, .score = score };
+                    heap_size += 1;
+                    if (heap_size == actual_k) {
+                        var j: u32 = heap_size / 2;
+                        while (j > 0) {
+                            j -= 1;
+                            heapifyDown(results[0..heap_size], j);
+                        }
+                    }
+                } else if (score > results[0].score) {
+                    results[0] = .{ .index = vec_idx, .score = score };
+                    heapifyDown(results[0..heap_size], 0);
+                }
+            }
+        }
+
+        std.mem.sort(SearchResult, results[0..heap_size], {}, struct {
+            fn cmp(_: void, a: SearchResult, b: SearchResult) bool {
+                return a.score > b.score;
+            }
+        }.cmp);
+        if (metric == .l2) {
+            for (results[0..heap_size]) |*r| r.score = -r.score;
+        }
+        return results[0..heap_size];
+    }
+
     /// Total memory used by this vector column in bytes.
     pub fn memoryBytes(self: *const VectorColumn) usize {
         return self.data.items.len * @sizeOf(f32) +
             self.norms.items.len * @sizeOf(f32) +
-            self.qdata.items.len;
+            self.qdata.items.len +
+            self.i8data.items.len +
+            self.i8scales.items.len * @sizeOf(f32) +
+            self.ivf_centroids_i8.items.len +
+            self.ivf_centroid_scales.items.len * @sizeOf(f32) +
+            self.ivf_lists.items.len * @sizeOf(u32) +
+            self.ivf_offsets.items.len * @sizeOf(u32) +
+            self.ivf_sizes.items.len * @sizeOf(u32);
     }
 };
+
+// ── Parallel INT8 search worker ─────────────────────────────────────────────
+
+const ParallelSearchArgs = struct {
+    i8items: []const i8,
+    i8scales: []const f32,
+    inv_q_scale: f32,
+    q_i8: []const i8,
+    dims: usize,
+    start: u32,
+    end: u32,
+    k: u32,
+    negate: bool, // true for L2 metric
+    out_results: []SearchResult,
+    out_count: *u32,
+};
+
+fn parallelSearchWorker(args: ParallelSearchArgs) void {
+    const d = args.dims;
+    var heap_size: u32 = 0;
+    const results = args.out_results;
+
+    var i: u32 = args.start;
+    while (i < args.end) : (i += 1) {
+        const offset = @as(usize, i) * d;
+        const vec_i8 = args.i8items[offset..][0..d];
+
+        // Prefetch next
+        if (i + 1 < args.end) {
+            @prefetch(@as([*]const u8, @ptrCast(args.i8items[(offset + d)..].ptr)), .{ .rw = .read, .locality = 3 });
+        }
+
+        const int_dot = turboquant.int8DotProduct(args.q_i8, vec_i8);
+        const inv_scale = args.inv_q_scale / args.i8scales[i];
+        const score_raw = @as(f32, @floatFromInt(int_dot)) * inv_scale;
+        const score = if (args.negate) -score_raw else score_raw;
+
+        if (heap_size < args.k) {
+            results[heap_size] = .{ .index = i, .score = score };
+            heap_size += 1;
+            if (heap_size == args.k) {
+                var j: u32 = heap_size / 2;
+                while (j > 0) {
+                    j -= 1;
+                    heapifyDown(results[0..heap_size], j);
+                }
+            }
+        } else if (score > results[0].score) {
+            results[0] = .{ .index = i, .score = score };
+            heapifyDown(results[0..heap_size], 0);
+        }
+    }
+    args.out_count.* = heap_size;
+}
 
 // ── SIMD-accelerated math ────────────────────────────────────────────────────
 
