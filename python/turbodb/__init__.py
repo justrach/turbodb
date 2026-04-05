@@ -100,6 +100,33 @@ class Collection:
         finally:
             _ffi.scan_free(handle)
 
+    def search(self, query: str, limit: int = 20):
+        """Full-text search using trigram index. Returns a list of matching docs."""
+        qb = query.encode("utf-8")
+        handle = _ffi.ScanHandle()
+        rc = _ffi._lib.turbodb_search(self._handle, qb, len(qb), limit, ctypes.byref(handle))
+        if rc != 0:
+            return []
+        try:
+            count = _ffi.scan_count(handle)
+            docs = []
+            for i in range(count):
+                r = _ffi.scan_doc(handle, i)
+                if r is not None:
+                    docs.append({
+                        "key": r.key_bytes().decode("utf-8", errors="replace"),
+                        "value": r.val_bytes().decode("utf-8", errors="replace"),
+                        "doc_id": r.doc_id,
+                        "version": r.version,
+                    })
+            return docs
+        finally:
+            _ffi.scan_free(handle)
+
+    def flush_index(self):
+        """Block until background index builder has finished processing all pending items."""
+        _ffi._lib.turbodb_flush_index(self._handle)
+
     def __repr__(self):
         if self._tenant is None:
             return f"Collection('{self._name}')"

@@ -80,6 +80,9 @@ pub const WordIndex = struct {
         // Clean up old entries first
         self.removeFile(path);
 
+        // Dupe path so hits survive after the caller's buffer is freed.
+        const owned_path = try self.allocator.dupe(u8, path);
+
         var words_set = std.StringHashMap(void).init(self.allocator);
         errdefer words_set.deinit();
         var line_num: u32 = 0;
@@ -101,7 +104,7 @@ pub const WordIndex = struct {
 
                 if (gop.value_ptr.items.len > 0) {
                     const last = gop.value_ptr.items[gop.value_ptr.items.len - 1];
-                    if (std.mem.eql(u8, last.path, path) and last.line_num == line_num) {
+                    if (std.mem.eql(u8, last.path, owned_path) and last.line_num == line_num) {
                         // Avoid duplicate hits for repeated words on the same line.
                         const wgop = try words_set.getOrPut(word);
                         if (!wgop.found_existing) wgop.key_ptr.* = gop.key_ptr.*;
@@ -110,7 +113,7 @@ pub const WordIndex = struct {
                 }
 
                 try gop.value_ptr.append(self.allocator, .{
-                    .path = path,
+                    .path = owned_path,
                     .line_num = line_num,
                 });
 
@@ -123,7 +126,6 @@ pub const WordIndex = struct {
             }
         }
 
-        const owned_path = try self.allocator.dupe(u8, path);
         try self.file_words.put(owned_path, words_set);
     }
 
@@ -183,115 +185,288 @@ pub const PostingMask = struct {
     loc_mask: u8 = 0, // bit mask of (position % 8) where trigram appears
 };
 
+/// Dense posting list entry: file_id + mask.
+pub const PostingEntry = struct {
+    file_id: u32,
+    mask: PostingMask = .{},
+};
+
+/// Dense posting list — sorted ArrayList(PostingEntry) replaces HashMap for better
+/// cache locality and lower overhead (6 bytes/entry vs ~128 bytes/HashMap).
+pub const PostingList = std.ArrayList(PostingEntry);
+
+/// Linear scan for small lists, binary search for large. Returns index or null.
+fn postingFind(list: *const PostingList, file_id: u32) ?usize {
+    if (list.items.len < 32) {
+        // Linear scan — cache-friendly for small lists (the common case)
+        for (list.items, 0..) |e, i| {
+            if (e.file_id == file_id) return i;
+        }
+        return null;
+    }
+    // Binary search on sorted file_id
+    var lo: usize = 0;
+    var hi: usize = list.items.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (list.items[mid].file_id < file_id) {
+            lo = mid + 1;
+        } else if (list.items[mid].file_id > file_id) {
+            hi = mid;
+        } else {
+            return mid;
+        }
+    }
+    return null;
+}
+
+fn postingContains(list: *const PostingList, file_id: u32) bool {
+    return postingFind(list, file_id) != null;
+}
+
+fn postingGet(list: *const PostingList, file_id: u32) ?PostingMask {
+    const idx = postingFind(list, file_id) orelse return null;
+    return list.items[idx].mask;
+}
+
+/// Insert a PostingEntry into a PostingList maintaining sorted file_id order.
+fn postingSortedInsert(list: *PostingList, alloc: std.mem.Allocator, entry: PostingEntry) void {
+    // Find insertion point via binary search
+    var lo: usize = 0;
+    var hi: usize = list.items.len;
+    while (lo < hi) {
+        const mid = lo + (hi - lo) / 2;
+        if (list.items[mid].file_id < entry.file_id) {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    // lo is the insertion index
+    list.insert(alloc, lo, entry) catch {
+        // Fallback: append (breaks ordering but doesn't lose data)
+        list.append(alloc, entry) catch {};
+    };
+}
+
 
 pub const TrigramIndex = struct {
-    /// trigram → set of file paths
-    index: std.AutoHashMap(Trigram, std.StringHashMap(PostingMask)),
-    /// path → list of trigrams contributed (for cleanup)
-    file_trigrams: std.StringHashMap(std.ArrayList(Trigram)),
+    /// trigram → dense sorted posting list
+    index: std.AutoHashMap(Trigram, PostingList),
+    /// file_id → list of trigrams contributed (for cleanup)
+    file_trigrams: std.AutoHashMap(u32, std.ArrayList(Trigram)),
+    /// Bidirectional path ↔ file_id mapping
+    path_to_id: std.StringHashMap(u32),
+    id_to_path: std.ArrayList([]const u8),
+    next_id: u32 = 0,
     allocator: std.mem.Allocator,
-    /// When true, deinit frees the path keys in file_trigrams (set by readFromDisk).
+    /// When true, deinit frees the path strings in id_to_path (set by readFromDisk).
     owns_paths: bool = false,
+    /// Mutex for concurrent access (background indexer writes, search reads).
+    mu: std.Thread.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator) TrigramIndex {
         return .{
-            .index = std.AutoHashMap(Trigram, std.StringHashMap(PostingMask)).init(allocator),
-            .file_trigrams = std.StringHashMap(std.ArrayList(Trigram)).init(allocator),
+            .index = std.AutoHashMap(Trigram, PostingList).init(allocator),
+            .file_trigrams = std.AutoHashMap(u32, std.ArrayList(Trigram)).init(allocator),
+            .path_to_id = std.StringHashMap(u32).init(allocator),
+            .id_to_path = .{},
             .allocator = allocator,
         };
     }
 
     pub fn deinit(self: *TrigramIndex) void {
+        // Free posting lists (no string keys to free — all u32)
         var iter = self.index.iterator();
         while (iter.next()) |entry| {
-            var path_iter = entry.value_ptr.iterator();
-            while (path_iter.next()) |path_entry| {
-                self.allocator.free(path_entry.key_ptr.*);
-            }
-            entry.value_ptr.deinit();
+            entry.value_ptr.deinit(self.allocator);
         }
         self.index.deinit();
 
+        // Free file_trigrams lists
         var ft_iter = self.file_trigrams.iterator();
         while (ft_iter.next()) |entry| {
-            self.allocator.free(entry.key_ptr.*);
             entry.value_ptr.deinit(self.allocator);
         }
         self.file_trigrams.deinit();
+
+        // Free owned path strings in id_to_path
+        for (self.id_to_path.items) |p| {
+            self.allocator.free(p);
+        }
+        self.id_to_path.deinit(self.allocator);
+
+        // Free path_to_id keys (they point to same strings as id_to_path, already freed)
+        // BUT: path_to_id keys ARE the same pointers as id_to_path items, so don't double-free.
+        self.path_to_id.deinit();
     }
 
-    pub fn removeFile(self: *TrigramIndex, path: []const u8) void {
-        const trigrams = self.file_trigrams.getPtr(path) orelse return;
+    /// Get or assign a file_id for a path. Dupes path only for genuinely new files.
+    fn getOrCreateFileId(self: *TrigramIndex, path: []const u8) !u32 {
+        const gop = try self.path_to_id.getOrPut(path);
+        if (gop.found_existing) return gop.value_ptr.*;
+        // New file — dupe path once, assign next id
+        const owned = try self.allocator.dupe(u8, path);
+        gop.key_ptr.* = owned; // replace stack key with owned key
+        const id = self.next_id;
+        self.next_id += 1;
+        gop.value_ptr.* = id;
+        try self.id_to_path.append(self.allocator, owned);
+        return id;
+    }
+
+    pub fn removeFileById(self: *TrigramIndex, file_id: u32) void {
+        const trigrams = self.file_trigrams.getPtr(file_id) orelse return;
         for (trigrams.items) |tri| {
             if (self.index.getPtr(tri)) |file_set| {
-                if (file_set.fetchRemove(path)) |removed| {
-                    self.allocator.free(removed.key);
+                if (postingFind(file_set, file_id)) |idx| {
+                    _ = file_set.orderedRemove(idx);
                 }
-                if (file_set.count() == 0) {
-                    file_set.deinit();
+                if (file_set.items.len == 0) {
+                    file_set.deinit(self.allocator);
                     _ = self.index.remove(tri);
                 }
             }
         }
         trigrams.deinit(self.allocator);
-        if (self.file_trigrams.fetchRemove(path)) |removed| {
-            self.allocator.free(removed.key);
-        }
+        _ = self.file_trigrams.remove(file_id);
+    }
+
+    /// Legacy wrapper for callers that pass a path string.
+    pub fn removeFile(self: *TrigramIndex, path: []const u8) void {
+        const file_id = self.path_to_id.get(path) orelse return;
+        self.removeFileById(file_id);
     }
 
     pub fn indexFile(self: *TrigramIndex, path: []const u8, content: []const u8) !void {
-        self.removeFile(path);
+        if (content.len < 3) return;
 
-        var seen_trigrams = std.AutoHashMap(Trigram, void).init(self.allocator);
-        defer seen_trigrams.deinit();
+        // ── Pass 1 (no lock): collect unique trigrams into a temporary hashmap ──
+        var unique_tris = std.AutoHashMap(Trigram, void).init(self.allocator);
+        defer unique_tris.deinit();
 
-        // Extract trigrams from content, recording PostingMask per (trigram, file)
-        if (content.len >= 3) {
+        const est = @min(content.len - 2, 4096);
+        unique_tris.ensureTotalCapacity(@intCast(est)) catch {};
+
+        for (0..content.len - 2) |i| {
+            const tri = packTrigram(
+                normalizeChar(content[i]),
+                normalizeChar(content[i + 1]),
+                normalizeChar(content[i + 2]),
+            );
+            unique_tris.put(tri, {}) catch {};
+        }
+
+        // ── Pass 2 (locked): update the global index once per unique trigram ──
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        const file_id = try self.getOrCreateFileId(path);
+
+        // Only remove old data if file was previously indexed (skip for new files)
+        if (self.file_trigrams.contains(file_id)) {
+            self.removeFileById(file_id);
+        }
+
+        var tri_list: std.ArrayList(Trigram) = .{};
+        errdefer tri_list.deinit(self.allocator);
+        try tri_list.ensureTotalCapacity(self.allocator, unique_tris.count());
+
+        var it = unique_tris.keyIterator();
+        while (it.next()) |tri_ptr| {
+            const tri = tri_ptr.*;
+            tri_list.appendAssumeCapacity(tri);
+
+            const idx_gop = try self.index.getOrPut(tri);
+            if (!idx_gop.found_existing) {
+                idx_gop.value_ptr.* = .{};
+            }
+            postingSortedInsert(idx_gop.value_ptr, self.allocator, .{ .file_id = file_id, .mask = PostingMask{ .loc_mask = 0xFF, .next_mask = 0xFF } });
+        }
+
+        try self.file_trigrams.put(file_id, tri_list);
+    }
+
+    /// Batch-index multiple files with a single lock acquisition.
+    /// `reusable_tris` is caller-owned and cleared between documents (avoids allocation).
+    pub fn indexBatch(
+        self: *TrigramIndex,
+        paths: []const []const u8,
+        contents: []const []const u8,
+        reusable_tris: *std.AutoHashMap(Trigram, void),
+    ) !void {
+        if (paths.len == 0) return;
+
+        // Per-doc trigram sets collected outside the lock
+        const BatchEntry = struct { tris: []Trigram };
+        var batch: [64]BatchEntry = undefined;
+
+        for (paths, contents, 0..) |path, content, di| {
+            _ = path;
+            if (content.len < 3) {
+                batch[di].tris = &.{};
+                continue;
+            }
+            reusable_tris.clearRetainingCapacity();
+            const est = @min(content.len - 2, 4096);
+            reusable_tris.ensureTotalCapacity(@intCast(est)) catch {};
+
             for (0..content.len - 2) |i| {
                 const tri = packTrigram(
                     normalizeChar(content[i]),
                     normalizeChar(content[i + 1]),
                     normalizeChar(content[i + 2]),
                 );
-                // Ensure the trigram → file_set entry exists
-                const idx_gop = try self.index.getOrPut(tri);
-                if (!idx_gop.found_existing) {
-                    idx_gop.value_ptr.* = std.StringHashMap(PostingMask).init(self.allocator);
-                }
-                // Get or create the posting for this file
-                const duped_path = if (!idx_gop.found_existing or !idx_gop.value_ptr.contains(path))
-                    try self.allocator.dupe(u8, path)
-                else
-                    path;
-                const file_gop = try idx_gop.value_ptr.getOrPut(duped_path);
-                if (!file_gop.found_existing) {
-                    file_gop.value_ptr.* = PostingMask{};
-                    try seen_trigrams.put(tri, {});
-                }
-                // OR in position masks
-                file_gop.value_ptr.loc_mask |= @as(u8, 1) << @intCast(i % 8);
-                if (i + 3 < content.len) {
-                    file_gop.value_ptr.next_mask |= @as(u8, 1) << @intCast(normalizeChar(content[i + 3]) % 8);
-                }
+                reusable_tris.put(tri, {}) catch {};
             }
+
+            // Copy unique trigrams to owned slice for this doc
+            const tris = try self.allocator.alloc(Trigram, reusable_tris.count());
+            var idx: usize = 0;
+            var kit = reusable_tris.keyIterator();
+            while (kit.next()) |k| {
+                tris[idx] = k.*;
+                idx += 1;
+            }
+            batch[di].tris = tris;
         }
 
-        // Store which trigrams this file contributed
-        var tri_list: std.ArrayList(Trigram) = .{};
-        errdefer tri_list.deinit(self.allocator);
-        var tri_iter = seen_trigrams.keyIterator();
-        while (tri_iter.next()) |tri_ptr| {
-            try tri_list.append(self.allocator, tri_ptr.*);
+        // Single lock acquisition for all docs
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        for (paths, contents, 0..) |path, _, di| {
+            const tris = batch[di].tris;
+            defer if (tris.len > 0) self.allocator.free(tris);
+            if (tris.len == 0) continue;
+
+            const file_id = self.getOrCreateFileId(path) catch continue;
+
+            if (self.file_trigrams.contains(file_id)) {
+                self.removeFileById(file_id);
+            }
+
+            var tri_list: std.ArrayList(Trigram) = .{};
+            tri_list.ensureTotalCapacity(self.allocator, tris.len) catch continue;
+
+            for (tris) |tri| {
+                tri_list.appendAssumeCapacity(tri);
+
+                const idx_gop = self.index.getOrPut(tri) catch continue;
+                if (!idx_gop.found_existing) {
+                    idx_gop.value_ptr.* = .{};
+                }
+                postingSortedInsert(idx_gop.value_ptr, self.allocator, .{ .file_id = file_id, .mask = PostingMask{ .loc_mask = 0xFF, .next_mask = 0xFF } });
+            }
+
+            self.file_trigrams.put(file_id, tri_list) catch {};
         }
-        const owned_path2 = try self.allocator.dupe(u8, path);
-        try self.file_trigrams.put(owned_path2, tri_list);
     }
-
-
-    /// Find candidate files that contain ALL trigrams from the query.
 pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.Allocator) ?[]const []const u8 {
-    if (query.len < 3) return null; // can't use trigrams for short queries
+    self.mu.lock();
+    defer self.mu.unlock();
 
+    if (query.len < 3) return null;
     const tri_count = query.len - 2;
 
     // Deduplicate query trigrams first so repeated trigrams don't do repeated work.
@@ -307,7 +482,7 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
         _ = unique.getOrPut(tri) catch return null;
     }
 
-    var sets: std.ArrayList(*std.StringHashMap(PostingMask)) = .{};
+    var sets: std.ArrayList(*PostingList) = .{};
     defer sets.deinit(allocator);
     sets.ensureTotalCapacity(allocator, unique.count()) catch return null;
 
@@ -325,9 +500,9 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
 
     // Iterate the smallest set and check membership in all others.
     var min_idx: usize = 0;
-    var min_count = sets.items[0].count();
+    var min_count = sets.items[0].items.len;
     for (sets.items[1..], 1..) |set, i| {
-        const count = set.count();
+        const count = set.items.len;
         if (count < min_count) {
             min_count = count;
             min_idx = i;
@@ -338,16 +513,22 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
     errdefer result.deinit(allocator);
     result.ensureTotalCapacity(allocator, min_count) catch return null;
 
-    var it = sets.items[min_idx].keyIterator();
-    next_cand: while (it.next()) |path_ptr| {
+    for (sets.items[min_idx].items) |entry| {
+        const file_id = entry.file_id;
 
         // Intersection check: candidate must be in all sets
+        var in_all = true;
         for (sets.items, 0..) |set, i| {
             if (i == min_idx) continue;
-            if (!set.contains(path_ptr.*)) continue :next_cand;
+            if (!postingContains(set, file_id)) {
+                in_all = false;
+                break;
+            }
         }
+        if (!in_all) continue;
 
         // Bloom-filter check for consecutive trigram pairs
+        var bloom_pass = true;
         if (tri_count >= 2) {
             for (0..tri_count - 1) |j| {
                 const tri_a = packTrigram(
@@ -362,20 +543,30 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
                 );
                 const set_a = self.index.getPtr(tri_a) orelse continue;
                 const set_b = self.index.getPtr(tri_b) orelse continue;
-                const mask_a = set_a.get(path_ptr.*) orelse continue;
-                const mask_b = set_b.get(path_ptr.*) orelse continue;
+                const mask_a = postingGet(set_a, file_id) orelse continue;
+                const mask_b = postingGet(set_b, file_id) orelse continue;
 
                 // next_mask: bit for query[j+3] must be set in tri_a's next_mask
                 const next_bit: u8 = @as(u8, 1) << @intCast(normalizeChar(query[j + 3]) % 8);
-                if ((mask_a.next_mask & next_bit) == 0) continue :next_cand;
+                if ((mask_a.next_mask & next_bit) == 0) {
+                    bloom_pass = false;
+                    break;
+                }
 
                 // loc_mask adjacency: use circular shift to handle position wrap-around
                 const rotated = (mask_a.loc_mask << 1) | (mask_a.loc_mask >> 7);
-                if ((rotated & mask_b.loc_mask) == 0) continue :next_cand;
+                if ((rotated & mask_b.loc_mask) == 0) {
+                    bloom_pass = false;
+                    break;
+                }
             }
         }
+        if (!bloom_pass) continue;
 
-        result.appendAssumeCapacity(path_ptr.*);
+        // Translate file_id -> path
+        if (file_id < self.id_to_path.items.len) {
+            result.appendAssumeCapacity(self.id_to_path.items[file_id]);
+        }
     }
 
     return result.toOwnedSlice(allocator) catch {
@@ -391,33 +582,26 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
     pub fn candidatesRegex(self: *TrigramIndex, query: *const RegexQuery, allocator: std.mem.Allocator) ?[]const []const u8 {
         if (query.and_trigrams.len == 0 and query.or_groups.len == 0) return null;
 
-        // Start with AND trigrams
-        var result_set: ?std.StringHashMap(void) = null;
+        // Start with AND trigrams — use u32 file_ids throughout
+        var result_set: ?std.AutoHashMap(u32, void) = null;
         defer if (result_set) |*rs| rs.deinit();
 
         if (query.and_trigrams.len > 0) {
-            // Intersect all AND trigram posting lists
             for (query.and_trigrams) |tri| {
                 const file_set = self.index.getPtr(tri) orelse {
-                    // Trigram not in index → no files can match
-                    var empty = allocator.alloc([]const u8, 0) catch return null;
-                    _ = &empty;
                     return allocator.alloc([]const u8, 0) catch null;
                 };
                 if (result_set == null) {
-                    // Initialize with all files from first trigram
-                    result_set = std.StringHashMap(void).init(allocator);
-                    var it = file_set.keyIterator();
-                    while (it.next()) |key| {
-                        result_set.?.put(key.*, {}) catch return null;
+                    result_set = std.AutoHashMap(u32, void).init(allocator);
+                    for (file_set.items) |pe| {
+                        result_set.?.put(pe.file_id, {}) catch return null;
                     }
                 } else {
-                    // Intersect: remove files not in this posting list
-                    var to_remove: std.ArrayList([]const u8) = .{};
+                    var to_remove: std.ArrayList(u32) = .{};
                     defer to_remove.deinit(allocator);
                     var it = result_set.?.keyIterator();
                     while (it.next()) |key| {
-                        if (!file_set.contains(key.*)) {
+                        if (!postingContains(file_set, key.*)) {
                             to_remove.append(allocator, key.*) catch return null;
                         }
                     }
@@ -428,32 +612,27 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
             }
         }
 
-        // Process OR groups: for each group, union posting lists of its trigrams,
-        // then intersect with result_set
+        // Process OR groups
         for (query.or_groups) |group| {
             if (group.len == 0) continue;
 
-            // Union all posting lists in this OR group
-            var union_set = std.StringHashMap(void).init(allocator);
+            var union_set = std.AutoHashMap(u32, void).init(allocator);
             defer union_set.deinit();
             for (group) |tri| {
                 const file_set = self.index.getPtr(tri) orelse continue;
-                var it = file_set.keyIterator();
-                while (it.next()) |key| {
-                    union_set.put(key.*, {}) catch return null;
+                for (file_set.items) |pe| {
+                    union_set.put(pe.file_id, {}) catch return null;
                 }
             }
 
             if (result_set == null) {
-                // First constraint — adopt the union
-                result_set = std.StringHashMap(void).init(allocator);
+                result_set = std.AutoHashMap(u32, void).init(allocator);
                 var it = union_set.keyIterator();
                 while (it.next()) |key| {
                     result_set.?.put(key.*, {}) catch return null;
                 }
             } else {
-                // Intersect result_set with union_set
-                var to_remove: std.ArrayList([]const u8) = .{};
+                var to_remove: std.ArrayList(u32) = .{};
                 defer to_remove.deinit(allocator);
                 var it = result_set.?.keyIterator();
                 while (it.next()) |key| {
@@ -469,13 +648,16 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
 
         if (result_set == null) return null;
 
-        // Convert to slice
+        // Convert file_ids to paths
         var result: std.ArrayList([]const u8) = .{};
         errdefer result.deinit(allocator);
         result.ensureTotalCapacity(allocator, result_set.?.count()) catch return null;
         var it = result_set.?.keyIterator();
-        while (it.next()) |key| {
-            result.appendAssumeCapacity(key.*);
+        while (it.next()) |fid_ptr| {
+            const fid = fid_ptr.*;
+            if (fid < self.id_to_path.items.len) {
+                result.appendAssumeCapacity(self.id_to_path.items[fid]);
+            }
         }
         return result.toOwnedSlice(allocator) catch {
             result.deinit(allocator);
@@ -514,20 +696,8 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
     /// Write the current in-memory index to disk in a two-file format.
     /// Files are written atomically (write to tmp, then rename).
     pub fn writeToDisk(self: *TrigramIndex, dir_path: []const u8, git_head: ?[40]u8) !void {
-        // Step 1: Build file table (assign u16 IDs to all unique paths)
-        var file_table: std.ArrayList([]const u8) = .{};
-        defer file_table.deinit(self.allocator);
-        var path_to_id = std.StringHashMap(u32).init(self.allocator);
-        defer path_to_id.deinit();
-
-        var ft_iter = self.file_trigrams.keyIterator();
-        while (ft_iter.next()) |path_ptr| {
-            const id: u32 = @intCast(file_table.items.len);
-            try file_table.append(self.allocator, path_ptr.*);
-            try path_to_id.put(path_ptr.*, id);
-        }
-
-        const file_count: u32 = @intCast(file_table.items.len);
+        // Step 1: File table comes directly from id_to_path (already indexed by file_id)
+        const file_count: u32 = @intCast(self.id_to_path.items.len);
 
         // Step 2: Collect all trigrams, sort them, serialize postings contiguously
         var trigrams_sorted: std.ArrayList(Trigram) = .{};
@@ -554,13 +724,11 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
             const file_set = self.index.getPtr(tri) orelse continue;
             const offset: u32 = @intCast(postings_buf.items.len);
             var count: u32 = 0;
-            var fs_iter = file_set.iterator();
-            while (fs_iter.next()) |entry| {
-                const fid = path_to_id.get(entry.key_ptr.*) orelse continue;
+            for (file_set.items) |pe| {
                 try postings_buf.append(self.allocator, .{
-                    .file_id = fid,
-                    .next_mask = entry.value_ptr.next_mask,
-                    .loc_mask = entry.value_ptr.loc_mask,
+                    .file_id = pe.file_id,
+                    .next_mask = pe.mask.next_mask,
+                    .loc_mask = pe.mask.loc_mask,
                 });
                 count += 1;
             }
@@ -600,7 +768,7 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
             }
 
             // File table: for each file, path_len(u16) + path bytes
-            for (file_table.items) |path| {
+            for (self.id_to_path.items) |path| {
                 var pl_buf: [2]u8 = undefined;
                 std.mem.writeInt(u16, &pl_buf, @intCast(path.len), .little);
                 try file.writeAll(&pl_buf);
@@ -711,20 +879,20 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
         const entry_count = std.mem.readInt(u32, lookup_data[8..12], .little);
         if (lookup_data.len < 12 + entry_count * @sizeOf(LookupEntry)) return null;
 
-        // Build in-memory index
+        // Build in-memory index with file-ID mappings
         var result = TrigramIndex.init(allocator);
         result.owns_paths = true;
         errdefer result.deinit();
 
-        // Allocate stable path strings owned by the index
-        var stable_paths = try allocator.alloc([]const u8, file_count);
-        defer allocator.free(stable_paths);
+        // Build id_to_path and path_to_id from file table, initialize file_trigrams
         for (0..file_count) |i| {
             const duped = try allocator.dupe(u8, file_paths[i]);
             errdefer allocator.free(duped);
-            stable_paths[i] = duped;
-            try result.file_trigrams.put(duped, .{});
+            try result.id_to_path.append(allocator, duped);
+            try result.path_to_id.put(duped, @intCast(i));
+            try result.file_trigrams.put(@intCast(i), .{});
         }
+        result.next_id = file_count;
 
         // Parse lookup entries and populate index + file_trigrams
         for (0..entry_count) |e| {
@@ -738,8 +906,8 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
 
             if (@as(u64, p_off) + @as(u64, p_count) > @as(u64, total_postings)) return error.InvalidData;
 
-            var file_set = std.StringHashMap(PostingMask).init(allocator);
-            errdefer file_set.deinit();
+            var posting_list: PostingList = .{};
+            errdefer posting_list.deinit(allocator);
 
             for (0..p_count) |pi| {
                 const pb_off = postings_start + (p_off + pi) * posting_size;
@@ -752,17 +920,20 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
                 const loc_mask = raw_posting[if (post_version >= 3) 5 else 3];
 
                 if (file_id >= file_count) return error.InvalidData;
-                const path = stable_paths[file_id];
 
-                const gop = try file_set.getOrPut(path);
-                if (!gop.found_existing) {
-                    gop.value_ptr.* = PostingMask{};
+                // Merge masks if file_id already exists, otherwise append
+                if (postingFind(&posting_list, file_id)) |idx| {
+                    posting_list.items[idx].mask.next_mask |= next_mask;
+                    posting_list.items[idx].mask.loc_mask |= loc_mask;
+                } else {
+                    try posting_list.append(allocator, .{
+                        .file_id = file_id,
+                        .mask = .{ .next_mask = next_mask, .loc_mask = loc_mask },
+                    });
                 }
-                gop.value_ptr.next_mask |= next_mask;
-                gop.value_ptr.loc_mask |= loc_mask;
 
                 // Track trigram in file_trigrams
-                if (result.file_trigrams.getPtr(path)) |tri_list| {
+                if (result.file_trigrams.getPtr(file_id)) |tri_list| {
                     var found = false;
                     for (tri_list.items) |existing| {
                         if (existing == tri) { found = true; break; }
@@ -771,14 +942,14 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
                 }
             }
 
-            try result.index.put(tri, file_set);
+            try result.index.put(tri, posting_list);
         }
 
         return result;
     }
 
     /// Returns the number of indexed files (for staleness checks).
-    pub fn fileCount(self: *TrigramIndex) u32 {
+    pub fn fileCount(self: *const TrigramIndex) u32 {
         return @intCast(self.file_trigrams.count());
     }
 

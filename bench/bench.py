@@ -248,7 +248,7 @@ def run_turbodb_workload(host, port, workload, col, docs, threads, doc_size):
     t_start = time.perf_counter()
     with ThreadPoolExecutor(max_workers=threads) as ex:
         futures = [ex.submit(worker, s, n) for s, n in work]
-        for f in as_completed(futures):
+        for f in as_completed(futures, timeout=120):
             for lat in f.result():
                 stats.record(lat)
     wall_time = time.perf_counter() - t_start
@@ -548,6 +548,11 @@ def main():
 
             results[wl] = (t_result, m_result)
 
+            # Drop the collection after benchmarking to free the indexer thread
+            # and avoid accumulating background threads across workloads.
+            tc = TurboClient(turbo_host, args.port)
+            tc.drop(f"bench_{wl}")
+            tc.close()
             # CSV row
             csv_rows.append({
                 "workload":        wl,

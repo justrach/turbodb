@@ -5,3 +5,10 @@ python/dist/
 codedb.snapshot
 __pycache__/
 *.pyc
+
+# ClickHouse local data
+access/
+preprocessed_configs/
+
+# Internal optimization docs (untracked)
+optimizations/
