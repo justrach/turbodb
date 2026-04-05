@@ -322,6 +322,7 @@ pub fn build(b: *std.Build) void {
         "src/marketplace.zig",
         "src/crypto.zig",
         "src/vector.zig",
+        "src/turboquant.zig",
         "src/auth.zig",
         "src/ttl.zig",
         "src/schema.zig",
