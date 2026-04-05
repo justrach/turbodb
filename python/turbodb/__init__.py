@@ -127,6 +127,61 @@ class Collection:
         """Block until background index builder has finished processing all pending items."""
         _ffi._lib.turbodb_flush_index(self._handle)
 
+    def configure_vectors(self, dims: int, field: str = "embedding"):
+        """Configure a vector embedding column on this collection.
+        `dims` is the dimensionality; `field` is the JSON key holding the embedding array."""
+        fb = field.encode("utf-8")
+        rc = _ffi._lib.turbodb_configure_vectors(self._handle, dims, fb, len(fb))
+        if rc != 0:
+            raise RuntimeError("Failed to configure vectors")
+
+    def search_vectors(self, query, k: int = 10, metric: str = "cosine"):
+        """Search the collection's vector column. Returns list of (index, score) tuples."""
+        import ctypes
+        metric_map = {"cosine": 0, "dot_product": 1, "l2": 2}
+        m = metric_map.get(metric, 0)
+        dims = len(query)
+        arr = (ctypes.c_float * dims)(*query)
+        out_idx = (ctypes.c_uint32 * k)()
+        out_scores = (ctypes.c_float * k)()
+        rc = _ffi._lib.turbodb_collection_search_vectors(
+            self._handle, arr, dims, k, m, out_idx, out_scores
+        )
+        if rc < 0:
+            return []
+        return [(int(out_idx[i]), float(out_scores[i])) for i in range(rc)]
+
+    def search_hybrid(self, text_query: str, vector_query, k: int = 10,
+                      text_weight: float = 0.3, vector_weight: float = 0.7):
+        """Hybrid search combining text + vector scoring.
+        Returns a list of matching docs ranked by combined score."""
+        import ctypes
+        tb = text_query.encode("utf-8")
+        dims = len(vector_query)
+        arr = (ctypes.c_float * dims)(*vector_query)
+        handle = _ffi.ScanHandle()
+        rc = _ffi._lib.turbodb_search_hybrid(
+            self._handle, tb, len(tb), arr, dims, k,
+            ctypes.c_float(text_weight), ctypes.c_float(vector_weight),
+            ctypes.byref(handle),
+        )
+        if rc != 0:
+            return []
+        try:
+            count = _ffi.scan_count(handle)
+            docs = []
+            for i in range(count):
+                r = _ffi.scan_doc(handle, i)
+                if r is not None:
+                    docs.append({
+                        "key": r.key_bytes().decode("utf-8", errors="replace"),
+                        "value": r.val_bytes().decode("utf-8", errors="replace"),
+                        "doc_id": r.doc_id,
+                        "version": r.version,
+                    })
+            return docs
+        finally:
+            _ffi.scan_free(handle)
     def __repr__(self):
         if self._tenant is None:
             return f"Collection('{self._name}')"
