@@ -569,3 +569,131 @@ export fn turbodb_search_hybrid(
     out.count = @intCast(result.docs.len);
     return 0;
 }
+
+// ── Branch operations ────────────────────────────────────────────────────────
+
+export fn turbodb_enable_branching(col_handle: *anyopaque) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    col.enableBranching() catch return -1;
+    return 0;
+}
+
+export fn turbodb_create_branch(col_handle: *anyopaque, name_ptr: [*]const u8, name_len: u32, agent_ptr: [*]const u8, agent_len: u32) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    _ = col.createBranch(name_ptr[0..name_len], agent_ptr[0..agent_len]) catch return -1;
+    return 0;
+}
+
+export fn turbodb_branch_write(col_handle: *anyopaque, branch_name: [*]const u8, branch_len: u32, key: [*]const u8, key_len: u32, val: [*]const u8, val_len: u32) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const br = col.getBranch(branch_name[0..branch_len]) orelse return -1;
+    col.writeOnBranch(br, key[0..key_len], val[0..val_len]) catch return -1;
+    return 0;
+}
+
+export fn turbodb_branch_read(col_handle: *anyopaque, branch_name: [*]const u8, branch_len: u32, key: [*]const u8, key_len: u32, out_val: *[*]const u8, out_len: *u32) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const br = col.getBranch(branch_name[0..branch_len]) orelse return -1;
+    const val = col.getOnBranch(br, key[0..key_len]) orelse return -1;
+    out_val.* = val.ptr;
+    out_len.* = @intCast(val.len);
+    return 0;
+}
+
+export fn turbodb_branch_merge(col_handle: *anyopaque, branch_name: [*]const u8, branch_len: u32) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const br = col.getBranch(branch_name[0..branch_len]) orelse return -1;
+    var result = col.mergeBranch(br, alloc) catch return -1;
+    defer result.deinit();
+    if (result.conflicts.len > 0) return @intCast(result.conflicts.len); // positive = conflict count
+    return 0; // 0 = success, no conflicts
+}
+
+export fn turbodb_branch_search(
+    col_handle: *anyopaque,
+    branch_name: [*]const u8,
+    branch_len: u32,
+    query_ptr: [*]const u8,
+    query_len: u32,
+    limit: u32,
+    out: *TurboScanHandle,
+) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const br = col.getBranch(branch_name[0..branch_len]) orelse return -1;
+    const result = col.searchOnBranch(br, query_ptr[0..query_len], limit, alloc) catch return -1;
+    out.docs_ptr = result.docs.ptr;
+    out.count = @intCast(result.docs.len);
+    return 0;
+}
+
+export fn turbodb_list_branches(
+    col_handle: *anyopaque,
+    out_json: *[*]u8,
+    out_len: *u32,
+) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const names = col.listBranches(alloc) catch return -1;
+    defer alloc.free(names);
+
+    // Build JSON array of branch names
+    var buf: std.ArrayList(u8) = .empty;
+    buf.append(alloc, '[') catch return -1;
+    for (names, 0..) |name, i| {
+        if (i > 0) buf.append(alloc, ',') catch return -1;
+        buf.append(alloc, '"') catch return -1;
+        buf.appendSlice(alloc, name) catch return -1;
+        buf.append(alloc, '"') catch return -1;
+    }
+    buf.append(alloc, ']') catch return -1;
+
+    const owned = buf.toOwnedSlice(alloc) catch return -1;
+    out_json.* = owned.ptr;
+    out_len.* = @intCast(owned.len);
+    return 0;
+}
+
+export fn turbodb_free_json(ptr: [*]u8, len: u32) void {
+    alloc.free(ptr[0..len]);
+}
+
+/// Discover context for an agent task — returns matching files, callers, tests in one call.
+/// Output is a JSON string with the context.
+export fn turbodb_discover_context(
+    col_handle: *anyopaque,
+    query: [*]const u8,
+    query_len: u32,
+    limit: u32,
+    out_json: *[*]u8,
+    out_len: *u32,
+) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    var result = col.discoverContext(query[0..query_len], limit, alloc) catch return -1;
+    defer result.deinit();
+
+    // Format as JSON
+    var buf: std.ArrayList(u8) = .empty;
+    const w = buf.writer(alloc);
+
+    w.writeAll("{\"matching_files\":[") catch return -1;
+    for (result.matching_files, 0..) |d, i| {
+        if (i > 0) w.writeByte(',') catch return -1;
+        std.fmt.format(w, "{{\"key\":\"{s}\",\"size\":{d}}}", .{ d.key, d.value.len }) catch return -1;
+    }
+    w.writeAll("],\"related_files\":[") catch return -1;
+    for (result.related_files, 0..) |d, i| {
+        if (i > 0) w.writeByte(',') catch return -1;
+        std.fmt.format(w, "{{\"key\":\"{s}\"}}", .{d.key}) catch return -1;
+    }
+    w.writeAll("],\"test_files\":[") catch return -1;
+    for (result.test_files, 0..) |d, i| {
+        if (i > 0) w.writeByte(',') catch return -1;
+        std.fmt.format(w, "{{\"key\":\"{s}\"}}", .{d.key}) catch return -1;
+    }
+    std.fmt.format(w, "],\"recent_versions\":{d},\"total_files\":{d}}}", .{ result.recent_versions, result.total_files }) catch return -1;
+
+    // Copy to output
+    const json = buf.toOwnedSlice(alloc) catch return -1;
+    out_json.* = json.ptr;
+    out_len.* = @intCast(json.len);
+    return 0;
+}

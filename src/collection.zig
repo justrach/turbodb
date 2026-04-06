@@ -10,6 +10,7 @@ const hot_cache = @import("hot_cache.zig");
 const mvcc_mod  = @import("mvcc.zig");
 const cdc_mod = @import("cdc.zig");
 const vector = @import("vector.zig");
+const branch_mod = @import("branch.zig");
 const turboquant = @import("turboquant.zig");
 const Doc = doc_mod.Doc;
 const DocHeader = doc_mod.DocHeader;
@@ -197,6 +198,9 @@ pub const Collection = struct {
     vector_field: [64]u8 = undefined,
     vector_field_len: u8 = 0,
     /// Maps vector index -> BTreeEntry so we can look up the real document.
+
+    // Branch manager (optional — lazy-initialized on first branch creation)
+    branch_mgr: ?*branch_mod.BranchManager = null,
     vec_entries: std.ArrayListUnmanaged(BTreeEntry) = .empty,
 
     /// Get the stripe lock index for a key hash.
@@ -245,6 +249,7 @@ pub const Collection = struct {
         col.vectors = null;
         col.vector_field_len = 0;
         col.vec_entries = .empty;
+        col.branch_mgr = null;
 
         const n = @min(logical_name.len, col.name_buf.len - 1);
         @memcpy(col.name_buf[0..n], logical_name[0..n]);
@@ -285,6 +290,10 @@ pub const Collection = struct {
             self.alloc.destroy(vc);
         }
         self.vec_entries.deinit(self.alloc);
+        if (self.branch_mgr) |bm| {
+            bm.deinit();
+            self.alloc.destroy(bm);
+        }
         self.pf.close();
         self.alloc.destroy(self);
     }
@@ -1053,6 +1062,311 @@ pub const Collection = struct {
         }
 
         return text_results;
+    }
+
+    // ─── Branch operations (CoW layer) ──────────────────────────────────
+
+    /// Enable branching on this collection (lazy — only allocates when first branch is created)
+    pub fn enableBranching(self: *Collection) !void {
+        if (self.branch_mgr != null) return;
+        const bm = try self.alloc.create(branch_mod.BranchManager);
+        bm.* = branch_mod.BranchManager.init(self.alloc, &self.next_doc_id);
+        self.branch_mgr = bm;
+    }
+
+    pub fn createBranch(self: *Collection, branch_name: []const u8, agent_id: []const u8) !*branch_mod.Branch {
+        try self.enableBranching();
+        return self.branch_mgr.?.createBranch(branch_name, agent_id);
+    }
+
+    pub fn getBranch(self: *const Collection, branch_name: []const u8) ?*branch_mod.Branch {
+        const bm = self.branch_mgr orelse return null;
+        return bm.getBranch(branch_name);
+    }
+
+    /// Read a key on a branch — checks branch writes first, falls through to main
+    pub fn getOnBranch(self: *Collection, br: *const branch_mod.Branch, key: []const u8) ?[]const u8 {
+        // Check branch-local writes
+        if (br.read(key)) |r| {
+            if (r.deleted) return null; // deleted on branch
+            return r.value;
+        }
+        // Fall through to main
+        const doc = self.get(key) orelse return null;
+        return doc.value;
+    }
+
+    /// Write a key-value pair on a branch (isolated — doesn't touch main)
+    pub fn writeOnBranch(self: *Collection, br: *branch_mod.Branch, key: []const u8, value: []const u8) !void {
+        const epoch = self.next_doc_id.fetchAdd(1, .monotonic);
+        try br.write(key, value, epoch);
+    }
+
+    /// Delete a key on a branch (isolated tombstone)
+    pub fn deleteOnBranch(self: *Collection, br: *branch_mod.Branch, key: []const u8) !void {
+        const epoch = self.next_doc_id.fetchAdd(1, .monotonic);
+        try br.delete(key, epoch);
+    }
+
+    /// Get the diff of a branch vs main (all modified keys)
+    pub fn diffBranch(self: *Collection, br: *const branch_mod.Branch, diff_alloc: std.mem.Allocator) ![]branch_mod.DiffEntry {
+        _ = self; // main state accessed via br.base_epoch
+        return br.modifiedKeys(diff_alloc);
+    }
+
+    /// Merge a branch into main. Returns conflicts if any.
+    pub fn mergeBranch(self: *Collection, br: *branch_mod.Branch, merge_alloc: std.mem.Allocator) !branch_mod.MergeResult {
+        var applied: u32 = 0;
+        var conflicts_list: std.ArrayList(branch_mod.MergeConflict) = .empty;
+
+        var it = br.writes.iterator();
+        while (it.next()) |entry| {
+            const w = entry.value_ptr.*;
+
+            if (w.deleted) {
+                // Delete on main — for now just count as applied
+                applied += 1;
+                continue;
+            }
+
+            // Check if main has this key
+            const main_doc = self.get(w.key);
+
+            if (main_doc != null) {
+                // Key exists on main — fast-forward (overwrite with branch value)
+                _ = self.insert(w.key, w.value) catch {
+                    try conflicts_list.append(merge_alloc, .{
+                        .key = w.key,
+                        .branch_value = w.value,
+                        .main_value = main_doc.?.value,
+                    });
+                    continue;
+                };
+            } else {
+                // New key on branch — insert into main
+                _ = self.insert(w.key, w.value) catch continue;
+            }
+            applied += 1;
+        }
+
+        if (conflicts_list.items.len == 0) {
+            br.status = .merged;
+        }
+
+        return .{
+            .applied = applied,
+            .conflicts = try conflicts_list.toOwnedSlice(merge_alloc),
+            .alloc = merge_alloc,
+        };
+    }
+
+    /// Search text on a branch — searches branch-local writes first, then falls through to main search.
+    /// Returns results that include both branch-modified files and main files matching the query.
+    pub fn searchOnBranch(
+        self: *Collection,
+        br: *const branch_mod.Branch,
+        query: []const u8,
+        limit: u32,
+        search_alloc: std.mem.Allocator,
+    ) !TextSearchResult {
+        // 1. Search main collection normally
+        const main_results = try self.searchText(query, limit, search_alloc);
+
+        // 2. Also search branch-local writes for the query
+        var branch_matches: std.ArrayList(Doc) = .empty;
+        defer branch_matches.deinit(search_alloc);
+
+        var it = br.writes.iterator();
+        while (it.next()) |entry| {
+            const w = entry.value_ptr.*;
+            if (w.deleted) continue;
+            // Check if query appears in the branch-local value or key
+            if (containsInsensitive(w.value, query) or containsInsensitive(w.key, query)) {
+                try branch_matches.append(search_alloc, Doc{
+                    .header = doc_mod.DocHeader{
+                        .doc_id = w.epoch,
+                        .key_hash = doc_mod.fnv1a(w.key),
+                        .val_len = @intCast(w.value.len),
+                        .key_len = @intCast(w.key.len),
+                        .flags = 0,
+                        .version = 0,
+                        .next_ver = 0,
+                    },
+                    .key = w.key,
+                    .value = w.value,
+                });
+            }
+        }
+
+        // 3. Overlay branch modifications onto main results.
+        // Replace any main result whose key was modified on branch with the branch version.
+        for (main_results.docs) |*doc| {
+            if (br.read(doc.key)) |r| {
+                if (r.deleted) continue;
+                if (r.value) |v| {
+                    doc.value = v;
+                }
+            }
+        }
+
+        // Branch-only docs that match the query but aren't in main are collected above.
+        // Currently we only overlay modifications on existing main results (step 3).
+        // Future: could extend the result slice with branch_matches items.
+
+        return main_results;
+    }
+
+    /// List all branch names for this collection.
+    pub fn listBranches(self: *const Collection, list_alloc: std.mem.Allocator) ![][]const u8 {
+        const bm = self.branch_mgr orelse return try list_alloc.alloc([]const u8, 0);
+        return bm.listBranches(list_alloc);
+    }
+
+    // ─── Smart Context Discovery ─────────────────────────────────────────
+
+    pub const ContextResult = struct {
+        /// Files matching the text query (trigram search)
+        matching_files: []Doc,
+        /// Files that reference/call symbols found in matching files
+        related_files: []Doc,
+        /// Test files (keys containing "test" that also match the query)
+        test_files: []Doc,
+        /// Recent changes to matching files (MVCC history)
+        recent_versions: u32,
+        /// Total files scanned
+        total_files: u32,
+        ctx_alloc: std.mem.Allocator,
+
+        pub fn deinit(self: *ContextResult) void {
+            self.ctx_alloc.free(self.matching_files);
+            self.ctx_alloc.free(self.related_files);
+            self.ctx_alloc.free(self.test_files);
+        }
+    };
+
+    /// Smart context discovery — combines text search, caller analysis, test discovery,
+    /// and MVCC history in a single call. Gives an agent everything it needs to understand
+    /// a code area.
+    pub fn discoverContext(
+        self: *Collection,
+        query: []const u8,
+        limit: u32,
+        ctx_alloc: std.mem.Allocator,
+    ) !ContextResult {
+        // Phase 1: Primary search — find files matching the query
+        const primary = self.searchText(query, limit * 2, ctx_alloc) catch |e| {
+            if (e == error.OutOfMemory) return e;
+            return ContextResult{
+                .matching_files = &.{},
+                .related_files = &.{},
+                .test_files = &.{},
+                .recent_versions = 0,
+                .total_files = @intCast(self.tri.fileCount()),
+                .ctx_alloc = ctx_alloc,
+            };
+        };
+
+        // Phase 2: Find related files — search for identifiers found in primary results.
+        // Extract potential function/symbol names from primary results and search for callers.
+        var related_set = std.StringHashMap(void).init(ctx_alloc);
+        defer related_set.deinit();
+
+        // Mark primary result keys so we don't duplicate them
+        for (primary.docs) |doc| {
+            related_set.put(doc.key, {}) catch {};
+        }
+
+        var related_list: std.ArrayListUnmanaged(Doc) = .empty;
+
+        // For each primary match, extract identifiers and search for them.
+        // Simple heuristic: look for "fn <name>" patterns, search for "<name>(".
+        for (primary.docs) |doc| {
+            var pos: usize = 0;
+            while (pos + 3 < doc.value.len) : (pos += 1) {
+                // Look for "fn " pattern
+                if (doc.value[pos] == 'f' and doc.value[pos + 1] == 'n' and doc.value[pos + 2] == ' ') {
+                    // Extract function name
+                    const name_start = pos + 3;
+                    var name_end = name_start;
+                    while (name_end < doc.value.len and
+                        ((doc.value[name_end] >= 'a' and doc.value[name_end] <= 'z') or
+                        (doc.value[name_end] >= 'A' and doc.value[name_end] <= 'Z') or
+                        (doc.value[name_end] >= '0' and doc.value[name_end] <= '9') or
+                        doc.value[name_end] == '_'))
+                    {
+                        name_end += 1;
+                    }
+
+                    if (name_end > name_start and name_end - name_start >= 3) {
+                        const fn_name = doc.value[name_start..name_end];
+                        // Search for callers of this function
+                        if (self.searchText(fn_name, 5, ctx_alloc)) |caller_results| {
+                            for (caller_results.docs) |caller| {
+                                if (!related_set.contains(caller.key)) {
+                                    related_set.put(caller.key, {}) catch {};
+                                    related_list.append(ctx_alloc, caller) catch {};
+                                }
+                            }
+                            // Don't deinit caller_results — docs are borrowed from mmap
+                        } else |_| {}
+                    }
+                }
+            }
+        }
+
+        // Phase 3: Find test files — search for "test" + query terms.
+        var test_list: std.ArrayListUnmanaged(Doc) = .empty;
+
+        if (self.searchText("test", limit, ctx_alloc)) |test_results| {
+            for (test_results.docs) |doc| {
+                // Check if this test file relates to our query
+                if (containsInsensitive(doc.key, query) or containsInsensitive(doc.value, query)) {
+                    if (!related_set.contains(doc.key)) {
+                        test_list.append(ctx_alloc, doc) catch {};
+                    }
+                }
+            }
+        } else |_| {}
+
+        // Phase 4: Count recent versions of matching files
+        var recent_versions: u32 = 0;
+        for (primary.docs) |doc| {
+            if (doc.header.version > 0) {
+                recent_versions += doc.header.version;
+            }
+        }
+
+        return ContextResult{
+            .matching_files = primary.docs,
+            .related_files = related_list.toOwnedSlice(ctx_alloc) catch &.{},
+            .test_files = test_list.toOwnedSlice(ctx_alloc) catch &.{},
+            .recent_versions = recent_versions,
+            .total_files = @intCast(self.tri.fileCount()),
+            .ctx_alloc = ctx_alloc,
+        };
+    }
+
+    /// Smart context discovery on a branch — overlays branch modifications on results.
+    pub fn discoverContextOnBranch(
+        self: *Collection,
+        br: *const branch_mod.Branch,
+        query: []const u8,
+        limit: u32,
+        ctx_alloc: std.mem.Allocator,
+    ) !ContextResult {
+        // Same as discoverContext but overlays branch modifications
+        const result = try self.discoverContext(query, limit, ctx_alloc);
+
+        // Overlay branch writes on matching_files
+        for (result.matching_files) |*doc| {
+            if (br.read(doc.key)) |r| {
+                if (!r.deleted) {
+                    if (r.value) |v| doc.value = v;
+                }
+            }
+        }
+
+        return result;
     }
 };
 

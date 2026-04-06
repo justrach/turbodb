@@ -9,6 +9,7 @@
 ///   GET    /collections          list collections
 ///   GET    /health               health check
 ///   GET    /metrics              server metrics
+///   GET    /context/:col         smart context discovery (q, limit query params)
 const std = @import("std");
 const activity = @import("activity.zig");
 const collection = @import("collection.zig");
@@ -258,6 +259,68 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
         return handleSearch(srv, requestTenant(raw, query), col_name, q, limit_val, alloc);
     }
 
+    // Route: /context/:col?q=...&limit=20
+    if (std.mem.startsWith(u8, path, "/context/") and std.mem.eql(u8, method, "GET")) {
+        const col_name = path[9..];
+        const q_raw = qparam(query, "q") orelse return err(400, "missing q parameter");
+        var decode_buf: [4096]u8 = undefined;
+        const q = urlDecode(q_raw, &decode_buf) orelse q_raw;
+        const limit_val: u32 = qparamInt(query, "limit") orelse 20;
+        return handleDiscoverContext(srv, requestTenant(raw, query), col_name, q, limit_val, alloc);
+    }
+
+    // Routes under /branch/:col[/:branch[/:key]]
+    if (std.mem.startsWith(u8, path, "/branch/")) {
+        const rest = path[8..]; // after "/branch/"
+        const tenant_id = requestTenant(raw, query);
+
+        // Parse: rest = col_name[/branch_name[/key...]]
+        if (std.mem.indexOfScalar(u8, rest, '/')) |sep1| {
+            const col_name = rest[0..sep1];
+            const after_col = rest[sep1 + 1 ..];
+
+            if (std.mem.indexOfScalar(u8, after_col, '/')) |sep2| {
+                const branch_name = after_col[0..sep2];
+                const key_or_action = after_col[sep2 + 1 ..];
+
+                // POST /branch/:col/:branch/merge
+                if (std.mem.eql(u8, key_or_action, "merge") and std.mem.eql(u8, method, "POST")) {
+                    return handleBranchMerge(srv, tenant_id, col_name, branch_name, alloc);
+                }
+                // GET /branch/:col/:branch/search?q=...
+                if (std.mem.eql(u8, key_or_action, "search") and std.mem.eql(u8, method, "GET")) {
+                    const q_raw = qparam(query, "q") orelse return err(400, "missing q parameter");
+                    var decode_buf: [4096]u8 = undefined;
+                    const q = urlDecode(q_raw, &decode_buf) orelse q_raw;
+                    const limit_val: u32 = qparamInt(query, "limit") orelse 50;
+                    return handleBranchSearch(srv, tenant_id, col_name, branch_name, q, limit_val, alloc);
+                }
+                // PUT /branch/:col/:branch/:key — write on branch
+                if (std.mem.eql(u8, method, "PUT")) {
+                    return handleBranchWrite(srv, tenant_id, col_name, branch_name, key_or_action, body);
+                }
+                // GET /branch/:col/:branch/:key — read on branch
+                if (std.mem.eql(u8, method, "GET")) {
+                    return handleBranchRead(srv, tenant_id, col_name, branch_name, key_or_action);
+                }
+            } else {
+                // No second slash — this is /branch/:col/:branch (no key)
+                // Could be used for branch-level ops if needed
+            }
+        } else {
+            // No slash after col_name: /branch/:col
+            const col_name = rest;
+            // POST /branch/:col — create branch (body: {"name":"...","agent_id":"..."})
+            if (std.mem.eql(u8, method, "POST")) {
+                return handleCreateBranch(srv, tenant_id, col_name, body);
+            }
+            // GET /branch/:col — list branches
+            if (std.mem.eql(u8, method, "GET")) {
+                return handleListBranches(srv, tenant_id, col_name, alloc);
+            }
+        }
+    }
+
     // Routes under /db/:col
     if (std.mem.startsWith(u8, path, "/db/")) {
         const rest = path[4..];
@@ -437,6 +500,44 @@ fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 
+fn handleDiscoverContext(srv: *Server, tenant_id: []const u8, col_name: []const u8, query: []const u8, limit: u32, alloc: std.mem.Allocator) usize {
+    const start_ns = std.time.nanoTimestamp();
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+    var result = col.discoverContext(query, limit, alloc) catch return err(500, "context discovery failed");
+    defer result.deinit();
+    var bytes_read: u64 = 0;
+    for (result.matching_files) |d| bytes_read += d.key.len + d.value.len;
+    srv.recordQueryCost(tenant_id, "context", result.matching_files.len, bytes_read, start_ns);
+
+    var fbs = std.io.fixedBufferStream(getBodyBuf());
+    const w = fbs.writer();
+
+    // Write JSON: matching_files
+    w.writeAll("{\"query\":\"") catch {};
+    for (query) |ch| {
+        if (ch == '"' or ch == '\\') { w.writeByte('\\') catch {}; }
+        w.writeByte(ch) catch {};
+    }
+    w.writeAll("\",\"matching_files\":[") catch {};
+    for (result.matching_files, 0..) |d, i| {
+        if (i > 0) w.writeByte(',') catch {};
+        std.fmt.format(w, "{{\"key\":\"{s}\",\"size\":{d}}}", .{ d.key, d.value.len }) catch {};
+    }
+    w.writeAll("],\"related_files\":[") catch {};
+    for (result.related_files, 0..) |d, i| {
+        if (i > 0) w.writeByte(',') catch {};
+        std.fmt.format(w, "{{\"key\":\"{s}\"}}", .{d.key}) catch {};
+    }
+    w.writeAll("],\"test_files\":[") catch {};
+    for (result.test_files, 0..) |d, i| {
+        if (i > 0) w.writeByte(',') catch {};
+        std.fmt.format(w, "{{\"key\":\"{s}\"}}", .{d.key}) catch {};
+    }
+    std.fmt.format(w, "],\"recent_versions\":{d},\"total_files\":{d}}}", .{ result.recent_versions, result.total_files }) catch {};
+    return ok(getBodyBuf()[0..fbs.pos]);
+}
+
 fn handleListCollections(srv: *Server, tenant_id: []const u8, alloc: std.mem.Allocator) usize {
     const start_ns = std.time.nanoTimestamp();
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
@@ -522,6 +623,93 @@ fn handleCdcEvents(srv: *Server, tenant_filter: ?[]const u8, alloc: std.mem.Allo
                 entry.payloadSlice(),
             },
         ) catch {};
+    }
+    w.writeAll("]}") catch {};
+    return ok(getBodyBuf()[0..fbs.pos]);
+}
+
+// ─── Branch handlers ─────────────────────────────────────────────────────
+
+fn handleCreateBranch(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8) usize {
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+    const name = jsonStr(body, "name") orelse return err(400, "missing name");
+    const agent = jsonStr(body, "agent_id") orelse "default";
+    _ = col.createBranch(name, agent) catch return err(500, "create branch failed");
+    return ok("{\"created\":true}");
+}
+
+fn handleBranchWrite(srv: *Server, tenant_id: []const u8, col_name: []const u8, branch_name: []const u8, key: []const u8, body: []const u8) usize {
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+    const br = col.getBranch(branch_name) orelse return err(404, "branch not found");
+    col.writeOnBranch(br, key, body) catch return err(500, "branch write failed");
+    return ok("{\"written\":true}");
+}
+
+fn handleBranchRead(srv: *Server, tenant_id: []const u8, col_name: []const u8, branch_name: []const u8, key: []const u8) usize {
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+    const br = col.getBranch(branch_name) orelse return err(404, "branch not found");
+    const val = col.getOnBranch(br, key) orelse return err(404, "not found");
+    // Write response with raw value
+    var fbs = std.io.fixedBufferStream(getBodyBuf());
+    std.fmt.format(fbs.writer(), "{{\"key\":\"{s}\",\"value\":{s}}}", .{
+        key, if (val.len > 0) val else "{}",
+    }) catch {};
+    return ok(getBodyBuf()[0..fbs.pos]);
+}
+
+fn handleBranchMerge(srv: *Server, tenant_id: []const u8, col_name: []const u8, branch_name: []const u8, alloc: std.mem.Allocator) usize {
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+    const br = col.getBranch(branch_name) orelse return err(404, "branch not found");
+    var result = col.mergeBranch(br, alloc) catch return err(500, "merge failed");
+    defer result.deinit();
+    if (result.conflicts.len > 0) {
+        // Return conflict count
+        var fbs = std.io.fixedBufferStream(getBodyBuf());
+        std.fmt.format(fbs.writer(), "{{\"merged\":false,\"conflicts\":{d}}}", .{result.conflicts.len}) catch {};
+        return respond(409, "Conflict", getBodyBuf()[0..fbs.pos]);
+    }
+    var fbs = std.io.fixedBufferStream(getBodyBuf());
+    std.fmt.format(fbs.writer(), "{{\"merged\":true,\"applied\":{d}}}", .{result.applied}) catch {};
+    return ok(getBodyBuf()[0..fbs.pos]);
+}
+
+fn handleBranchSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, branch_name: []const u8, query_text: []const u8, limit: u32, alloc: std.mem.Allocator) usize {
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+    const br = col.getBranch(branch_name) orelse return err(404, "branch not found");
+    const result = col.searchOnBranch(br, query_text, limit, alloc) catch return err(500, "branch search failed");
+    defer result.deinit();
+
+    var fbs = std.io.fixedBufferStream(getBodyBuf());
+    const w = fbs.writer();
+    std.fmt.format(w, "{{\"branch\":\"{s}\",\"hits\":{d},\"results\":[", .{ branch_name, result.docs.len }) catch {};
+    for (result.docs, 0..) |d, i| {
+        if (i > 0) w.writeByte(',') catch {};
+        std.fmt.format(w,
+            "{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":{s}}}",
+            .{ d.header.doc_id, d.key,
+               if (d.value.len > 0) d.value else "{}" }) catch {};
+    }
+    w.writeAll("]}") catch {};
+    return ok(getBodyBuf()[0..fbs.pos]);
+}
+
+fn handleListBranches(srv: *Server, tenant_id: []const u8, col_name: []const u8, alloc: std.mem.Allocator) usize {
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+    const names = col.listBranches(alloc) catch return err(500, "list branches failed");
+    defer alloc.free(names);
+
+    var fbs = std.io.fixedBufferStream(getBodyBuf());
+    const w = fbs.writer();
+    w.writeAll("{\"branches\":[") catch {};
+    for (names, 0..) |name, i| {
+        if (i > 0) w.writeByte(',') catch {};
+        std.fmt.format(w, "\"{s}\"", .{name}) catch {};
     }
     w.writeAll("]}") catch {};
     return ok(getBodyBuf()[0..fbs.pos]);

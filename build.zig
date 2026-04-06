@@ -334,6 +334,7 @@ pub fn build(b: *std.Build) void {
         "src/replication/router.zig",
         "src/replication/peer.zig",
         "src/replication/integration.zig",
+        "src/branch.zig",
     };
 
     const test_all_step = b.step("test-all", "Run all tests (core + new subsystems)");

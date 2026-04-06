@@ -223,6 +223,105 @@ class Collection:
             return f"Collection('{self._name}')"
         return f"Collection('{self._tenant}/{self._name}')"
 
+    # ─── Branch operations ─────────────────────────────────────────────
+
+    def create_branch(self, name: str, agent_id: str = "default"):
+        nb = name.encode("utf-8")
+        ab = agent_id.encode("utf-8")
+        rc = _ffi._lib.turbodb_create_branch(self._handle, nb, len(nb), ab, len(ab))
+        if rc != 0:
+            raise RuntimeError(f"Failed to create branch '{name}'")
+
+    def branch_write(self, branch: str, key: str, value: str):
+        bb = branch.encode("utf-8")
+        kb = key.encode("utf-8")
+        vb = value.encode("utf-8")
+        rc = _ffi._lib.turbodb_branch_write(self._handle, bb, len(bb), kb, len(kb), vb, len(vb))
+        if rc != 0:
+            raise RuntimeError(f"Branch write failed")
+
+    def branch_read(self, branch: str, key: str) -> str:
+        bb = branch.encode("utf-8")
+        kb = key.encode("utf-8")
+        out_val = ctypes.c_char_p()
+        out_len = ctypes.c_uint32()
+        rc = _ffi._lib.turbodb_branch_read(self._handle, bb, len(bb), kb, len(kb), ctypes.byref(out_val), ctypes.byref(out_len))
+        if rc != 0:
+            return None
+        return ctypes.string_at(out_val, out_len.value).decode("utf-8", errors="replace")
+
+    def branch_merge(self, branch: str) -> int:
+        """Merge branch into main. Returns 0 on success, >0 = number of conflicts."""
+        bb = branch.encode("utf-8")
+        return _ffi._lib.turbodb_branch_merge(self._handle, bb, len(bb))
+
+
+    def branch_search(self, branch: str, query: str, limit: int = 20):
+        """Search text on a branch (sees branch modifications + main)."""
+        bb = branch.encode("utf-8")
+        qb = query.encode("utf-8")
+        handle = _ffi.ScanHandle()
+        rc = _ffi._lib.turbodb_branch_search(
+            self._handle, bb, len(bb), qb, len(qb), limit, ctypes.byref(handle))
+        if rc != 0:
+            return []
+        try:
+            count = _ffi.scan_count(handle)
+            docs = []
+            for i in range(count):
+                r = _ffi.scan_doc(handle, i)
+                if r is not None:
+                    docs.append({
+                        "key": r.key_bytes().decode("utf-8", errors="replace"),
+                        "value": r.val_bytes().decode("utf-8", errors="replace"),
+                        "doc_id": r.doc_id,
+                        "version": r.version,
+                    })
+            return docs
+        finally:
+            _ffi.scan_free(handle)
+
+    def list_branches(self):
+        """List all branch names. Returns list of strings."""
+        import json as _json
+        out_json = ctypes.c_char_p()
+        out_len = ctypes.c_uint32()
+        rc = _ffi._lib.turbodb_list_branches(
+            self._handle, ctypes.byref(out_json), ctypes.byref(out_len))
+        if rc != 0:
+            return []
+        try:
+            raw = ctypes.string_at(out_json, out_len.value)
+            return _json.loads(raw.decode("utf-8"))
+        finally:
+            if out_json.value and out_len.value > 0:
+                _ffi._lib.turbodb_free_json(out_json, out_len.value)
+
+    def discover_context(self, query: str, limit: int = 20):
+        """Smart context discovery -- returns matching files, callers, tests in one call.
+
+        Instead of making 5+ search calls, this gives an agent everything it needs:
+        - matching_files: files matching the query
+        - related_files: files that call/import functions from matching files
+        - test_files: test files related to the query
+        - recent_versions: total version count (how actively edited)
+        - total_files: total files in collection
+        """
+        qb = query.encode("utf-8")
+        out_json = ctypes.c_char_p()
+        out_len = ctypes.c_uint32()
+        rc = _ffi._lib.turbodb_discover_context(
+            self._handle, qb, len(qb), limit,
+            ctypes.byref(out_json), ctypes.byref(out_len))
+        if rc != 0:
+            return {"matching_files": [], "related_files": [], "test_files": [],
+                    "recent_versions": 0, "total_files": 0}
+        try:
+            json_str = ctypes.string_at(out_json, out_len.value).decode("utf-8")
+            return json.loads(json_str)
+        finally:
+            if out_json.value and out_len.value > 0:
+                _ffi._lib.turbodb_free_json(out_json, out_len.value)
 
 class Database:
     """A TurboDB database instance."""
