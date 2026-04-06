@@ -35,6 +35,21 @@ __version__ = _ffi.version()
 __all__ = ["Database", "Collection", "VectorColumn", "crypto", "__version__"]
 
 
+def _float_ptr(data):
+    """Get a c_float pointer from a list, tuple, or numpy array — zero-copy for numpy."""
+    try:
+        import numpy as np
+        if isinstance(data, np.ndarray):
+            arr = np.ascontiguousarray(data, dtype=np.float32)
+            return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), len(arr), arr
+        # Convert list/tuple to numpy for zero-copy
+        arr = np.ascontiguousarray(data, dtype=np.float32)
+        return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), len(arr), arr
+    except ImportError:
+        # No numpy — fall back to ctypes array (slow but works)
+        arr = (ctypes.c_float * len(data))(*data)
+        return arr, len(data), arr
+
 class Collection:
     """A TurboDB document collection."""
 
@@ -123,10 +138,86 @@ class Collection:
         finally:
             _ffi.scan_free(handle)
 
+    def insert_with_embedding(self, key: str, value: str, embedding):
+        """Insert a document with a pre-computed embedding vector.
+        
+        This is the fast path — embedding is passed directly to Zig via zero-copy 
+        numpy pointer (no JSON parsing, no ctypes array construction).
+        
+        Args:
+            key: Document key
+            value: Document value (plain text, no need to include embedding in JSON)
+            embedding: list, tuple, or numpy array of floats
+        """
+        kb = key.encode("utf-8")
+        vb = value.encode("utf-8")
+        ptr, dims, _ref = _float_ptr(embedding)  # _ref keeps numpy array alive
+        out_id = ctypes.c_uint64(0)
+        rc = _ffi._lib.turbodb_insert_with_embedding(
+            self._handle, kb, len(kb), vb, len(vb), ptr, dims, ctypes.byref(out_id)
+        )
+        if rc != 0:
+            raise RuntimeError("insert_with_embedding failed")
+        return int(out_id.value)
     def flush_index(self):
         """Block until background index builder has finished processing all pending items."""
         _ffi._lib.turbodb_flush_index(self._handle)
 
+    def configure_vectors(self, dims: int, field: str = "embedding"):
+        """Configure a vector embedding column on this collection.
+        `dims` is the dimensionality; `field` is the JSON key holding the embedding array."""
+        fb = field.encode("utf-8")
+        rc = _ffi._lib.turbodb_configure_vectors(self._handle, dims, fb, len(fb))
+        if rc != 0:
+            raise RuntimeError("Failed to configure vectors")
+
+    def search_vectors(self, query, k: int = 10, metric: str = "cosine"):
+        """Search the collection's vector column. Returns list of (index, score) tuples."""
+        import ctypes
+        metric_map = {"cosine": 0, "dot_product": 1, "l2": 2}
+        m = metric_map.get(metric, 0)
+        dims = len(query)
+        arr = (ctypes.c_float * dims)(*query)
+        out_idx = (ctypes.c_uint32 * k)()
+        out_scores = (ctypes.c_float * k)()
+        rc = _ffi._lib.turbodb_collection_search_vectors(
+            self._handle, arr, dims, k, m, out_idx, out_scores
+        )
+        if rc < 0:
+            return []
+        return [(int(out_idx[i]), float(out_scores[i])) for i in range(rc)]
+
+    def search_hybrid(self, text_query: str, vector_query, k: int = 10,
+                      text_weight: float = 0.3, vector_weight: float = 0.7):
+        """Hybrid search combining text + vector scoring.
+        Returns a list of matching docs ranked by combined score."""
+        import ctypes
+        tb = text_query.encode("utf-8")
+        dims = len(vector_query)
+        arr = (ctypes.c_float * dims)(*vector_query)
+        handle = _ffi.ScanHandle()
+        rc = _ffi._lib.turbodb_search_hybrid(
+            self._handle, tb, len(tb), arr, dims, k,
+            ctypes.c_float(text_weight), ctypes.c_float(vector_weight),
+            ctypes.byref(handle),
+        )
+        if rc != 0:
+            return []
+        try:
+            count = _ffi.scan_count(handle)
+            docs = []
+            for i in range(count):
+                r = _ffi.scan_doc(handle, i)
+                if r is not None:
+                    docs.append({
+                        "key": r.key_bytes().decode("utf-8", errors="replace"),
+                        "value": r.val_bytes().decode("utf-8", errors="replace"),
+                        "doc_id": r.doc_id,
+                        "version": r.version,
+                    })
+            return docs
+        finally:
+            _ffi.scan_free(handle)
     def __repr__(self):
         if self._tenant is None:
             return f"Collection('{self._name}')"

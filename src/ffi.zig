@@ -123,6 +123,20 @@ export fn turbodb_insert(
     return 0;
 }
 
+/// Insert with a pre-computed embedding (no JSON parsing). Fast path for vector inserts.
+export fn turbodb_insert_with_embedding(
+    col_handle: *anyopaque,
+    key: [*]const u8, key_len: usize,
+    val: [*]const u8, val_len: usize,
+    embedding: [*]const f32, dims: u32,
+    out_id: *u64,
+) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const doc_id = col.insertWithEmbedding(key[0..key_len], val[0..val_len], embedding[0..dims]) catch return -1;
+    out_id.* = doc_id;
+    return 0;
+}
+
 /// Get a document by key. On success, fills `out` with pointers into
 /// mmap'd memory (valid until next write to this collection).
 /// Returns 0 if found, -1 if not found.
@@ -490,4 +504,68 @@ export fn turbodb_vector_search_ivf(
         out_scores[i] = r.score;
     }
     return @intCast(results.len);
+}
+
+// ── Collection-level vector integration ─────────────────────────────────────
+
+/// Configure a vector embedding column on a Collection.
+/// field_name is the JSON key that holds the embedding array (e.g. "embedding").
+export fn turbodb_configure_vectors(col_handle: *anyopaque, dims: u32, field_name: [*]const u8, field_len: u32) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    col.configureVectors(dims, field_name[0..field_len]) catch return -1;
+    return 0;
+}
+
+/// Search the collection's vector column. Returns result count written to out arrays.
+/// metric: 0=cosine, 1=dot_product, 2=l2.
+export fn turbodb_collection_search_vectors(
+    col_handle: *anyopaque,
+    query: [*]const f32,
+    dims: u32,
+    k: u32,
+    metric: u8,
+    out_indices: [*]u32,
+    out_scores: [*]f32,
+) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const m: vector.Metric = switch (metric) {
+        0 => .cosine,
+        1 => .dot_product,
+        2 => .l2,
+        else => return -1,
+    };
+    const result = col.searchVectors(query[0..dims], k, m) catch return -1;
+    defer result.deinit();
+    for (result.docs[0..result.count], 0..) |d, i| {
+        out_indices[i] = @intCast(d.header.doc_id);
+        out_scores[i] = result.scores[i];
+    }
+    return @intCast(result.count);
+}
+
+/// Hybrid search: combines text + vector scoring.
+/// Returns results as a ScanHandle (use turbodb_scan_count/doc/free).
+export fn turbodb_search_hybrid(
+    col_handle: *anyopaque,
+    text_query: [*]const u8,
+    text_len: u32,
+    vector_query: [*]const f32,
+    dims: u32,
+    k: u32,
+    text_weight: f32,
+    vector_weight: f32,
+    out: *TurboScanHandle,
+) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const result = col.searchHybrid(
+        text_query[0..text_len],
+        vector_query[0..dims],
+        text_weight,
+        vector_weight,
+        k,
+        alloc,
+    ) catch return -1;
+    out.docs_ptr = result.docs.ptr;
+    out.count = @intCast(result.docs.len);
+    return 0;
 }
