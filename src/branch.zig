@@ -124,6 +124,88 @@ pub const Branch = struct {
     }
 };
 
+/// Result of comparing multiple branches on the same key.
+pub const BranchFileView = struct {
+    branch_name: []const u8,
+    agent_id: []const u8,
+    value: ?[]const u8, // null = not modified on this branch
+    deleted: bool,
+    epoch: u64,
+};
+
+/// A single file's view across all branches.
+pub const CompareEntry = struct {
+    key: []const u8,
+    main_value: ?[]const u8, // current value on main (null if doesn't exist)
+    branch_views: []BranchFileView, // one per branch that modified this key
+};
+
+/// Compare result: all files touched by any branch, with per-branch views.
+pub const CompareResult = struct {
+    entries: []CompareEntry,
+    branch_names: [][]const u8,
+    alloc: Allocator,
+
+    pub fn deinit(self: *CompareResult) void {
+        for (self.entries) |e| {
+            self.alloc.free(e.branch_views);
+        }
+        self.alloc.free(self.entries);
+        self.alloc.free(self.branch_names);
+    }
+};
+
+/// Compare multiple branches side-by-side.
+/// Returns every file touched by ANY branch, with each branch's version.
+pub fn compareBranches(branches: []*const Branch, alloc: Allocator) !CompareResult {
+    // Collect all unique keys across all branches
+    var all_keys = std.StringHashMap(void).init(alloc);
+    defer all_keys.deinit();
+
+    for (branches) |br| {
+        var it = br.writes.iterator();
+        while (it.next()) |entry| {
+            try all_keys.put(entry.value_ptr.key, {});
+        }
+    }
+
+    // Build entries
+    var entries: std.ArrayList(CompareEntry) = .empty;
+    var key_iter = all_keys.keyIterator();
+    while (key_iter.next()) |key_ptr| {
+        const key = key_ptr.*;
+        var views: std.ArrayList(BranchFileView) = .empty;
+
+        for (branches) |br| {
+            if (br.read(key)) |r| {
+                try views.append(alloc, .{
+                    .branch_name = br.getName(),
+                    .agent_id = br.getAgentId(),
+                    .value = r.value,
+                    .deleted = r.deleted,
+                    .epoch = if (br.writes.get(fnv1a(key))) |w| w.epoch else 0,
+                });
+            }
+        }
+
+        try entries.append(alloc, .{
+            .key = key,
+            .main_value = null, // caller fills this from Collection.get()
+            .branch_views = try views.toOwnedSlice(alloc),
+        });
+    }
+
+    // Collect branch names
+    var names: std.ArrayList([]const u8) = .empty;
+    for (branches) |br| try names.append(alloc, br.getName());
+
+    return .{
+        .entries = try entries.toOwnedSlice(alloc),
+        .branch_names = try names.toOwnedSlice(alloc),
+        .alloc = alloc,
+    };
+}
+
 pub const DiffEntry = struct {
     key: []const u8,
     value: []const u8,

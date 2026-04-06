@@ -1170,6 +1170,33 @@ pub const Collection = struct {
         };
     }
 
+    /// Compare multiple branches side-by-side. Shows every file touched by ANY branch,
+    /// with each branch's version and the current main version.
+    /// Use this to review agent work before deciding which branch to merge.
+    pub fn compareBranches(self: *Collection, branch_names: []const []const u8, alloc: std.mem.Allocator) !branch_mod.CompareResult {
+        const bm = self.branch_mgr orelse return error.NoBranchManager;
+
+        // Collect branch pointers
+        var branches: std.ArrayList(*const branch_mod.Branch) = .empty;
+        defer branches.deinit(alloc);
+        for (branch_names) |bname| {
+            if (bm.getBranch(bname)) |br| {
+                try branches.append(alloc, br);
+            }
+        }
+
+        // Run comparison
+        const result = try branch_mod.compareBranches(branches.items, alloc);
+
+        // Fill in main_value for each entry
+        for (result.entries) |*entry| {
+            const doc = self.get(entry.key);
+            if (doc) |d| entry.main_value = d.value;
+        }
+
+        return result;
+    }
+
     /// Search text on a branch — searches branch-local writes first, then falls through to main search.
     /// Returns results that include both branch-modified files and main files matching the query.
     pub fn searchOnBranch(

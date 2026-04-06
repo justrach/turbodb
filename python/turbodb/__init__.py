@@ -297,6 +297,75 @@ class Collection:
             if out_json.value and out_len.value > 0:
                 _ffi._lib.turbodb_free_json(out_json, out_len.value)
 
+    def compare_branches(self, *branch_names, keys=None):
+        """Compare multiple branches side-by-side before merging.
+        
+        If `keys` is provided, compares those specific files across branches.
+        Otherwise, discovers modified keys by searching each branch.
+        
+        Returns dict:
+          {"files": {
+             "src/auth.zig": {
+               "main": "original code...",
+               "agent-a/fix-auth": "modified code...",
+               "agent-b/fix-auth": "different modification...",
+             },
+             "src/new_file.zig": {
+               "main": None,  # doesn't exist on main
+               "agent-a/fix-auth": "new code...",
+             }
+           },
+           "summary": {
+             "agent-a/fix-auth": {"modified": 1, "added": 1, "deleted": 0},
+             "agent-b/fix-auth": {"modified": 1, "added": 0, "deleted": 0},
+           }
+          }
+        """
+        branches = list(branch_names)
+        
+        # If no specific keys given, discover them by searching each branch
+        if keys is None:
+            keys = set()
+            # Use branch_search with a broad query to find modified files
+            # Each branch's writes will show up in search
+            for bname in branches:
+                # Search for any content — finds files modified on this branch
+                results = self.branch_search(bname, " ", limit=1000)
+                for r in results:
+                    keys.add(r["key"])
+            # Also check specific keys we know about
+            all_main = self.scan(limit=10000)
+            for doc in all_main:
+                for bname in branches:
+                    bval = self.branch_read(bname, doc["key"])
+                    mval = doc["value"]
+                    if bval is not None and bval != mval:
+                        keys.add(doc["key"])
+            keys = list(keys)
+        
+        files = {}
+        summary = {b: {"modified": 0, "added": 0, "deleted": 0} for b in branches}
+        
+        for key in keys:
+            entry = {}
+            main_doc = self.get(key)
+            entry["main"] = main_doc["value"] if main_doc else None
+            
+            for bname in branches:
+                bval = self.branch_read(bname, key)
+                if bval is not None:
+                    entry[bname] = bval
+                    if entry["main"] is None:
+                        summary[bname]["added"] += 1
+                    elif bval != entry["main"]:
+                        summary[bname]["modified"] += 1
+            
+            # Only include if at least one branch touched this file
+            if len(entry) > 1:  # more than just "main"
+                files[key] = entry
+        
+        return {"files": files, "summary": summary}
+
     def discover_context(self, query: str, limit: int = 20):
         """Smart context discovery -- returns matching files, callers, tests in one call.
 
