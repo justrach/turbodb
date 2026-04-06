@@ -412,3 +412,31 @@ def scan_free(handle):
 
 def version() -> str:
     return _lib.turbodb_version().decode("utf-8")
+
+# ── Branch operations ──────────────────────────────────────────────────────
+
+_lib.turbodb_enable_branching.argtypes = [ctypes.c_void_p]
+_lib.turbodb_enable_branching.restype = ctypes.c_int
+
+_lib.turbodb_create_branch.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32,
+    ctypes.c_char_p, ctypes.c_uint32,
+]
+_lib.turbodb_create_branch.restype = ctypes.c_int
+
+_lib.turbodb_branch_write.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32,
+    ctypes.c_char_p, ctypes.c_uint32,
+    ctypes.c_char_p, ctypes.c_uint32,
+]
+_lib.turbodb_branch_write.restype = ctypes.c_int
+
+_lib.turbodb_branch_read.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32,
+    ctypes.c_char_p, ctypes.c_uint32,
+    ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_uint32),
+]
+_lib.turbodb_branch_read.restype = ctypes.c_int
+
+_lib.turbodb_branch_merge.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+_lib.turbodb_branch_merge.restype = ctypes.c_int

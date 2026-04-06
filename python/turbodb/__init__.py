@@ -223,6 +223,38 @@ class Collection:
             return f"Collection('{self._name}')"
         return f"Collection('{self._tenant}/{self._name}')"
 
+    # ─── Branch operations ─────────────────────────────────────────────
+
+    def create_branch(self, name: str, agent_id: str = "default"):
+        nb = name.encode("utf-8")
+        ab = agent_id.encode("utf-8")
+        rc = _ffi._lib.turbodb_create_branch(self._handle, nb, len(nb), ab, len(ab))
+        if rc != 0:
+            raise RuntimeError(f"Failed to create branch '{name}'")
+
+    def branch_write(self, branch: str, key: str, value: str):
+        bb = branch.encode("utf-8")
+        kb = key.encode("utf-8")
+        vb = value.encode("utf-8")
+        rc = _ffi._lib.turbodb_branch_write(self._handle, bb, len(bb), kb, len(kb), vb, len(vb))
+        if rc != 0:
+            raise RuntimeError(f"Branch write failed")
+
+    def branch_read(self, branch: str, key: str) -> str:
+        bb = branch.encode("utf-8")
+        kb = key.encode("utf-8")
+        out_val = ctypes.c_char_p()
+        out_len = ctypes.c_uint32()
+        rc = _ffi._lib.turbodb_branch_read(self._handle, bb, len(bb), kb, len(kb), ctypes.byref(out_val), ctypes.byref(out_len))
+        if rc != 0:
+            return None
+        return ctypes.string_at(out_val, out_len.value).decode("utf-8", errors="replace")
+
+    def branch_merge(self, branch: str) -> int:
+        """Merge branch into main. Returns 0 on success, >0 = number of conflicts."""
+        bb = branch.encode("utf-8")
+        return _ffi._lib.turbodb_branch_merge(self._handle, bb, len(bb))
+
 
 class Database:
     """A TurboDB database instance."""

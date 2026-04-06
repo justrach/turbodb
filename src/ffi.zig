@@ -569,3 +569,42 @@ export fn turbodb_search_hybrid(
     out.count = @intCast(result.docs.len);
     return 0;
 }
+
+// ── Branch operations ────────────────────────────────────────────────────────
+
+export fn turbodb_enable_branching(col_handle: *anyopaque) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    col.enableBranching() catch return -1;
+    return 0;
+}
+
+export fn turbodb_create_branch(col_handle: *anyopaque, name_ptr: [*]const u8, name_len: u32, agent_ptr: [*]const u8, agent_len: u32) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    _ = col.createBranch(name_ptr[0..name_len], agent_ptr[0..agent_len]) catch return -1;
+    return 0;
+}
+
+export fn turbodb_branch_write(col_handle: *anyopaque, branch_name: [*]const u8, branch_len: u32, key: [*]const u8, key_len: u32, val: [*]const u8, val_len: u32) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const br = col.getBranch(branch_name[0..branch_len]) orelse return -1;
+    col.writeOnBranch(br, key[0..key_len], val[0..val_len]) catch return -1;
+    return 0;
+}
+
+export fn turbodb_branch_read(col_handle: *anyopaque, branch_name: [*]const u8, branch_len: u32, key: [*]const u8, key_len: u32, out_val: *[*]const u8, out_len: *u32) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const br = col.getBranch(branch_name[0..branch_len]) orelse return -1;
+    const val = col.getOnBranch(br, key[0..key_len]) orelse return -1;
+    out_val.* = val.ptr;
+    out_len.* = @intCast(val.len);
+    return 0;
+}
+
+export fn turbodb_branch_merge(col_handle: *anyopaque, branch_name: [*]const u8, branch_len: u32) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const br = col.getBranch(branch_name[0..branch_len]) orelse return -1;
+    var result = col.mergeBranch(br, alloc) catch return -1;
+    defer result.deinit();
+    if (result.conflicts.len > 0) return @intCast(result.conflicts.len); // positive = conflict count
+    return 0; // 0 = success, no conflicts
+}

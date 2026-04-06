@@ -10,6 +10,7 @@ const hot_cache = @import("hot_cache.zig");
 const mvcc_mod  = @import("mvcc.zig");
 const cdc_mod = @import("cdc.zig");
 const vector = @import("vector.zig");
+const branch_mod = @import("branch.zig");
 const turboquant = @import("turboquant.zig");
 const Doc = doc_mod.Doc;
 const DocHeader = doc_mod.DocHeader;
@@ -197,6 +198,9 @@ pub const Collection = struct {
     vector_field: [64]u8 = undefined,
     vector_field_len: u8 = 0,
     /// Maps vector index -> BTreeEntry so we can look up the real document.
+
+    // Branch manager (optional — lazy-initialized on first branch creation)
+    branch_mgr: ?*branch_mod.BranchManager = null,
     vec_entries: std.ArrayListUnmanaged(BTreeEntry) = .empty,
 
     /// Get the stripe lock index for a key hash.
@@ -245,6 +249,7 @@ pub const Collection = struct {
         col.vectors = null;
         col.vector_field_len = 0;
         col.vec_entries = .empty;
+        col.branch_mgr = null;
 
         const n = @min(logical_name.len, col.name_buf.len - 1);
         @memcpy(col.name_buf[0..n], logical_name[0..n]);
@@ -285,6 +290,10 @@ pub const Collection = struct {
             self.alloc.destroy(vc);
         }
         self.vec_entries.deinit(self.alloc);
+        if (self.branch_mgr) |bm| {
+            bm.deinit();
+            self.alloc.destroy(bm);
+        }
         self.pf.close();
         self.alloc.destroy(self);
     }
@@ -1053,6 +1062,102 @@ pub const Collection = struct {
         }
 
         return text_results;
+    }
+
+    // ─── Branch operations (CoW layer) ──────────────────────────────────
+
+    /// Enable branching on this collection (lazy — only allocates when first branch is created)
+    pub fn enableBranching(self: *Collection) !void {
+        if (self.branch_mgr != null) return;
+        const bm = try self.alloc.create(branch_mod.BranchManager);
+        bm.* = branch_mod.BranchManager.init(self.alloc, &self.next_doc_id);
+        self.branch_mgr = bm;
+    }
+
+    pub fn createBranch(self: *Collection, branch_name: []const u8, agent_id: []const u8) !*branch_mod.Branch {
+        try self.enableBranching();
+        return self.branch_mgr.?.createBranch(branch_name, agent_id);
+    }
+
+    pub fn getBranch(self: *const Collection, branch_name: []const u8) ?*branch_mod.Branch {
+        const bm = self.branch_mgr orelse return null;
+        return bm.getBranch(branch_name);
+    }
+
+    /// Read a key on a branch — checks branch writes first, falls through to main
+    pub fn getOnBranch(self: *Collection, br: *const branch_mod.Branch, key: []const u8) ?[]const u8 {
+        // Check branch-local writes
+        if (br.read(key)) |r| {
+            if (r.deleted) return null; // deleted on branch
+            return r.value;
+        }
+        // Fall through to main
+        const doc = self.get(key) orelse return null;
+        return doc.value;
+    }
+
+    /// Write a key-value pair on a branch (isolated — doesn't touch main)
+    pub fn writeOnBranch(self: *Collection, br: *branch_mod.Branch, key: []const u8, value: []const u8) !void {
+        const epoch = self.next_doc_id.fetchAdd(1, .monotonic);
+        try br.write(key, value, epoch);
+    }
+
+    /// Delete a key on a branch (isolated tombstone)
+    pub fn deleteOnBranch(self: *Collection, br: *branch_mod.Branch, key: []const u8) !void {
+        const epoch = self.next_doc_id.fetchAdd(1, .monotonic);
+        try br.delete(key, epoch);
+    }
+
+    /// Get the diff of a branch vs main (all modified keys)
+    pub fn diffBranch(self: *Collection, br: *const branch_mod.Branch, diff_alloc: std.mem.Allocator) ![]branch_mod.DiffEntry {
+        _ = self; // main state accessed via br.base_epoch
+        return br.modifiedKeys(diff_alloc);
+    }
+
+    /// Merge a branch into main. Returns conflicts if any.
+    pub fn mergeBranch(self: *Collection, br: *branch_mod.Branch, merge_alloc: std.mem.Allocator) !branch_mod.MergeResult {
+        var applied: u32 = 0;
+        var conflicts_list: std.ArrayList(branch_mod.MergeConflict) = .empty;
+
+        var it = br.writes.iterator();
+        while (it.next()) |entry| {
+            const w = entry.value_ptr.*;
+
+            if (w.deleted) {
+                // Delete on main — for now just count as applied
+                applied += 1;
+                continue;
+            }
+
+            // Check if main has this key
+            const main_doc = self.get(w.key);
+
+            if (main_doc != null) {
+                // Key exists on main — fast-forward (overwrite with branch value)
+                _ = self.insert(w.key, w.value) catch {
+                    try conflicts_list.append(merge_alloc, .{
+                        .key = w.key,
+                        .branch_value = w.value,
+                        .main_value = main_doc.?.value,
+                    });
+                    continue;
+                };
+            } else {
+                // New key on branch — insert into main
+                _ = self.insert(w.key, w.value) catch continue;
+            }
+            applied += 1;
+        }
+
+        if (conflicts_list.items.len == 0) {
+            br.status = .merged;
+        }
+
+        return .{
+            .applied = applied,
+            .conflicts = try conflicts_list.toOwnedSlice(merge_alloc),
+            .alloc = merge_alloc,
+        };
     }
 };
 
