@@ -1221,6 +1221,153 @@ pub const Collection = struct {
         const bm = self.branch_mgr orelse return try list_alloc.alloc([]const u8, 0);
         return bm.listBranches(list_alloc);
     }
+
+    // ─── Smart Context Discovery ─────────────────────────────────────────
+
+    pub const ContextResult = struct {
+        /// Files matching the text query (trigram search)
+        matching_files: []Doc,
+        /// Files that reference/call symbols found in matching files
+        related_files: []Doc,
+        /// Test files (keys containing "test" that also match the query)
+        test_files: []Doc,
+        /// Recent changes to matching files (MVCC history)
+        recent_versions: u32,
+        /// Total files scanned
+        total_files: u32,
+        ctx_alloc: std.mem.Allocator,
+
+        pub fn deinit(self: *ContextResult) void {
+            self.ctx_alloc.free(self.matching_files);
+            self.ctx_alloc.free(self.related_files);
+            self.ctx_alloc.free(self.test_files);
+        }
+    };
+
+    /// Smart context discovery — combines text search, caller analysis, test discovery,
+    /// and MVCC history in a single call. Gives an agent everything it needs to understand
+    /// a code area.
+    pub fn discoverContext(
+        self: *Collection,
+        query: []const u8,
+        limit: u32,
+        ctx_alloc: std.mem.Allocator,
+    ) !ContextResult {
+        // Phase 1: Primary search — find files matching the query
+        const primary = self.searchText(query, limit * 2, ctx_alloc) catch |e| {
+            if (e == error.OutOfMemory) return e;
+            return ContextResult{
+                .matching_files = &.{},
+                .related_files = &.{},
+                .test_files = &.{},
+                .recent_versions = 0,
+                .total_files = @intCast(self.tri.fileCount()),
+                .ctx_alloc = ctx_alloc,
+            };
+        };
+
+        // Phase 2: Find related files — search for identifiers found in primary results.
+        // Extract potential function/symbol names from primary results and search for callers.
+        var related_set = std.StringHashMap(void).init(ctx_alloc);
+        defer related_set.deinit();
+
+        // Mark primary result keys so we don't duplicate them
+        for (primary.docs) |doc| {
+            related_set.put(doc.key, {}) catch {};
+        }
+
+        var related_list: std.ArrayListUnmanaged(Doc) = .empty;
+
+        // For each primary match, extract identifiers and search for them.
+        // Simple heuristic: look for "fn <name>" patterns, search for "<name>(".
+        for (primary.docs) |doc| {
+            var pos: usize = 0;
+            while (pos + 3 < doc.value.len) : (pos += 1) {
+                // Look for "fn " pattern
+                if (doc.value[pos] == 'f' and doc.value[pos + 1] == 'n' and doc.value[pos + 2] == ' ') {
+                    // Extract function name
+                    const name_start = pos + 3;
+                    var name_end = name_start;
+                    while (name_end < doc.value.len and
+                        ((doc.value[name_end] >= 'a' and doc.value[name_end] <= 'z') or
+                        (doc.value[name_end] >= 'A' and doc.value[name_end] <= 'Z') or
+                        (doc.value[name_end] >= '0' and doc.value[name_end] <= '9') or
+                        doc.value[name_end] == '_'))
+                    {
+                        name_end += 1;
+                    }
+
+                    if (name_end > name_start and name_end - name_start >= 3) {
+                        const fn_name = doc.value[name_start..name_end];
+                        // Search for callers of this function
+                        if (self.searchText(fn_name, 5, ctx_alloc)) |caller_results| {
+                            for (caller_results.docs) |caller| {
+                                if (!related_set.contains(caller.key)) {
+                                    related_set.put(caller.key, {}) catch {};
+                                    related_list.append(ctx_alloc, caller) catch {};
+                                }
+                            }
+                            // Don't deinit caller_results — docs are borrowed from mmap
+                        } else |_| {}
+                    }
+                }
+            }
+        }
+
+        // Phase 3: Find test files — search for "test" + query terms.
+        var test_list: std.ArrayListUnmanaged(Doc) = .empty;
+
+        if (self.searchText("test", limit, ctx_alloc)) |test_results| {
+            for (test_results.docs) |doc| {
+                // Check if this test file relates to our query
+                if (containsInsensitive(doc.key, query) or containsInsensitive(doc.value, query)) {
+                    if (!related_set.contains(doc.key)) {
+                        test_list.append(ctx_alloc, doc) catch {};
+                    }
+                }
+            }
+        } else |_| {}
+
+        // Phase 4: Count recent versions of matching files
+        var recent_versions: u32 = 0;
+        for (primary.docs) |doc| {
+            if (doc.header.version > 0) {
+                recent_versions += doc.header.version;
+            }
+        }
+
+        return ContextResult{
+            .matching_files = primary.docs,
+            .related_files = related_list.toOwnedSlice(ctx_alloc) catch &.{},
+            .test_files = test_list.toOwnedSlice(ctx_alloc) catch &.{},
+            .recent_versions = recent_versions,
+            .total_files = @intCast(self.tri.fileCount()),
+            .ctx_alloc = ctx_alloc,
+        };
+    }
+
+    /// Smart context discovery on a branch — overlays branch modifications on results.
+    pub fn discoverContextOnBranch(
+        self: *Collection,
+        br: *const branch_mod.Branch,
+        query: []const u8,
+        limit: u32,
+        ctx_alloc: std.mem.Allocator,
+    ) !ContextResult {
+        // Same as discoverContext but overlays branch modifications
+        const result = try self.discoverContext(query, limit, ctx_alloc);
+
+        // Overlay branch writes on matching_files
+        for (result.matching_files) |*doc| {
+            if (br.read(doc.key)) |r| {
+                if (!r.deleted) {
+                    if (r.value) |v| doc.value = v;
+                }
+            }
+        }
+
+        return result;
+    }
 };
 
 /// Background thread that drains the index queue and builds trigram indexes.

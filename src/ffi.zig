@@ -655,3 +655,45 @@ export fn turbodb_list_branches(
 export fn turbodb_free_json(ptr: [*]u8, len: u32) void {
     alloc.free(ptr[0..len]);
 }
+
+/// Discover context for an agent task — returns matching files, callers, tests in one call.
+/// Output is a JSON string with the context.
+export fn turbodb_discover_context(
+    col_handle: *anyopaque,
+    query: [*]const u8,
+    query_len: u32,
+    limit: u32,
+    out_json: *[*]u8,
+    out_len: *u32,
+) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    var result = col.discoverContext(query[0..query_len], limit, alloc) catch return -1;
+    defer result.deinit();
+
+    // Format as JSON
+    var buf: std.ArrayList(u8) = .empty;
+    const w = buf.writer(alloc);
+
+    w.writeAll("{\"matching_files\":[") catch return -1;
+    for (result.matching_files, 0..) |d, i| {
+        if (i > 0) w.writeByte(',') catch return -1;
+        std.fmt.format(w, "{{\"key\":\"{s}\",\"size\":{d}}}", .{ d.key, d.value.len }) catch return -1;
+    }
+    w.writeAll("],\"related_files\":[") catch return -1;
+    for (result.related_files, 0..) |d, i| {
+        if (i > 0) w.writeByte(',') catch return -1;
+        std.fmt.format(w, "{{\"key\":\"{s}\"}}", .{d.key}) catch return -1;
+    }
+    w.writeAll("],\"test_files\":[") catch return -1;
+    for (result.test_files, 0..) |d, i| {
+        if (i > 0) w.writeByte(',') catch return -1;
+        std.fmt.format(w, "{{\"key\":\"{s}\"}}", .{d.key}) catch return -1;
+    }
+    std.fmt.format(w, "],\"recent_versions\":{d},\"total_files\":{d}}}", .{ result.recent_versions, result.total_files }) catch return -1;
+
+    // Copy to output
+    const json = buf.toOwnedSlice(alloc) catch return -1;
+    out_json.* = json.ptr;
+    out_len.* = @intCast(json.len);
+    return 0;
+}

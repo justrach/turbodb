@@ -458,3 +458,10 @@ _lib.turbodb_list_branches.restype = ctypes.c_int
 # turbodb_free_json(ptr, len) -> void
 _lib.turbodb_free_json.argtypes = [ctypes.c_char_p, ctypes.c_uint32]
 _lib.turbodb_free_json.restype = None
+
+# turbodb_discover_context(col, query, query_len, limit, out_json, out_len) -> c_int
+_lib.turbodb_discover_context.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.c_uint32,
+    ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_uint32),
+]
+_lib.turbodb_discover_context.restype = ctypes.c_int

@@ -9,6 +9,7 @@
 ///   GET    /collections          list collections
 ///   GET    /health               health check
 ///   GET    /metrics              server metrics
+///   GET    /context/:col         smart context discovery (q, limit query params)
 const std = @import("std");
 const activity = @import("activity.zig");
 const collection = @import("collection.zig");
@@ -258,6 +259,16 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
         return handleSearch(srv, requestTenant(raw, query), col_name, q, limit_val, alloc);
     }
 
+    // Route: /context/:col?q=...&limit=20
+    if (std.mem.startsWith(u8, path, "/context/") and std.mem.eql(u8, method, "GET")) {
+        const col_name = path[9..];
+        const q_raw = qparam(query, "q") orelse return err(400, "missing q parameter");
+        var decode_buf: [4096]u8 = undefined;
+        const q = urlDecode(q_raw, &decode_buf) orelse q_raw;
+        const limit_val: u32 = qparamInt(query, "limit") orelse 20;
+        return handleDiscoverContext(srv, requestTenant(raw, query), col_name, q, limit_val, alloc);
+    }
+
     // Routes under /branch/:col[/:branch[/:key]]
     if (std.mem.startsWith(u8, path, "/branch/")) {
         const rest = path[8..]; // after "/branch/"
@@ -486,6 +497,44 @@ fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query
                if (d.value.len > 0) d.value else "{}" }) catch {};
     }
     w.writeAll("]}") catch {};
+    return ok(getBodyBuf()[0..fbs.pos]);
+}
+
+fn handleDiscoverContext(srv: *Server, tenant_id: []const u8, col_name: []const u8, query: []const u8, limit: u32, alloc: std.mem.Allocator) usize {
+    const start_ns = std.time.nanoTimestamp();
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+    var result = col.discoverContext(query, limit, alloc) catch return err(500, "context discovery failed");
+    defer result.deinit();
+    var bytes_read: u64 = 0;
+    for (result.matching_files) |d| bytes_read += d.key.len + d.value.len;
+    srv.recordQueryCost(tenant_id, "context", result.matching_files.len, bytes_read, start_ns);
+
+    var fbs = std.io.fixedBufferStream(getBodyBuf());
+    const w = fbs.writer();
+
+    // Write JSON: matching_files
+    w.writeAll("{\"query\":\"") catch {};
+    for (query) |ch| {
+        if (ch == '"' or ch == '\\') { w.writeByte('\\') catch {}; }
+        w.writeByte(ch) catch {};
+    }
+    w.writeAll("\",\"matching_files\":[") catch {};
+    for (result.matching_files, 0..) |d, i| {
+        if (i > 0) w.writeByte(',') catch {};
+        std.fmt.format(w, "{{\"key\":\"{s}\",\"size\":{d}}}", .{ d.key, d.value.len }) catch {};
+    }
+    w.writeAll("],\"related_files\":[") catch {};
+    for (result.related_files, 0..) |d, i| {
+        if (i > 0) w.writeByte(',') catch {};
+        std.fmt.format(w, "{{\"key\":\"{s}\"}}", .{d.key}) catch {};
+    }
+    w.writeAll("],\"test_files\":[") catch {};
+    for (result.test_files, 0..) |d, i| {
+        if (i > 0) w.writeByte(',') catch {};
+        std.fmt.format(w, "{{\"key\":\"{s}\"}}", .{d.key}) catch {};
+    }
+    std.fmt.format(w, "],\"recent_versions\":{d},\"total_files\":{d}}}", .{ result.recent_versions, result.total_files }) catch {};
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 

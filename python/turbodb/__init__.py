@@ -297,6 +297,32 @@ class Collection:
             if out_json.value and out_len.value > 0:
                 _ffi._lib.turbodb_free_json(out_json, out_len.value)
 
+    def discover_context(self, query: str, limit: int = 20):
+        """Smart context discovery -- returns matching files, callers, tests in one call.
+
+        Instead of making 5+ search calls, this gives an agent everything it needs:
+        - matching_files: files matching the query
+        - related_files: files that call/import functions from matching files
+        - test_files: test files related to the query
+        - recent_versions: total version count (how actively edited)
+        - total_files: total files in collection
+        """
+        qb = query.encode("utf-8")
+        out_json = ctypes.c_char_p()
+        out_len = ctypes.c_uint32()
+        rc = _ffi._lib.turbodb_discover_context(
+            self._handle, qb, len(qb), limit,
+            ctypes.byref(out_json), ctypes.byref(out_len))
+        if rc != 0:
+            return {"matching_files": [], "related_files": [], "test_files": [],
+                    "recent_versions": 0, "total_files": 0}
+        try:
+            json_str = ctypes.string_at(out_json, out_len.value).decode("utf-8")
+            return json.loads(json_str)
+        finally:
+            if out_json.value and out_len.value > 0:
+                _ffi._lib.turbodb_free_json(out_json, out_len.value)
+
 class Database:
     """A TurboDB database instance."""
 
