@@ -116,6 +116,12 @@ pub const Branch = struct {
         }
         return entries.toOwnedSlice(alloc);
     }
+
+    /// Resolve a conflict by providing the final value for a key.
+    /// Just overwrites the branch's value — same as write().
+    pub fn resolveConflict(self: *Branch, key: []const u8, resolved_value: []const u8, epoch: u64) !void {
+        try self.write(key, resolved_value, epoch);
+    }
 };
 
 pub const DiffEntry = struct {

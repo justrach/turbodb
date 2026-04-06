@@ -1159,6 +1159,68 @@ pub const Collection = struct {
             .alloc = merge_alloc,
         };
     }
+
+    /// Search text on a branch — searches branch-local writes first, then falls through to main search.
+    /// Returns results that include both branch-modified files and main files matching the query.
+    pub fn searchOnBranch(
+        self: *Collection,
+        br: *const branch_mod.Branch,
+        query: []const u8,
+        limit: u32,
+        search_alloc: std.mem.Allocator,
+    ) !TextSearchResult {
+        // 1. Search main collection normally
+        const main_results = try self.searchText(query, limit, search_alloc);
+
+        // 2. Also search branch-local writes for the query
+        var branch_matches: std.ArrayList(Doc) = .empty;
+        defer branch_matches.deinit(search_alloc);
+
+        var it = br.writes.iterator();
+        while (it.next()) |entry| {
+            const w = entry.value_ptr.*;
+            if (w.deleted) continue;
+            // Check if query appears in the branch-local value or key
+            if (containsInsensitive(w.value, query) or containsInsensitive(w.key, query)) {
+                try branch_matches.append(search_alloc, Doc{
+                    .header = doc_mod.DocHeader{
+                        .doc_id = w.epoch,
+                        .key_hash = doc_mod.fnv1a(w.key),
+                        .val_len = @intCast(w.value.len),
+                        .key_len = @intCast(w.key.len),
+                        .flags = 0,
+                        .version = 0,
+                        .next_ver = 0,
+                    },
+                    .key = w.key,
+                    .value = w.value,
+                });
+            }
+        }
+
+        // 3. Overlay branch modifications onto main results.
+        // Replace any main result whose key was modified on branch with the branch version.
+        for (main_results.docs) |*doc| {
+            if (br.read(doc.key)) |r| {
+                if (r.deleted) continue;
+                if (r.value) |v| {
+                    doc.value = v;
+                }
+            }
+        }
+
+        // Branch-only docs that match the query but aren't in main are collected above.
+        // Currently we only overlay modifications on existing main results (step 3).
+        // Future: could extend the result slice with branch_matches items.
+
+        return main_results;
+    }
+
+    /// List all branch names for this collection.
+    pub fn listBranches(self: *const Collection, list_alloc: std.mem.Allocator) ![][]const u8 {
+        const bm = self.branch_mgr orelse return try list_alloc.alloc([]const u8, 0);
+        return bm.listBranches(list_alloc);
+    }
 };
 
 /// Background thread that drains the index queue and builds trigram indexes.

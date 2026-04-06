@@ -608,3 +608,50 @@ export fn turbodb_branch_merge(col_handle: *anyopaque, branch_name: [*]const u8,
     if (result.conflicts.len > 0) return @intCast(result.conflicts.len); // positive = conflict count
     return 0; // 0 = success, no conflicts
 }
+
+export fn turbodb_branch_search(
+    col_handle: *anyopaque,
+    branch_name: [*]const u8,
+    branch_len: u32,
+    query_ptr: [*]const u8,
+    query_len: u32,
+    limit: u32,
+    out: *TurboScanHandle,
+) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const br = col.getBranch(branch_name[0..branch_len]) orelse return -1;
+    const result = col.searchOnBranch(br, query_ptr[0..query_len], limit, alloc) catch return -1;
+    out.docs_ptr = result.docs.ptr;
+    out.count = @intCast(result.docs.len);
+    return 0;
+}
+
+export fn turbodb_list_branches(
+    col_handle: *anyopaque,
+    out_json: *[*]u8,
+    out_len: *u32,
+) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const names = col.listBranches(alloc) catch return -1;
+    defer alloc.free(names);
+
+    // Build JSON array of branch names
+    var buf: std.ArrayList(u8) = .empty;
+    buf.append(alloc, '[') catch return -1;
+    for (names, 0..) |name, i| {
+        if (i > 0) buf.append(alloc, ',') catch return -1;
+        buf.append(alloc, '"') catch return -1;
+        buf.appendSlice(alloc, name) catch return -1;
+        buf.append(alloc, '"') catch return -1;
+    }
+    buf.append(alloc, ']') catch return -1;
+
+    const owned = buf.toOwnedSlice(alloc) catch return -1;
+    out_json.* = owned.ptr;
+    out_len.* = @intCast(owned.len);
+    return 0;
+}
+
+export fn turbodb_free_json(ptr: [*]u8, len: u32) void {
+    alloc.free(ptr[0..len]);
+}

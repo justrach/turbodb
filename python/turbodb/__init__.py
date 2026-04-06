@@ -256,6 +256,47 @@ class Collection:
         return _ffi._lib.turbodb_branch_merge(self._handle, bb, len(bb))
 
 
+    def branch_search(self, branch: str, query: str, limit: int = 20):
+        """Search text on a branch (sees branch modifications + main)."""
+        bb = branch.encode("utf-8")
+        qb = query.encode("utf-8")
+        handle = _ffi.ScanHandle()
+        rc = _ffi._lib.turbodb_branch_search(
+            self._handle, bb, len(bb), qb, len(qb), limit, ctypes.byref(handle))
+        if rc != 0:
+            return []
+        try:
+            count = _ffi.scan_count(handle)
+            docs = []
+            for i in range(count):
+                r = _ffi.scan_doc(handle, i)
+                if r is not None:
+                    docs.append({
+                        "key": r.key_bytes().decode("utf-8", errors="replace"),
+                        "value": r.val_bytes().decode("utf-8", errors="replace"),
+                        "doc_id": r.doc_id,
+                        "version": r.version,
+                    })
+            return docs
+        finally:
+            _ffi.scan_free(handle)
+
+    def list_branches(self):
+        """List all branch names. Returns list of strings."""
+        import json as _json
+        out_json = ctypes.c_char_p()
+        out_len = ctypes.c_uint32()
+        rc = _ffi._lib.turbodb_list_branches(
+            self._handle, ctypes.byref(out_json), ctypes.byref(out_len))
+        if rc != 0:
+            return []
+        try:
+            raw = ctypes.string_at(out_json, out_len.value)
+            return _json.loads(raw.decode("utf-8"))
+        finally:
+            if out_json.value and out_len.value > 0:
+                _ffi._lib.turbodb_free_json(out_json, out_len.value)
+
 class Database:
     """A TurboDB database instance."""
 

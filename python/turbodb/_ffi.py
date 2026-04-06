@@ -440,3 +440,21 @@ _lib.turbodb_branch_read.restype = ctypes.c_int
 
 _lib.turbodb_branch_merge.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
 _lib.turbodb_branch_merge.restype = ctypes.c_int
+
+# turbodb_branch_search(col, branch, branch_len, query, query_len, limit, out) -> c_int
+_lib.turbodb_branch_search.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32,
+    ctypes.c_char_p, ctypes.c_uint32,
+    ctypes.c_uint32, ctypes.POINTER(ScanHandle),
+]
+_lib.turbodb_branch_search.restype = ctypes.c_int
+
+# turbodb_list_branches(col, out_json, out_len) -> c_int
+_lib.turbodb_list_branches.argtypes = [
+    ctypes.c_void_p, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_uint32),
+]
+_lib.turbodb_list_branches.restype = ctypes.c_int
+
+# turbodb_free_json(ptr, len) -> void
+_lib.turbodb_free_json.argtypes = [ctypes.c_char_p, ctypes.c_uint32]
+_lib.turbodb_free_json.restype = None
