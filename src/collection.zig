@@ -358,8 +358,18 @@ pub const Collection = struct {
         const hdr = doc_mod.newHeader(doc_id, key, value);
         const d = Doc{ .header = hdr, .key = key, .value = value };
 
+        // Use stack buffer for small docs, heap for large ones (code files can be 100KB+)
         var enc_buf: [65536]u8 = undefined;
-        const enc = try d.encodeBuf(&enc_buf);
+        const total_size = DocHeader.size + key.len + value.len;
+        var heap_buf: ?[]u8 = null;
+        defer if (heap_buf) |hb| self.alloc.free(hb);
+        const buf = if (total_size <= enc_buf.len)
+            &enc_buf
+        else blk: {
+            heap_buf = try self.alloc.alloc(u8, total_size + 64);
+            break :blk heap_buf.?;
+        };
+        const enc = try d.encodeBuf(buf);
 
         // Write to WAL buffer (background flusher will commit periodically).
         const txn = self.wal_log.next_lsn.load(.monotonic);

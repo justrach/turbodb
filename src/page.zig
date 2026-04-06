@@ -1,7 +1,7 @@
 /// TurboDB — 4KB page allocator
 const std = @import("std");
 const mmap = @import("mmap");
-pub const PAGE_SIZE: usize = 4096;
+pub const PAGE_SIZE: usize = 65536; // 64KB — supports code files up to ~65KB per doc
 pub const PAGE_HEADER_SIZE: usize = 32;
 pub const PAGE_USABLE: usize = PAGE_SIZE - PAGE_HEADER_SIZE;
 
