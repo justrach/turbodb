@@ -35,6 +35,21 @@ __version__ = _ffi.version()
 __all__ = ["Database", "Collection", "VectorColumn", "crypto", "__version__"]
 
 
+def _float_ptr(data):
+    """Get a c_float pointer from a list, tuple, or numpy array — zero-copy for numpy."""
+    try:
+        import numpy as np
+        if isinstance(data, np.ndarray):
+            arr = np.ascontiguousarray(data, dtype=np.float32)
+            return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), len(arr), arr
+        # Convert list/tuple to numpy for zero-copy
+        arr = np.ascontiguousarray(data, dtype=np.float32)
+        return arr.ctypes.data_as(ctypes.POINTER(ctypes.c_float)), len(arr), arr
+    except ImportError:
+        # No numpy — fall back to ctypes array (slow but works)
+        arr = (ctypes.c_float * len(data))(*data)
+        return arr, len(data), arr
+
 class Collection:
     """A TurboDB document collection."""
 
@@ -123,6 +138,27 @@ class Collection:
         finally:
             _ffi.scan_free(handle)
 
+    def insert_with_embedding(self, key: str, value: str, embedding):
+        """Insert a document with a pre-computed embedding vector.
+        
+        This is the fast path — embedding is passed directly to Zig via zero-copy 
+        numpy pointer (no JSON parsing, no ctypes array construction).
+        
+        Args:
+            key: Document key
+            value: Document value (plain text, no need to include embedding in JSON)
+            embedding: list, tuple, or numpy array of floats
+        """
+        kb = key.encode("utf-8")
+        vb = value.encode("utf-8")
+        ptr, dims, _ref = _float_ptr(embedding)  # _ref keeps numpy array alive
+        out_id = ctypes.c_uint64(0)
+        rc = _ffi._lib.turbodb_insert_with_embedding(
+            self._handle, kb, len(kb), vb, len(vb), ptr, dims, ctypes.byref(out_id)
+        )
+        if rc != 0:
+            raise RuntimeError("insert_with_embedding failed")
+        return int(out_id.value)
     def flush_index(self):
         """Block until background index builder has finished processing all pending items."""
         _ffi._lib.turbodb_flush_index(self._handle)

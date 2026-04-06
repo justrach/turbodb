@@ -113,6 +113,15 @@ _lib.turbodb_insert.argtypes = [
 ]
 _lib.turbodb_insert.restype = ctypes.c_int
 
+# turbodb_insert_with_embedding(col, key, key_len, val, val_len, embedding, dims, out_id)
+_lib.turbodb_insert_with_embedding.argtypes = [
+    ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+    ctypes.c_char_p, ctypes.c_size_t,
+    ctypes.POINTER(ctypes.c_float), ctypes.c_uint32,
+    ctypes.POINTER(ctypes.c_uint64),
+]
+_lib.turbodb_insert_with_embedding.restype = ctypes.c_int
+
 # turbodb_get(col, key, key_len, out) -> c_int
 _lib.turbodb_get.argtypes = [
     ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
