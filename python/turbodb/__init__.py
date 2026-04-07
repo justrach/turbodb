@@ -255,6 +255,29 @@ class Collection:
         bb = branch.encode("utf-8")
         return _ffi._lib.turbodb_branch_merge(self._handle, bb, len(bb))
 
+    def branch_diff(self, branch: str):
+        """Get line-level diff for a branch vs main. Computed in Zig, not Python.
+        
+        Returns dict: {"files": [{"key": "src/auth.zig", "lines": [
+            {"no": 1, "kind": "same", "text": "pub fn auth()..."},
+            {"no": 2, "kind": "removed", "text": "    return false;"},
+            {"no": 2, "kind": "added", "text": "    return verify(token);"},
+        ]}]}
+        """
+        bb = branch.encode("utf-8")
+        out_json = ctypes.c_char_p()
+        out_len = ctypes.c_uint32()
+        rc = _ffi._lib.turbodb_branch_diff(
+            self._handle, bb, len(bb), ctypes.byref(out_json), ctypes.byref(out_len))
+        if rc != 0:
+            return {"files": []}
+        try:
+            raw = ctypes.string_at(out_json, out_len.value)
+            return json.loads(raw.decode("utf-8"))
+        finally:
+            if out_json.value and out_len.value > 0:
+                _ffi._lib.turbodb_free_json(out_json, out_len.value)
+
 
     def branch_search(self, branch: str, query: str, limit: int = 20):
         """Search text on a branch (sees branch modifications + main)."""

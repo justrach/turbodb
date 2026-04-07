@@ -609,6 +609,76 @@ export fn turbodb_branch_merge(col_handle: *anyopaque, branch_name: [*]const u8,
     return 0; // 0 = success, no conflicts
 }
 
+/// Get line-level diff for a branch. Returns JSON with per-file diffs.
+/// Format: {"files":[{"key":"src/auth.zig","lines":[{"no":1,"kind":"same","text":"..."},{"no":2,"kind":"added","text":"..."},...]},...]}
+export fn turbodb_branch_diff(
+    col_handle: *anyopaque,
+    branch_name: [*]const u8,
+    branch_len: u32,
+    out_json: *[*]u8,
+    out_len: *u32,
+) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const br = col.getBranch(branch_name[0..branch_len]) orelse return -1;
+    const branch_mod = @import("branch.zig");
+
+    var buf: std.ArrayList(u8) = .empty;
+    const w = buf.writer(alloc);
+    w.writeAll("{\"files\":[") catch return -1;
+
+    var first_file = true;
+    var it = br.writes.iterator();
+    while (it.next()) |entry| {
+        const bw = entry.value_ptr.*;
+        if (bw.deleted) continue;
+
+        if (!first_file) w.writeByte(',') catch return -1;
+        first_file = false;
+
+        // Get main version for comparison
+        const main_doc = col.get(bw.key);
+        const old_val = if (main_doc) |d| d.value else "";
+
+        // Compute line diff
+        const diffs = branch_mod.lineDiff(old_val, bw.value, alloc) catch return -1;
+        defer alloc.free(diffs);
+
+        w.writeAll("{\"key\":\"") catch return -1;
+        w.writeAll(bw.key) catch return -1;
+        w.writeAll("\",\"lines\":[") catch return -1;
+
+        for (diffs, 0..) |d, di| {
+            if (di > 0) w.writeByte(',') catch return -1;
+            const kind_str = switch (d.kind) {
+                .same => "same",
+                .added => "added",
+                .removed => "removed",
+            };
+            std.fmt.format(w, "{{\"no\":{d},\"kind\":\"{s}\",\"text\":\"", .{ d.line_no, kind_str }) catch return -1;
+            // Escape text for JSON
+            for (d.text) |c| {
+                switch (c) {
+                    '"' => w.writeAll("\\\"") catch return -1,
+                    '\\' => w.writeAll("\\\\") catch return -1,
+                    '\n' => w.writeAll("\\n") catch return -1,
+                    '\r' => w.writeAll("\\r") catch return -1,
+                    '\t' => w.writeAll("\\t") catch return -1,
+                    else => w.writeByte(c) catch return -1,
+                }
+            }
+            w.writeAll("\"}") catch return -1;
+        }
+        w.writeAll("]}") catch return -1;
+    }
+
+    w.writeAll("]}") catch return -1;
+
+    const json = buf.toOwnedSlice(alloc) catch return -1;
+    out_json.* = json.ptr;
+    out_len.* = @intCast(json.len);
+    return 0;
+}
+
 export fn turbodb_branch_search(
     col_handle: *anyopaque,
     branch_name: [*]const u8,

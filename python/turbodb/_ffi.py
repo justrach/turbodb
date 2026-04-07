@@ -441,6 +441,9 @@ _lib.turbodb_branch_read.restype = ctypes.c_int
 _lib.turbodb_branch_merge.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
 _lib.turbodb_branch_merge.restype = ctypes.c_int
 
+_lib.turbodb_branch_diff.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32, ctypes.POINTER(ctypes.c_char_p), ctypes.POINTER(ctypes.c_uint32)]
+_lib.turbodb_branch_diff.restype = ctypes.c_int
+
 # turbodb_branch_search(col, branch, branch_len, query, query_len, limit, out) -> c_int
 _lib.turbodb_branch_search.argtypes = [
     ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32,

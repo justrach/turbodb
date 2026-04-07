@@ -213,6 +213,170 @@ pub const DiffEntry = struct {
     epoch: u64,
 };
 
+/// A single line change in a diff.
+pub const LineDiff = struct {
+    line_no: u32, // 1-indexed line number in the original (for removals) or new (for additions)
+    kind: enum(u8) { same, added, removed },
+    text: []const u8, // the line content (not owned — points into input slices)
+};
+
+/// Compute a line-by-line diff between two strings.
+/// Returns an array of LineDiff entries. Simple O(n+m) algorithm:
+/// splits both into lines, walks forward matching equal lines,
+/// marks unmatched lines as removed/added.
+pub fn lineDiff(old: []const u8, new: []const u8, alloc: Allocator) ![]LineDiff {
+    var result: std.ArrayList(LineDiff) = .empty;
+
+    // Split into lines
+    const old_lines = try splitLines(old, alloc);
+    defer alloc.free(old_lines);
+    const new_lines = try splitLines(new, alloc);
+    defer alloc.free(new_lines);
+
+    // Simple LCS-free diff: walk both line arrays with greedy matching
+    var oi: usize = 0;
+    var ni: usize = 0;
+
+    while (oi < old_lines.len and ni < new_lines.len) {
+        if (std.mem.eql(u8, old_lines[oi], new_lines[ni])) {
+            // Lines match — context
+            try result.append(alloc, .{
+                .line_no = @intCast(oi + 1),
+                .kind = .same,
+                .text = old_lines[oi],
+            });
+            oi += 1;
+            ni += 1;
+        } else {
+            // Try to find the new line ahead in old (deletion then continue)
+            // or old line ahead in new (addition then continue)
+            // Simple heuristic: look ahead up to 5 lines in each direction
+            var found_in_new: ?usize = null;
+            var found_in_old: ?usize = null;
+
+            for (0..@min(5, new_lines.len - ni)) |look| {
+                if (std.mem.eql(u8, old_lines[oi], new_lines[ni + look])) {
+                    found_in_new = look;
+                    break;
+                }
+            }
+            for (0..@min(5, old_lines.len - oi)) |look| {
+                if (std.mem.eql(u8, old_lines[oi + look], new_lines[ni])) {
+                    found_in_old = look;
+                    break;
+                }
+            }
+
+            if (found_in_new) |skip| {
+                // Lines were added in new
+                for (0..skip) |j| {
+                    try result.append(alloc, .{
+                        .line_no = @intCast(ni + j + 1),
+                        .kind = .added,
+                        .text = new_lines[ni + j],
+                    });
+                }
+                ni += skip;
+            } else if (found_in_old) |skip| {
+                // Lines were removed from old
+                for (0..skip) |j| {
+                    try result.append(alloc, .{
+                        .line_no = @intCast(oi + j + 1),
+                        .kind = .removed,
+                        .text = old_lines[oi + j],
+                    });
+                }
+                oi += skip;
+            } else {
+                // No match found — treat as remove old + add new
+                try result.append(alloc, .{
+                    .line_no = @intCast(oi + 1),
+                    .kind = .removed,
+                    .text = old_lines[oi],
+                });
+                try result.append(alloc, .{
+                    .line_no = @intCast(ni + 1),
+                    .kind = .added,
+                    .text = new_lines[ni],
+                });
+                oi += 1;
+                ni += 1;
+            }
+        }
+    }
+
+    // Remaining old lines = removed
+    while (oi < old_lines.len) : (oi += 1) {
+        try result.append(alloc, .{
+            .line_no = @intCast(oi + 1),
+            .kind = .removed,
+            .text = old_lines[oi],
+        });
+    }
+
+    // Remaining new lines = added
+    while (ni < new_lines.len) : (ni += 1) {
+        try result.append(alloc, .{
+            .line_no = @intCast(ni + 1),
+            .kind = .added,
+            .text = new_lines[ni],
+        });
+    }
+
+    return result.toOwnedSlice(alloc);
+}
+
+/// Split a string into lines (by \n). Returns slice of slices into the original string.
+fn splitLines(text: []const u8, alloc: Allocator) ![][]const u8 {
+    var lines: std.ArrayList([]const u8) = .empty;
+    var start: usize = 0;
+    for (text, 0..) |c, i| {
+        if (c == '\n') {
+            try lines.append(alloc, text[start..i]);
+            start = i + 1;
+        }
+    }
+    if (start <= text.len) {
+        try lines.append(alloc, text[start..]);
+    }
+    return lines.toOwnedSlice(alloc);
+}
+
+test "lineDiff detects added and removed lines" {
+    const alloc = std.testing.allocator;
+    const old = "line1\nline2\nline3\n";
+    const new = "line1\nline2_modified\nline3\nline4\n";
+
+    const diff = try lineDiff(old, new, alloc);
+    defer alloc.free(diff);
+
+    // Should have: same(line1), removed(line2), added(line2_modified), same(line3), added(line4)
+    var added: u32 = 0;
+    var removed: u32 = 0;
+    var same: u32 = 0;
+    for (diff) |d| {
+        switch (d.kind) {
+            .added => added += 1,
+            .removed => removed += 1,
+            .same => same += 1,
+        }
+    }
+    try std.testing.expect(added >= 1);
+    try std.testing.expect(removed >= 1);
+    try std.testing.expect(same >= 1);
+}
+
+test "lineDiff identical files" {
+    const alloc = std.testing.allocator;
+    const text = "aaa\nbbb\nccc\n";
+    const diff = try lineDiff(text, text, alloc);
+    defer alloc.free(diff);
+
+    for (diff) |d| {
+        try std.testing.expectEqual(d.kind, .same);
+    }
+}
+
 pub const MergeConflict = struct {
     key: []const u8,
     branch_value: []const u8,
