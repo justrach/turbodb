@@ -18,6 +18,7 @@ pub fn main() !void {
     var use_wire: bool = true; // wire protocol by default
     var use_http: bool = false;
     var unix_path: ?[]const u8 = null;
+    var auth_key: ?[]const u8 = null;
 
     // Replication flags
     var repl_enabled: bool = false;
@@ -44,6 +45,9 @@ pub fn main() !void {
         } else if (std.mem.eql(u8, args[i], "--unix") and i + 1 < args.len) {
             i += 1;
             unix_path = args[i];
+        } else if (std.mem.eql(u8, args[i], "--auth-key") and i + 1 < args.len) {
+            i += 1;
+            auth_key = args[i];
         } else if (std.mem.eql(u8, args[i], "--replicate")) {
             repl_enabled = true;
         } else if (std.mem.eql(u8, args[i], "--node-id") and i + 1 < args.len) {
@@ -67,6 +71,7 @@ pub fn main() !void {
                 \\  --http             HTTP REST API
                 \\  --both             run wire + HTTP (wire on port, HTTP on port+1)
                 \\  --unix <path>      also listen on a Unix domain socket
+                \\  --auth-key <key>   require this API key for all requests
                 \\
                 \\Replication (Calvin deterministic):
                 \\  --replicate        enable Calvin replication
@@ -87,6 +92,9 @@ pub fn main() !void {
                 \\
             , .{});
             return;
+        } else {
+            std.log.err("unknown flag: {s}", .{args[i]});
+            return error.InvalidArgument;
         }
     }
 
@@ -100,6 +108,12 @@ pub fn main() !void {
     std.log.info("Opening TurboDB at {s}", .{data_dir});
     const db = try collection.Database.open(alloc, data_dir);
     defer db.close();
+
+    // ── configure auth ────────────────────────────────────────────────────
+    if (auth_key) |key| {
+        _ = db.auth.addKey(key, "cli", .admin);
+        std.log.info("Auth enabled (--auth-key)", .{});
+    }
 
     // ── replication setup ─────────────────────────────────────────────────
     if (repl_enabled) {

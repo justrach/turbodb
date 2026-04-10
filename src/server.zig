@@ -12,6 +12,7 @@
 ///   GET    /context/:col         smart context discovery (q, limit query params)
 const std = @import("std");
 const activity = @import("activity.zig");
+const auth = @import("auth.zig");
 const collection = @import("collection.zig");
 const Database = collection.Database;
 
@@ -231,6 +232,14 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
                 srv.query_cost_nanos_usd.load(.acquire),
             }) catch {};
         return ok(getBodyBuf()[0..fbs.pos]);
+    }
+
+    // ── Auth gate — public endpoints above, protected endpoints below ────
+    if (srv.db.auth.isEnabled()) {
+        const api_key = auth.AuthStore.extractHttpKey(raw) orelse
+            return err(401, "unauthorized — missing X-Api-Key header");
+        if (srv.db.auth.verify(api_key) == null)
+            return err(401, "unauthorized — invalid API key");
     }
 
     if (std.mem.eql(u8, path, "/billing") and std.mem.eql(u8, method, "GET"))
@@ -760,6 +769,7 @@ fn err(code: u16, msg: []const u8) usize {
     const body = std.fmt.bufPrint(&scratch, "{{\"error\":\"{s}\"}}", .{msg}) catch msg;
     const status = switch (code) {
         400 => "Bad Request",
+        401 => "Unauthorized",
         429 => "Too Many Requests",
         404 => "Not Found",
         else => "Internal Server Error",
