@@ -16,9 +16,10 @@ const auth = @import("auth.zig");
 const collection = @import("collection.zig");
 const Database = collection.Database;
 
-const MAX_REQ  = 65536;  // 64 KiB
+const MAX_REQ  = 65536;  // 64 KiB (initial read)
 const MAX_RESP = 131072; // 128 KiB
 const MAX_BODY = 65536;  // 64 KiB
+const MAX_BULK = 16 * 1024 * 1024; // 16 MiB for bulk inserts
 
 // Heap-allocated per-connection buffers (threadlocal pointers set in handleConn).
 // This avoids large threadlocal TLS segments that break in Release mode on macOS.
@@ -181,11 +182,45 @@ fn handleConn(srv: *Server, conn: std.net.Server.Connection) void {
     defer tl_bufs = null;
 
     while (true) {
-        const n = conn.stream.read(&bufs.req) catch return;
+        var n = conn.stream.read(&bufs.req) catch return;
         if (n == 0) return;
         _ = srv.req_count.fetchAdd(1, .monotonic);
 
-        const resp_len = dispatch(srv, bufs.req[0..n], std.heap.page_allocator);
+        // For bulk inserts: read the full body based on Content-Length.
+        // The initial read may only contain part of a large body.
+        const initial = bufs.req[0..n];
+        const content_length = extractContentLength(initial);
+        if (content_length > MAX_REQ and content_length <= MAX_BULK) {
+            // Check this is actually a bulk request before allocating
+            const is_bulk = std.mem.indexOf(u8, initial[0..@min(n, 256)], "/bulk") != null;
+            if (is_bulk) {
+                // Find where headers end
+                const header_end = if (std.mem.indexOf(u8, initial, "\r\n\r\n")) |p| p + 4
+                    else if (std.mem.indexOf(u8, initial, "\n\n")) |p| p + 2
+                    else n;
+                const total_size = header_end + content_length;
+                if (total_size <= MAX_BULK) {
+                    const big_buf = std.heap.page_allocator.alloc(u8, total_size) catch {
+                        const resp_len = dispatch(srv, initial, std.heap.page_allocator);
+                        conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
+                        continue;
+                    };
+                    defer std.heap.page_allocator.free(big_buf);
+                    @memcpy(big_buf[0..n], initial);
+                    // Read remaining bytes
+                    while (n < total_size) {
+                        const r = conn.stream.read(big_buf[n..total_size]) catch break;
+                        if (r == 0) break;
+                        n += r;
+                    }
+                    const resp_len = dispatch(srv, big_buf[0..n], std.heap.page_allocator);
+                    conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
+                    continue;
+                }
+            }
+        }
+
+        const resp_len = dispatch(srv, initial, std.heap.page_allocator);
         conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
     }
 }
@@ -338,6 +373,9 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
             const col_name = rest[0..sep];
             const key = rest[sep + 1 ..];
             const tenant_id = requestTenant(raw, query);
+            // POST /db/:col/bulk — bulk insert
+            if (std.mem.eql(u8, key, "bulk") and std.mem.eql(u8, method, "POST"))
+                return handleBulkInsert(srv, tenant_id, col_name, body, alloc);
             if (std.mem.eql(u8, method, "GET"))    return handleGet(srv, tenant_id, col_name, key, requestAsOf(raw, query));
             if (std.mem.eql(u8, method, "PUT"))    return handleUpdate(srv, tenant_id, col_name, key, body, alloc);
             if (std.mem.eql(u8, method, "DELETE")) return handleDelete(srv, tenant_id, col_name, key);
@@ -383,6 +421,49 @@ fn doInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []co
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 
+/// POST /db/:col/bulk — insert multiple documents in one request.
+/// Body: NDJSON — one {"key":"...","value":"..."} per line.
+/// Response: {"inserted":N,"errors":M,"collection":"...","tenant":"..."}
+fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
+    _ = alloc;
+    const start_ns = std.time.nanoTimestamp();
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+
+    var inserted: u32 = 0;
+    var errors: u32 = 0;
+    var total_bytes: u64 = 0;
+
+    // Parse NDJSON: iterate lines, each is a {"key":"...","value":...} object
+    var pos: usize = 0;
+    while (pos < body.len) {
+        // Find end of line
+        const line_end = std.mem.indexOfScalarPos(u8, body, pos, '\n') orelse body.len;
+        const line = std.mem.trim(u8, body[pos..line_end], " \t\r");
+        pos = line_end + 1;
+
+        if (line.len < 2) continue; // skip empty lines
+
+        // Extract key from this JSON line
+        const key = jsonStr(line, "key") orelse continue;
+
+        // Use the full line as the value (TurboDB stores the raw JSON)
+        _ = col.insert(key, line) catch {
+            errors += 1;
+            continue;
+        };
+        inserted += 1;
+        total_bytes += line.len;
+    }
+
+    srv.recordQueryCost(tenant_id, "bulk_insert", inserted, total_bytes, start_ns);
+
+    var fbs = std.io.fixedBufferStream(getBodyBuf());
+    std.fmt.format(fbs.writer(),
+        "{{\"inserted\":{d},\"errors\":{d},\"collection\":\"{s}\",\"tenant\":\"{s}\"}}",
+        .{ inserted, errors, col_name, tenant_id }) catch {};
+    return ok(getBodyBuf()[0..fbs.pos]);
+}
 fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, as_of: ?i64) usize {
         const start_ns = std.time.nanoTimestamp();
         srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
@@ -786,6 +867,24 @@ fn respond(code: u16, status: []const u8, body: []const u8) usize {
 }
 
 // ─── mini parsers ────────────────────────────────────────────────────────
+
+fn extractContentLength(raw: []const u8) usize {
+    // Case-insensitive search for Content-Length header
+    const headers = raw[0..@min(raw.len, 2048)]; // only scan headers
+    const needle = "ontent-length: "; // skip first char for case insensitivity
+    var i: usize = 0;
+    while (i + needle.len < headers.len) : (i += 1) {
+        if ((headers[i] == 'C' or headers[i] == 'c') and std.mem.eql(u8, headers[i + 1 .. i + 1 + needle.len], needle)) {
+            const start = i + 1 + needle.len;
+            var end = start;
+            while (end < headers.len and headers[end] >= '0' and headers[end] <= '9') : (end += 1) {}
+            if (end > start) {
+                return std.fmt.parseInt(usize, headers[start..end], 10) catch 0;
+            }
+        }
+    }
+    return 0;
+}
 
 fn jsonStr(json: []const u8, key: []const u8) ?[]const u8 {
     var kbuf: [64]u8 = undefined;
