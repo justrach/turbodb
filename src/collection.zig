@@ -1471,6 +1471,7 @@ pub const Database = struct {
     data_dir_len: usize,
     alloc: std.mem.Allocator,
     mu: std.Thread.RwLock,
+    auth: @import("auth.zig").AuthStore,
 
     pub const TenantQuota = struct {
         max_collections: u32 = std.math.maxInt(u32),
@@ -1503,6 +1504,7 @@ pub const Database = struct {
         try db.cdc.start();
         db.alloc = alloc;
         db.mu = .{};
+        db.auth = .{};
 
         const n = @min(resolved_data_dir.len, 255);
         @memcpy(db.data_dir_buf[0..n], resolved_data_dir[0..n]);
