@@ -397,14 +397,16 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
 fn handleInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
     _ = alloc;
     // Expect body: {"key":"...","value":{...}}  OR  use auto-generated key.
+    // Extract the value field; fall back to the full body for backwards compat.
+    const value = jsonValue(body, "value") orelse body;
     const key_raw = jsonStr(body, "key") orelse {
         // Auto-generate key from timestamp + counter.
         var kb: [32]u8 = undefined;
         const k = std.fmt.bufPrint(&kb, "doc_{d}", .{std.time.milliTimestamp()}) catch
             return err(400, "bad key");
-        return doInsert(srv, tenant_id, col_name, k, body);
+        return doInsert(srv, tenant_id, col_name, k, value);
     };
-    return doInsert(srv, tenant_id, col_name, key_raw, body);
+    return doInsert(srv, tenant_id, col_name, key_raw, value);
 }
 
 fn doInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, value: []const u8) usize {
@@ -446,9 +448,10 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
 
         // Extract key from this JSON line
         const key = jsonStr(line, "key") orelse continue;
+        // Extract value field; fall back to full line for backwards compat.
+        const value = jsonValue(line, "value") orelse line;
 
-        // Use the full line as the value (TurboDB stores the raw JSON)
-        _ = col.insert(key, line) catch {
+        _ = col.insert(key, value) catch {
             errors += 1;
             continue;
         };
@@ -893,6 +896,44 @@ fn jsonStr(json: []const u8, key: []const u8) ?[]const u8 {
     const start = pos + needle.len;
     const end = std.mem.indexOfScalarPos(u8, json, start, '"') orelse return null;
     return json[start..end];
+}
+
+// Extract a JSON value (string, object, array, number, bool, null) for the given key.
+// Returns the raw slice: "hello" for strings (without quotes), {"a":1} for objects, etc.
+fn jsonValue(json: []const u8, key: []const u8) ?[]const u8 {
+    var kbuf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&kbuf, "\"{s}\":", .{key}) catch return null;
+    const pos = std.mem.indexOf(u8, json, needle) orelse return null;
+    var start = pos + needle.len;
+    // Skip whitespace
+    while (start < json.len and (json[start] == ' ' or json[start] == '\t')) start += 1;
+    if (start >= json.len) return null;
+
+    const ch = json[start];
+    if (ch == '"') {
+        // String value — return content without quotes
+        const end = std.mem.indexOfScalarPos(u8, json, start + 1, '"') orelse return null;
+        return json[start + 1 .. end];
+    } else if (ch == '{' or ch == '[') {
+        // Object or array — find matching close bracket
+        const close: u8 = if (ch == '{') '}' else ']';
+        var depth: u32 = 1;
+        var i = start + 1;
+        var in_str = false;
+        while (i < json.len and depth > 0) : (i += 1) {
+            if (json[i] == '\\' and in_str) { i += 1; continue; }
+            if (json[i] == '"') { in_str = !in_str; continue; }
+            if (in_str) continue;
+            if (json[i] == ch) depth += 1;
+            if (json[i] == close) depth -= 1;
+        }
+        return json[start..i];
+    } else {
+        // Number, bool, null — read until delimiter
+        var i = start;
+        while (i < json.len and json[i] != ',' and json[i] != '}' and json[i] != ']' and json[i] != ' ' and json[i] != '\n') : (i += 1) {}
+        return json[start..i];
+    }
 }
 
 fn qparamInt(query: []const u8, key: []const u8) ?u32 {
