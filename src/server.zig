@@ -481,10 +481,20 @@ fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []c
         const HEADER_RESERVE = 256;
         var resp = getRespBuf();
         var fbs = std.io.fixedBufferStream(resp[HEADER_RESERVE..]);
-        std.fmt.format(fbs.writer(),
-            "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}",
-            .{ d.header.doc_id, d.key, d.header.version,
-               if (d.value.len > 0) d.value else "{}" }) catch {};
+        const val = if (d.value.len > 0) d.value else "{}";
+        const is_json = val.len > 0 and (val[0] == '{' or val[0] == '[' or val[0] == '"');
+        const w = fbs.writer();
+        if (is_json) {
+            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}", .{ d.header.doc_id, d.key, d.header.version, val }) catch {};
+        } else {
+            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":\"", .{ d.header.doc_id, d.key, d.header.version }) catch {};
+            for (val) |ch| {
+                if (ch == '"' or ch == '\\') w.writeByte('\\') catch {};
+                if (ch == '\n') { w.writeAll("\\n") catch {}; continue; }
+                w.writeByte(ch) catch {};
+            }
+            w.writeAll("\"}") catch {};
+        }
         const body_len = fbs.pos;
 
         // Now write headers into the reserved space at the front
@@ -544,10 +554,19 @@ fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_s
         .{ tenant_id, col_name, result.docs.len }) catch {};
     for (result.docs, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
-        std.fmt.format(w,
-            "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}",
-            .{ d.header.doc_id, d.key, d.header.version,
-               if (d.value.len > 0) d.value else "{}" }) catch {};
+        const val = if (d.value.len > 0) d.value else "{}";
+        const is_json = val.len > 0 and (val[0] == '{' or val[0] == '[' or val[0] == '"');
+        if (is_json) {
+            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}", .{ d.header.doc_id, d.key, d.header.version, val }) catch {};
+        } else {
+            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":\"", .{ d.header.doc_id, d.key, d.header.version }) catch {};
+            for (val) |ch| {
+                if (ch == '"' or ch == '\\') w.writeByte('\\') catch {};
+                if (ch == '\n') { w.writeAll("\\n") catch {}; continue; }
+                w.writeByte(ch) catch {};
+            }
+            w.writeAll("\"}") catch {};
+        }
     }
     w.writeAll("]}") catch {};
     return ok(getBodyBuf()[0..fbs.pos]);
@@ -584,10 +603,21 @@ fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query
         .{ result.docs.len, result.candidate_paths.len, col.docCount(), result.total_files }) catch {};
     for (result.docs, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
-        std.fmt.format(w,
-            "{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":{s}}}",
-            .{ d.header.doc_id, d.key,
-               if (d.value.len > 0) d.value else "{}" }) catch {};
+        // Output value as valid JSON — objects/arrays as-is, strings quoted
+        const val = if (d.value.len > 0) d.value else "{}";
+        const is_json = val.len > 0 and (val[0] == '{' or val[0] == '[' or val[0] == '"');
+        if (is_json) {
+            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":{s}}}", .{ d.header.doc_id, d.key, val }) catch {};
+        } else {
+            w.writeAll("{\"doc_id\":") catch {};
+            std.fmt.format(w, "{d},\"key\":\"{s}\",\"value\":\"", .{ d.header.doc_id, d.key }) catch {};
+            for (val) |ch| {
+                if (ch == '"' or ch == '\\') w.writeByte('\\') catch {};
+                if (ch == '\n') { w.writeAll("\\n") catch {}; continue; }
+                w.writeByte(ch) catch {};
+            }
+            w.writeAll("\"}") catch {};
+        }
     }
     w.writeAll("]}") catch {};
     return ok(getBodyBuf()[0..fbs.pos]);
