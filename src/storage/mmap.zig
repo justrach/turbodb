@@ -17,6 +17,9 @@ pub const MmapFile = struct {
     ptr:      [*]align(PAGE_SIZE) u8,
     len:      usize,        // logical data length
     capacity: usize,        // mapped (file) length; >= len, multiple of PAGE_SIZE
+    /// Protects ptr/capacity against concurrent grow+read.
+    /// Writers (grow) take exclusive; readers (at/slice) take shared.
+    rw_lock:  std.Thread.RwLock,
 
     // ── Open / Close ──────────────────────────────────────────────────────────
 
@@ -47,6 +50,7 @@ pub const MmapFile = struct {
             .ptr      = ptr.ptr,
             .len      = existing,
             .capacity = capacity,
+            .rw_lock  = .{},
         };
     }
 
@@ -68,7 +72,16 @@ pub const MmapFile = struct {
     // ── Grow ──────────────────────────────────────────────────────────────────
 
     /// Extend the logical length.  Remaps if needed (macOS: munmap + mmap).
+    /// Takes an exclusive lock so concurrent readers cannot hold stale pointers.
     pub fn grow(self: *MmapFile, needed_len: usize) !void {
+        if (needed_len <= self.capacity) {
+            self.len = needed_len;
+            return;
+        }
+        // Must remap — take exclusive lock to block readers during munmap/mmap.
+        self.rw_lock.lock();
+        defer self.rw_lock.unlock();
+        // Re-check after acquiring lock (another thread may have grown).
         if (needed_len <= self.capacity) {
             self.len = needed_len;
             return;
@@ -92,12 +105,18 @@ pub const MmapFile = struct {
     // ── Typed access ──────────────────────────────────────────────────────────
 
     /// Return a pointer to the record at byte offset `off`.
-    pub fn at(self: MmapFile, comptime T: type, off: usize) *T {
+    /// Takes a shared lock so grow() cannot remap underneath us.
+    pub fn at(self: *MmapFile, comptime T: type, off: usize) *T {
+        self.rw_lock.lockShared();
+        defer self.rw_lock.unlockShared();
         return @alignCast(@ptrCast(&self.ptr[off]));
     }
 
     /// Return a slice of T starting at byte offset `off`, `count` elements.
-    pub fn slice(self: MmapFile, comptime T: type, off: usize, count: usize) []T {
+    /// Takes a shared lock so grow() cannot remap underneath us.
+    pub fn slice(self: *MmapFile, comptime T: type, off: usize, count: usize) []T {
+        self.rw_lock.lockShared();
+        defer self.rw_lock.unlockShared();
         return @as([*]T, @alignCast(@ptrCast(&self.ptr[off])))[0..count];
     }
 

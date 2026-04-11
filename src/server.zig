@@ -45,6 +45,9 @@ pub const Server = struct {
         cost_nanos_usd: u64,
     };
 
+    const MAX_CONNECTIONS: u32 = 512;
+    const BILLING_LOG_CAP: usize = 1024;
+
     db: *Database,
     port: u16,
     running: std.atomic.Value(bool),
@@ -58,9 +61,14 @@ pub const Server = struct {
     query_bytes_read: std.atomic.Value(u64),
     query_cpu_us: std.atomic.Value(u64),
     query_cost_nanos_usd: std.atomic.Value(u64),
-    billing_log: std.ArrayList(QueryCost),
+    // Ring buffer for billing log — avoids O(n) orderedRemove(0).
+    billing_ring: [BILLING_LOG_CAP]QueryCost,
+    billing_ring_head: usize,  // next write position
+    billing_ring_count: usize, // entries currently stored
     billing_mu: std.Thread.Mutex,
     activity: activity.ActivityTracker,
+    // Connection limiter — prevents unbounded thread spawning under flood.
+    active_conns: std.atomic.Value(u32),
 
     pub fn init(alloc: std.mem.Allocator, db: *Database, port: u16) Server {
         return .{
@@ -75,9 +83,12 @@ pub const Server = struct {
             .query_bytes_read = std.atomic.Value(u64).init(0),
             .query_cpu_us = std.atomic.Value(u64).init(0),
             .query_cost_nanos_usd = std.atomic.Value(u64).init(0),
-            .billing_log = .empty,
+            .billing_ring = undefined,
+            .billing_ring_head = 0,
+            .billing_ring_count = 0,
             .billing_mu = .{},
             .activity = activity.ActivityTracker.init(),
+            .active_conns = std.atomic.Value(u32).init(0),
         };
     }
 
@@ -98,13 +109,22 @@ pub const Server = struct {
                 std.log.err("accept: {}", .{e});
                 continue;
             };
-            const t = try std.Thread.spawn(.{}, handleConn, .{self, conn});
+            // Reject if at connection limit to prevent OOM from thread exhaustion.
+            if (self.active_conns.load(.monotonic) >= MAX_CONNECTIONS) {
+                conn.stream.close();
+                _ = self.err_count.fetchAdd(1, .monotonic);
+                continue;
+            }
+            const t = std.Thread.spawn(.{}, handleConnWrapped, .{self, conn}) catch {
+                conn.stream.close();
+                _ = self.err_count.fetchAdd(1, .monotonic);
+                continue;
+            };
             t.detach();
         }
     }
 
     pub fn runUnix(self: *Server, path: []const u8) !void {
-        // Remove any existing socket file
         // Remove any existing socket file
         std.posix.unlink(path) catch {};
         const fd = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
@@ -128,7 +148,15 @@ pub const Server = struct {
             const client_fd = std.posix.accept(fd, @ptrCast(&client_addr), &addr_len, 0) catch continue;
             const stream = std.net.Stream{ .handle = client_fd };
             const conn = std.net.Server.Connection{ .stream = stream, .address = std.net.Address.initUnix(path) catch continue };
-            const t = std.Thread.spawn(.{}, handleConn, .{ self, conn }) catch continue;
+            if (self.active_conns.load(.monotonic) >= MAX_CONNECTIONS) {
+                conn.stream.close();
+                _ = self.err_count.fetchAdd(1, .monotonic);
+                continue;
+            }
+            const t = std.Thread.spawn(.{}, handleConnWrapped, .{ self, conn }) catch {
+                conn.stream.close();
+                continue;
+            };
             t.detach();
         }
     }
@@ -162,14 +190,23 @@ pub const Server = struct {
         @memcpy(entry.tenant_id[0..entry.tenant_id_len], tenant_id[0..entry.tenant_id_len]);
         @memcpy(entry.op[0..entry.op_len], op[0..entry.op_len]);
 
+        // O(1) ring buffer append — overwrites oldest entry when full.
         self.billing_mu.lock();
         defer self.billing_mu.unlock();
-        self.billing_log.append(self.alloc, entry) catch return;
-        if (self.billing_log.items.len > 1024) {
-            _ = self.billing_log.orderedRemove(0);
+        self.billing_ring[self.billing_ring_head] = entry;
+        self.billing_ring_head = (self.billing_ring_head + 1) % BILLING_LOG_CAP;
+        if (self.billing_ring_count < BILLING_LOG_CAP) {
+            self.billing_ring_count += 1;
         }
     }
 };
+
+/// Wrapper that tracks active connection count around handleConn.
+fn handleConnWrapped(srv: *Server, conn: std.net.Server.Connection) void {
+    _ = srv.active_conns.fetchAdd(1, .monotonic);
+    defer _ = srv.active_conns.fetchSub(1, .monotonic);
+    handleConn(srv, conn);
+}
 
 fn handleConn(srv: *Server, conn: std.net.Server.Connection) void {
     defer conn.stream.close();
@@ -687,8 +724,15 @@ fn handleBillingLog(srv: *Server) usize {
     w.writeAll("{\"queries\":[") catch {};
     srv.billing_mu.lock();
     defer srv.billing_mu.unlock();
-    const start = if (srv.billing_log.items.len > 100) srv.billing_log.items.len - 100 else 0;
-    for (srv.billing_log.items[start..], 0..) |entry, i| {
+    // Read from ring buffer: emit up to 100 most recent entries.
+    const count = srv.billing_ring_count;
+    const emit = @min(count, 100);
+    const cap = Server.BILLING_LOG_CAP;
+    // Start index: oldest of the last `emit` entries in the ring.
+    const start_idx = if (count >= emit) (srv.billing_ring_head + cap - emit) % cap else 0;
+    for (0..emit) |i| {
+        const idx = (start_idx + i) % cap;
+        const entry = srv.billing_ring[idx];
         if (i > 0) w.writeByte(',') catch {};
         std.fmt.format(w,
             "{{\"tenant\":\"{s}\",\"op\":\"{s}\",\"rows_scanned\":{d},\"bytes_read\":{d},\"cpu_us\":{d},\"cost_nanos_usd\":{d}}}",

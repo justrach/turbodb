@@ -163,6 +163,8 @@ fn extractJsonFloatArray(json: []const u8, field_name: []const u8, out: []f32) ?
 // ─── Collection ──────────────────────────────────────────────────────────
 pub const Collection = struct {
     pub const STRIPE_COUNT = 1024;
+    // MVCC GC: trigger version chain cleanup every GC_INTERVAL inserts.
+    const GC_INTERVAL: u64 = 10_000;
 
     name_buf: [128]u8,
     name_len: u8,
@@ -184,7 +186,7 @@ pub const Collection = struct {
     key_epochs: std.AutoHashMap(u64, u64),
     alloc: std.mem.Allocator,
     cache: hot_cache.HotCache,
-    // MVCC version chain — append-only, no vacuum.
+    // MVCC version chain — append-only, vacuumed periodically via gc_counter.
     versions: mvcc_mod.VersionChain,
 
     // Async index queues — inserts round-robin into 2 queues, 2 background threads drain them.
@@ -205,8 +207,7 @@ pub const Collection = struct {
     // Branch manager (optional — lazy-initialized on first branch creation)
     branch_mgr: ?*branch_mod.BranchManager = null,
     vec_entries: std.ArrayListUnmanaged(BTreeEntry) = .empty,
-
-    /// Get the stripe lock index for a key hash.
+    gc_counter: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
     fn stripeIndex(key_hash: u64) usize {
         return @intCast(key_hash % STRIPE_COUNT);
     }
@@ -450,6 +451,11 @@ pub const Collection = struct {
         }
 
         emitChange(self, .insert, key, value, doc_id);
+
+        // Periodic MVCC version chain GC to prevent unbounded memory growth.
+        if (self.gc_counter.fetchAdd(1, .monotonic) % GC_INTERVAL == GC_INTERVAL - 1) {
+            _ = self.gcVersions();
+        }
 
         return doc_id;
     }
@@ -1474,9 +1480,9 @@ pub const Database = struct {
     auth: @import("auth.zig").AuthStore,
 
     pub const TenantQuota = struct {
-        max_collections: u32 = std.math.maxInt(u32),
-        max_storage_bytes: usize = std.math.maxInt(usize),
-        max_ops_per_second: u32 = std.math.maxInt(u32),
+        max_collections: u32 = 256,
+        max_storage_bytes: usize = 10 * 1024 * 1024 * 1024, // 10 GiB
+        max_ops_per_second: u32 = 10_000,
     };
 
     pub const TenantUsage = struct {

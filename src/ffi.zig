@@ -17,6 +17,33 @@ const Doc = doc_mod.Doc;
 
 const alloc = std.heap.c_allocator;
 
+// ── Handle wrappers with magic sentinel for validation ──────────────────────
+
+const DB_MAGIC: u64 = 0xDB_7042_B0DB_0001;
+const COL_MAGIC: u64 = 0xC0_11EC_7100_0001;
+
+const DbHandle = struct {
+    magic: u64 = DB_MAGIC,
+    ptr: *Database,
+};
+
+const ColHandle = struct {
+    magic: u64 = COL_MAGIC,
+    ptr: *Collection,
+};
+
+fn validateDbHandle(handle: ?*anyopaque) ?*Database {
+    const h: *DbHandle = @ptrCast(@alignCast(handle orelse return null));
+    if (h.magic != DB_MAGIC) return null;
+    return h.ptr;
+}
+
+fn validateColHandle(handle: ?*anyopaque) ?*Collection {
+    const h: *ColHandle = @ptrCast(@alignCast(handle orelse return null));
+    if (h.magic != COL_MAGIC) return null;
+    return h.ptr;
+}
+
 // ── Exported C structs ──────────────────────────────────────────────────────
 
 pub const TurboDocResult = extern struct {
@@ -49,13 +76,18 @@ export fn turbodb_open(dir: [*]const u8, dir_len: usize) ?*anyopaque {
     };
 
     const db = Database.open(alloc, dir_slice) catch return null;
-    return @ptrCast(db);
+    const handle = alloc.create(DbHandle) catch return null;
+    handle.* = .{ .ptr = db };
+    return @ptrCast(handle);
 }
 
 /// Close a database and free all resources.
 export fn turbodb_close(handle: *anyopaque) void {
-    const db: *Database = @ptrCast(@alignCast(handle));
+    const db = validateDbHandle(handle) orelse return;
     db.close();
+    const h: *DbHandle = @ptrCast(@alignCast(handle));
+    h.magic = 0; // poison the handle
+    alloc.destroy(h);
 }
 
 // ── Collection access ───────────────────────────────────────────────────────
@@ -67,9 +99,11 @@ export fn turbodb_collection(
     name: [*]const u8,
     name_len: usize,
 ) ?*anyopaque {
-    const db: *Database = @ptrCast(@alignCast(db_handle));
+    const db = validateDbHandle(db_handle) orelse return null;
     const col = db.collection(name[0..name_len]) catch return null;
-    return @ptrCast(col);
+    const handle = alloc.create(ColHandle) catch return null;
+    handle.* = .{ .ptr = col };
+    return @ptrCast(handle);
 }
 
 export fn turbodb_collection_tenant(
@@ -79,9 +113,11 @@ export fn turbodb_collection_tenant(
     name: [*]const u8,
     name_len: usize,
 ) ?*anyopaque {
-    const db: *Database = @ptrCast(@alignCast(db_handle));
+    const db = validateDbHandle(db_handle) orelse return null;
     const col = db.collectionForTenant(tenant[0..tenant_len], name[0..name_len]) catch return null;
-    return @ptrCast(col);
+    const handle = alloc.create(ColHandle) catch return null;
+    handle.* = .{ .ptr = col };
+    return @ptrCast(handle);
 }
 
 /// Drop a named collection.
@@ -90,7 +126,7 @@ export fn turbodb_drop_collection(
     name: [*]const u8,
     name_len: usize,
 ) void {
-    const db: *Database = @ptrCast(@alignCast(db_handle));
+    const db = validateDbHandle(db_handle) orelse return;
     db.dropCollection(name[0..name_len]);
 }
 
@@ -101,7 +137,7 @@ export fn turbodb_drop_collection_tenant(
     name: [*]const u8,
     name_len: usize,
 ) void {
-    const db: *Database = @ptrCast(@alignCast(db_handle));
+    const db = validateDbHandle(db_handle) orelse return;
     db.dropCollectionForTenant(tenant[0..tenant_len], name[0..name_len]);
 }
 
@@ -117,7 +153,7 @@ export fn turbodb_insert(
     val_len: usize,
     out_id: *u64,
 ) c_int {
-    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const col = validateColHandle(col_handle) orelse return -1;
     const doc_id = col.insert(key[0..key_len], val[0..val_len]) catch return -1;
     out_id.* = doc_id;
     return 0;
@@ -131,7 +167,7 @@ export fn turbodb_insert_with_embedding(
     embedding: [*]const f32, dims: u32,
     out_id: *u64,
 ) c_int {
-    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const col = validateColHandle(col_handle) orelse return -1;
     const doc_id = col.insertWithEmbedding(key[0..key_len], val[0..val_len], embedding[0..dims]) catch return -1;
     out_id.* = doc_id;
     return 0;
@@ -146,7 +182,7 @@ export fn turbodb_get(
     key_len: usize,
     out: *TurboDocResult,
 ) c_int {
-    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const col = validateColHandle(col_handle) orelse return -1;
     const d = col.get(key[0..key_len]) orelse return -1;
     out.* = docToResult(d);
     return 0;
@@ -160,7 +196,7 @@ export fn turbodb_update(
     val: [*]const u8,
     val_len: usize,
 ) c_int {
-    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const col = validateColHandle(col_handle) orelse return -1;
     const updated = col.update(key[0..key_len], val[0..val_len]) catch return -1;
     return if (updated) 0 else -1;
 }
@@ -171,7 +207,7 @@ export fn turbodb_delete(
     key: [*]const u8,
     key_len: usize,
 ) c_int {
-    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const col = validateColHandle(col_handle) orelse return -1;
     const deleted = col.delete(key[0..key_len]) catch return -1;
     return if (deleted) 0 else -1;
 }
@@ -186,7 +222,7 @@ export fn turbodb_scan(
     offset: u32,
     out: *TurboScanHandle,
 ) c_int {
-    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const col = validateColHandle(col_handle) orelse return -1;
     const result = col.scan(limit, offset, alloc) catch return -1;
     out.docs_ptr = result.docs.ptr;
     out.count = @intCast(result.docs.len);
@@ -244,7 +280,7 @@ export fn turbodb_search(
     limit: u32,
     out: *TurboScanHandle,
 ) c_int {
-    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const col = validateColHandle(col_handle) orelse return -1;
     const query = query_ptr[0..query_len];
     const result = col.searchText(query, limit, alloc) catch return -1;
     out.docs_ptr = result.docs.ptr;
@@ -253,7 +289,7 @@ export fn turbodb_search(
 }
 
 export fn turbodb_flush_index(col_handle: *anyopaque) void {
-    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const col = validateColHandle(col_handle) orelse return;
     col.flushIndex();
 }
 
@@ -511,7 +547,7 @@ export fn turbodb_vector_search_ivf(
 /// Configure a vector embedding column on a Collection.
 /// field_name is the JSON key that holds the embedding array (e.g. "embedding").
 export fn turbodb_configure_vectors(col_handle: *anyopaque, dims: u32, field_name: [*]const u8, field_len: u32) c_int {
-    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const col = validateColHandle(col_handle) orelse return -1;
     col.configureVectors(dims, field_name[0..field_len]) catch return -1;
     return 0;
 }
@@ -527,7 +563,7 @@ export fn turbodb_collection_search_vectors(
     out_indices: [*]u32,
     out_scores: [*]f32,
 ) c_int {
-    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const col = validateColHandle(col_handle) orelse return -1;
     const m: vector.Metric = switch (metric) {
         0 => .cosine,
         1 => .dot_product,
@@ -556,7 +592,7 @@ export fn turbodb_search_hybrid(
     vector_weight: f32,
     out: *TurboScanHandle,
 ) c_int {
-    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const col = validateColHandle(col_handle) orelse return -1;
     const result = col.searchHybrid(
         text_query[0..text_len],
         vector_query[0..dims],
@@ -573,26 +609,26 @@ export fn turbodb_search_hybrid(
 // ── Branch operations ────────────────────────────────────────────────────────
 
 export fn turbodb_enable_branching(col_handle: *anyopaque) c_int {
-    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const col = validateColHandle(col_handle) orelse return -1;
     col.enableBranching() catch return -1;
     return 0;
 }
 
 export fn turbodb_create_branch(col_handle: *anyopaque, name_ptr: [*]const u8, name_len: u32, agent_ptr: [*]const u8, agent_len: u32) c_int {
-    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const col = validateColHandle(col_handle) orelse return -1;
     _ = col.createBranch(name_ptr[0..name_len], agent_ptr[0..agent_len]) catch return -1;
     return 0;
 }
 
 export fn turbodb_branch_write(col_handle: *anyopaque, branch_name: [*]const u8, branch_len: u32, key: [*]const u8, key_len: u32, val: [*]const u8, val_len: u32) c_int {
-    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const col = validateColHandle(col_handle) orelse return -1;
     const br = col.getBranch(branch_name[0..branch_len]) orelse return -1;
     col.writeOnBranch(br, key[0..key_len], val[0..val_len]) catch return -1;
     return 0;
 }
 
 export fn turbodb_branch_read(col_handle: *anyopaque, branch_name: [*]const u8, branch_len: u32, key: [*]const u8, key_len: u32, out_val: *[*]const u8, out_len: *u32) c_int {
-    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const col = validateColHandle(col_handle) orelse return -1;
     const br = col.getBranch(branch_name[0..branch_len]) orelse return -1;
     const val = col.getOnBranch(br, key[0..key_len]) orelse return -1;
     out_val.* = val.ptr;
@@ -601,7 +637,7 @@ export fn turbodb_branch_read(col_handle: *anyopaque, branch_name: [*]const u8, 
 }
 
 export fn turbodb_branch_merge(col_handle: *anyopaque, branch_name: [*]const u8, branch_len: u32) c_int {
-    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const col = validateColHandle(col_handle) orelse return -1;
     const br = col.getBranch(branch_name[0..branch_len]) orelse return -1;
     var result = col.mergeBranch(br, alloc) catch return -1;
     defer result.deinit();
@@ -618,7 +654,7 @@ export fn turbodb_branch_diff(
     out_json: *[*]u8,
     out_len: *u32,
 ) c_int {
-    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const col = validateColHandle(col_handle) orelse return -1;
     const br = col.getBranch(branch_name[0..branch_len]) orelse return -1;
     const branch_mod = @import("branch.zig");
 
@@ -688,7 +724,7 @@ export fn turbodb_branch_search(
     limit: u32,
     out: *TurboScanHandle,
 ) c_int {
-    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const col = validateColHandle(col_handle) orelse return -1;
     const br = col.getBranch(branch_name[0..branch_len]) orelse return -1;
     const result = col.searchOnBranch(br, query_ptr[0..query_len], limit, alloc) catch return -1;
     out.docs_ptr = result.docs.ptr;
@@ -701,7 +737,7 @@ export fn turbodb_list_branches(
     out_json: *[*]u8,
     out_len: *u32,
 ) c_int {
-    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const col = validateColHandle(col_handle) orelse return -1;
     const names = col.listBranches(alloc) catch return -1;
     defer alloc.free(names);
 
@@ -736,7 +772,7 @@ export fn turbodb_discover_context(
     out_json: *[*]u8,
     out_len: *u32,
 ) c_int {
-    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const col = validateColHandle(col_handle) orelse return -1;
     var result = col.discoverContext(query[0..query_len], limit, alloc) catch return -1;
     defer result.deinit();
 
