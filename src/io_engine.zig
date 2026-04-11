@@ -456,9 +456,6 @@ pub const EventLoop = struct {
     work_queue: *MpscRing(WorkItem, 4096),
     workers: []std.Thread,
     worker_count: usize,
-    /// Futex-based wake signal — workers sleep on this instead of spinning.
-    /// Incremented by the I/O thread after pushing work; workers wait on it.
-    wake_signal: std.atomic.Value(u32),
 
     pub fn init(alloc: Allocator, max_conns: usize) !EventLoop {
         const wq = try alloc.create(MpscRing(WorkItem, 4096));
@@ -476,7 +473,6 @@ pub const EventLoop = struct {
             .work_queue = wq,
             .workers = try alloc.alloc(std.Thread, n_workers),
             .worker_count = n_workers,
-            .wake_signal = std.atomic.Value(u32).init(0),
         };
     }
 
@@ -484,8 +480,6 @@ pub const EventLoop = struct {
         if (self.running.load(.acquire)) {
             self.running.store(false, .release);
         }
-        // Wake all workers so they can observe running=false and exit.
-        std.Thread.Futex.wake(&self.wake_signal, @intCast(self.worker_count));
         if (self.listen_fd >= 0) {
             posix.close(self.listen_fd);
         }
@@ -547,8 +541,6 @@ pub const EventLoop = struct {
     /// Stop the event loop gracefully.
     pub fn stop(self: *EventLoop) void {
         self.running.store(false, .release);
-        // Wake all sleeping workers so they see running=false.
-        std.Thread.Futex.wake(&self.wake_signal, @intCast(self.worker_count));
     }
 
     // ── Internal completion handlers ──
@@ -616,10 +608,6 @@ pub const EventLoop = struct {
             // Queue full — close connection to shed load.
             conn.state = .closing;
             self.engine.submitClose(conn.fd, comp.user_data) catch {};
-        } else {
-            // Wake one sleeping worker to process this item.
-            _ = self.wake_signal.fetchAdd(1, .release);
-            std.Thread.Futex.wake(&self.wake_signal, 1);
         }
     }
 
@@ -662,11 +650,9 @@ pub const EventLoop = struct {
     fn workerThread(self: *EventLoop, handler: *const fn (request: []const u8, response: []u8) usize) void {
         while (self.running.load(.acquire)) {
             const item = self.work_queue.pop() orelse {
-                // No work — sleep on futex instead of spinning.
-                const cur = self.wake_signal.load(.acquire);
-                // Re-check running before sleeping (avoid missed wake on shutdown).
-                if (!self.running.load(.acquire)) break;
-                std.Thread.Futex.timedWait(&self.wake_signal, cur, 50_000_000) catch {};
+                // No work — brief spin-then-yield.
+                std.atomic.spinLoopHint();
+                std.Thread.yield() catch {};
                 continue;
             };
 

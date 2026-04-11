@@ -27,17 +27,10 @@ pub const Seqlock = struct {
     /// Begin a read.  Returns the current sequence number.
     /// Spins until no write is in progress (seq is even).
     pub inline fn readBegin(self: *const Seqlock) u64 {
-        var spins: u32 = 0;
         while (true) {
             const s = self.seq.load(.acquire);
             if (s & 1 == 0) return s;
-            spins += 1;
-            if (spins > 16) {
-                std.Thread.yield() catch {};
-                spins = 0;
-            } else {
-                std.atomic.spinLoopHint();
-            }
+            std.atomic.spinLoopHint();
         }
     }
 
@@ -52,7 +45,6 @@ pub const Seqlock = struct {
     /// Acquire the write lock (spins until no other writer is active).
     /// After this call seq is ODD — readers will spin.
     pub fn writeLock(self: *Seqlock) void {
-        var spins: u32 = 0;
         while (true) {
             const s = self.seq.load(.acquire);
             if (s & 1 == 0) {
@@ -60,13 +52,7 @@ pub const Seqlock = struct {
                 if (self.seq.cmpxchgStrong(s, s + 1, .acq_rel, .monotonic) == null)
                     return;
             }
-            spins += 1;
-            if (spins > 16) {
-                std.Thread.yield() catch {};
-                spins = 0;
-            } else {
-                std.atomic.spinLoopHint();
-            }
+            std.atomic.spinLoopHint();
         }
     }
 

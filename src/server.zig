@@ -911,9 +911,16 @@ fn jsonValue(json: []const u8, key: []const u8) ?[]const u8 {
 
     const ch = json[start];
     if (ch == '"') {
-        // String value — return content without quotes
-        const end = std.mem.indexOfScalarPos(u8, json, start + 1, '"') orelse return null;
-        return json[start + 1 .. end];
+        // String value — return the raw JSON token including quotes so it stays
+        // valid when embedded in a JSON response via {s}.  A stringified JSON
+        // string like "value":"{\"a\":1}" is stored as "{\"a\":1}" (quotes + escapes)
+        // and re-emitted verbatim by handleGet.
+        var i = start + 1;
+        while (i < json.len) : (i += 1) {
+            if (json[i] == '\\' and i + 1 < json.len) { i += 1; continue; }
+            if (json[i] == '"') break;
+        }
+        return json[start .. i + 1]; // include both quotes
     } else if (ch == '{' or ch == '[') {
         // Object or array — find matching close bracket
         const close: u8 = if (ch == '{') '}' else ']';
