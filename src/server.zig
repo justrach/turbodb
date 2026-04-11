@@ -965,9 +965,13 @@ fn extractContentLength(raw: []const u8) usize {
 
 fn jsonStr(json: []const u8, key: []const u8) ?[]const u8 {
     var kbuf: [64]u8 = undefined;
-    const needle = std.fmt.bufPrint(&kbuf, "\"{s}\":\"", .{key}) catch return null;
+    const needle = std.fmt.bufPrint(&kbuf, "\"{s}\":", .{key}) catch return null;
     const pos = std.mem.indexOf(u8, json, needle) orelse return null;
-    const start = pos + needle.len;
+    var start = pos + needle.len;
+    // Skip optional whitespace after colon (e.g. "key": "value")
+    while (start < json.len and (json[start] == ' ' or json[start] == '\t')) start += 1;
+    if (start >= json.len or json[start] != '"') return null;
+    start += 1; // skip opening quote
     const end = std.mem.indexOfScalarPos(u8, json, start, '"') orelse return null;
     return json[start..end];
 }
