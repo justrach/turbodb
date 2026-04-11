@@ -193,6 +193,8 @@ pub const Collection = struct {
     index_thread: ?std.Thread,
     index_thread2: ?std.Thread,
     index_stop: std.atomic.Value(bool),
+    /// Futex signal — index workers sleep on this when queues are empty.
+    index_wake: std.atomic.Value(u32),
     queue_toggle: std.atomic.Value(u32),
     indexing_count: std.atomic.Value(u32),
 
@@ -248,6 +250,7 @@ pub const Collection = struct {
         col.index_queue = IndexQueue.init(alloc);
         col.index_queue2 = IndexQueue.init(alloc);
         col.index_stop = std.atomic.Value(bool).init(false);
+        col.index_wake = std.atomic.Value(u32).init(0);
         col.queue_toggle = std.atomic.Value(u32).init(0);
         col.indexing_count = std.atomic.Value(u32).init(0);
         col.vectors = null;
@@ -271,6 +274,8 @@ pub const Collection = struct {
     pub fn close(self: *Collection) void {
         // Signal background indexers to stop, then join both threads.
         self.index_stop.store(true, .release);
+        // Wake sleeping index workers so they observe the stop flag.
+        std.Thread.Futex.wake(&self.index_wake, std.math.maxInt(u32));
         if (self.index_thread) |t| t.join();
         if (self.index_thread2) |t| t.join();
         // Drain any leftover entries from both queues (free owned slices).
@@ -322,9 +327,14 @@ pub const Collection = struct {
     /// Block until the background indexers have drained all pending items
     /// and finished processing the current batch.
     pub fn flushIndex(self: *Collection) void {
-        var waited: u32 = 0;
-        while ((self.index_queue.len() > 0 or self.index_queue2.len() > 0 or self.indexing_count.load(.acquire) > 0) and waited < 300_000) : (waited += 1) {
-            std.Thread.sleep(100_000); // 100µs
+        var sleep_ns: u64 = 100_000; // start at 100µs
+        var total_ns: u64 = 0;
+        const max_ns: u64 = 30_000_000_000; // 30s total cap
+        while ((self.index_queue.len() > 0 or self.index_queue2.len() > 0 or self.indexing_count.load(.acquire) > 0) and total_ns < max_ns) {
+            std.Thread.sleep(sleep_ns);
+            total_ns += sleep_ns;
+            // Exponential backoff: 100µs → 200µs → ... → 10ms cap.
+            sleep_ns = @min(sleep_ns * 2, 10_000_000);
         }
     }
 
@@ -425,6 +435,9 @@ pub const Collection = struct {
                         }
                         std.Thread.yield() catch {};
                     }
+                    // Wake sleeping index worker to process the new entry.
+                    _ = self.index_wake.fetchAdd(1, .release);
+                    std.Thread.Futex.wake(&self.index_wake, 1);
                 }
             }
         }
@@ -1434,7 +1447,10 @@ fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
         }
         if (n == 0) {
             _ = col.indexing_count.fetchSub(1, .release);
-            std.Thread.yield() catch {};
+            // Sleep on futex instead of spinning — woken by index push path.
+            const cur = col.index_wake.load(.acquire);
+            if (!col.index_stop.load(.acquire))
+                std.Thread.Futex.timedWait(&col.index_wake, cur, 50_000_000) catch {};
             continue;
         }
         // Batch trigram indexing (single lock acquisition for all docs).

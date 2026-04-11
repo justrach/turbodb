@@ -48,10 +48,17 @@ const NodeHeader = struct {
     }
 
     fn writeLock(self: *NodeHeader) void {
+        var spins: u32 = 0;
         while (true) {
             const v = self.version.load(.acquire);
             if (v & 1 != 0) {
-                std.atomic.spinLoopHint();
+                spins += 1;
+                if (spins > 16) {
+                    std.Thread.yield() catch {};
+                    spins = 0;
+                } else {
+                    std.atomic.spinLoopHint();
+                }
                 continue;
             }
             if (self.version.cmpxchgWeak(v, v + 1, .acq_rel, .acquire)) |_| {
