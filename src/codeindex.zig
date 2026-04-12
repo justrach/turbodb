@@ -14,6 +14,8 @@ pub const WordIndex = struct {
     /// path → set of words contributed (for efficient re-index cleanup)
     file_words: std.StringHashMap(std.StringHashMap(void)),
     allocator: std.mem.Allocator,
+    /// Mutex for concurrent access (background indexer writes, search reads).
+    mu: std.Thread.Mutex = .{},
 
     /// Cap hits per word to bound memory. Common words ("the", "var", "if")
     /// accumulate thousands of hits — beyond this they waste memory for
@@ -82,6 +84,8 @@ pub const WordIndex = struct {
 
     /// Index a file's content — tokenizes into words and records hits.
     pub fn indexFile(self: *WordIndex, path: []const u8, content: []const u8) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
         // Clean up old entries first
         self.removeFile(path);
 
@@ -139,6 +143,8 @@ pub const WordIndex = struct {
 
     /// Look up all hits for a word. O(1) lookup + O(hits) iteration.
     pub fn search(self: *WordIndex, word: []const u8) []const WordHit {
+        self.mu.lock();
+        defer self.mu.unlock();
         if (self.index.get(word)) |hits| {
             return hits.items;
         }
