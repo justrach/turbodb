@@ -283,7 +283,9 @@ pub const WAL = struct {
 
     // ── Checkpoint ────────────────────────────────────────────────────────────
 
-    /// Write a checkpoint barrier entry and update checkpoint_lsn.
+    /// Write a checkpoint barrier entry, flush, then truncate the WAL file.
+    /// After checkpoint all data is durable in page files, so the WAL can be
+    /// safely cleared to reclaim disk space.
     pub fn checkpoint(self: *WAL, db_tag: u8) !void {
         var p: [8]u8 = undefined;
         std.mem.writeInt(u64, &p, self.checkpoint_lsn, .little);
@@ -298,6 +300,11 @@ pub const WAL = struct {
         self.file.writeAll(to_write.items) catch {};
         to_write.deinit(self.allocator);
         try self.file.sync();
+
+        // Truncate WAL — all data is checkpointed to page files.
+        self.file.seekTo(0) catch {};
+        self.file.setEndPos(0) catch {};
+
         self.mu.lock();
         self.synced_lsn = lsn;
         self.flushing = false;

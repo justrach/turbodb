@@ -24,6 +24,11 @@ pub const TrigramIndex = struct {
     doc_count: u64,
     trigram_count: u64,
 
+    /// Maximum posting list length per trigram. Trigrams appearing in more docs
+    /// than this are too common to be useful for search — stop tracking them to
+    /// bound memory. 10K docs × 8 bytes = 80KB per trigram, manageable.
+    const MAX_POSTINGS_PER_TRIGRAM: usize = 10_000;
+
     pub fn init(alloc: std.mem.Allocator) TrigramIndex {
         return .{
             .postings = std.AutoHashMap(u24, std.ArrayList(u64)).init(alloc),
@@ -53,6 +58,8 @@ pub const TrigramIndex = struct {
                 self.trigram_count += 1;
             }
             const list = gop.value_ptr;
+            // Skip overly common trigrams to bound memory.
+            if (list.items.len >= MAX_POSTINGS_PER_TRIGRAM) continue;
             if (list.items.len == 0 or list.items[list.items.len - 1] != doc_id) {
                 try list.append(self.alloc, doc_id);
             }

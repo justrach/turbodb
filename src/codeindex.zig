@@ -15,6 +15,11 @@ pub const WordIndex = struct {
     file_words: std.StringHashMap(std.StringHashMap(void)),
     allocator: std.mem.Allocator,
 
+    /// Cap hits per word to bound memory. Common words ("the", "var", "if")
+    /// accumulate thousands of hits — beyond this they waste memory for
+    /// negligible search value.
+    const MAX_HITS_PER_WORD: usize = 5_000;
+
     pub fn init(allocator: std.mem.Allocator) WordIndex {
         return .{
             .index = std.StringHashMap(std.ArrayList(WordHit)).init(allocator),
@@ -101,6 +106,9 @@ pub const WordIndex = struct {
                     gop.key_ptr.* = duped_word;
                     gop.value_ptr.* = .{};
                 }
+
+                // Skip overly common words to bound memory.
+                if (gop.value_ptr.items.len >= MAX_HITS_PER_WORD) continue;
 
                 if (gop.value_ptr.items.len > 0) {
                     const last = gop.value_ptr.items[gop.value_ptr.items.len - 1];
