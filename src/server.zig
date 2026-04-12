@@ -349,7 +349,7 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
         const q_raw = qparam(query, "q") orelse return err(400, "missing q parameter");
         var decode_buf: [4096]u8 = undefined;
         const q = urlDecode(q_raw, &decode_buf) orelse q_raw;
-        const limit_val: u32 = qparamInt(query, "limit") orelse 50;
+        const limit_val: u32 = @min(qparamInt(query, "limit") orelse 50, 500);
         return handleSearch(srv, requestTenant(raw, query), col_name, q, limit_val, alloc);
     }
 
@@ -359,7 +359,7 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
         const q_raw = qparam(query, "q") orelse return err(400, "missing q parameter");
         var decode_buf: [4096]u8 = undefined;
         const q = urlDecode(q_raw, &decode_buf) orelse q_raw;
-        const limit_val: u32 = qparamInt(query, "limit") orelse 20;
+        const limit_val: u32 = @min(qparamInt(query, "limit") orelse 20, 100);
         return handleDiscoverContext(srv, requestTenant(raw, query), col_name, q, limit_val, alloc);
     }
 
@@ -585,7 +585,7 @@ fn handleDelete(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: 
 
 fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_str: []const u8, as_of: ?i64, alloc: std.mem.Allocator) usize {
     const start_ns = std.time.nanoTimestamp();
-    const limit: u32 = qparamInt(query_str, "limit") orelse 20;
+    const limit: u32 = @min(qparamInt(query_str, "limit") orelse 20, 1000);
     const offset: u32 = qparamInt(query_str, "offset") orelse 0;
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
@@ -603,6 +603,8 @@ fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_s
     std.fmt.format(w, "{{\"tenant\":\"{s}\",\"collection\":\"{s}\",\"count\":{d},\"docs\":[",
         .{ tenant_id, col_name, result.docs.len }) catch {};
     for (result.docs, 0..) |d, i| {
+        // Stop writing if buffer is nearly full to avoid truncated JSON.
+        if (fbs.pos + 256 >= MAX_BODY) break;
         if (i > 0) w.writeByte(',') catch {};
         const val = if (d.value.len > 0) d.value else "{}";
         const is_json = val.len > 0 and (val[0] == '{' or val[0] == '[' or val[0] == '"');
@@ -620,8 +622,8 @@ fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_s
     }
     w.writeAll("]}") catch {};
     return ok(getBodyBuf()[0..fbs.pos]);
-}
 
+}
 fn handleDrop(srv: *Server, tenant_id: []const u8, col_name: []const u8) usize {
     const start_ns = std.time.nanoTimestamp();
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
@@ -652,6 +654,7 @@ fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query
         "\",\"hits\":{d},\"candidates\":{d},\"total_docs\":{d},\"total_files\":{d},\"results\":[",
         .{ result.docs.len, result.candidate_paths.len, col.docCount(), result.total_files }) catch {};
     for (result.docs, 0..) |d, i| {
+        if (fbs.pos + 256 >= MAX_BODY) break;
         if (i > 0) w.writeByte(',') catch {};
         // Output value as valid JSON — objects/arrays as-is, strings quoted
         const val = if (d.value.len > 0) d.value else "{}";
