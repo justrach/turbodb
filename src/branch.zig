@@ -54,14 +54,17 @@ pub const Branch = struct {
     /// Write a key-value pair on this branch (CoW — only stores the delta)
     pub fn write(self: *Branch, key: []const u8, value: []const u8, epoch: u64) !void {
         const key_hash = fnv1a(key);
-        // Free old write if exists
+        // Allocate new copies BEFORE freeing old ones — if alloc fails,
+        // the existing entry stays valid.
+        const owned_key = try self.allocator.dupe(u8, key);
+        errdefer self.allocator.free(owned_key);
+        const owned_val = try self.allocator.dupe(u8, value);
+        errdefer self.allocator.free(owned_val);
+        // Free old write if exists (safe — new copies already allocated)
         if (self.writes.getPtr(key_hash)) |old| {
             if (old.key.len > 0) self.allocator.free(old.key);
             if (old.value.len > 0) self.allocator.free(old.value);
         }
-        const owned_key = try self.allocator.dupe(u8, key);
-        errdefer self.allocator.free(owned_key);
-        const owned_val = try self.allocator.dupe(u8, value);
         try self.writes.put(key_hash, .{
             .key = owned_key,
             .value = owned_val,

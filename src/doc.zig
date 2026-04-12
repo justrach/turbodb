@@ -76,9 +76,11 @@ pub const Doc = struct {
 pub fn decode(buf: []const u8) error{TooShort,Corrupt}!struct { doc: Doc, consumed: usize } {
     if (buf.len < DocHeader.size) return error.TooShort;
     const hdr: DocHeader = std.mem.bytesToValue(DocHeader, buf[0..DocHeader.size]);
-    const total = DocHeader.size + hdr.key_len + hdr.val_len;
-    if (buf.len < total) return error.TooShort;
     if (hdr.key_len > 1024) return error.Corrupt;
+    // Sanity check: reject impossibly large values (>64MB) as corruption.
+    if (hdr.val_len > 64 * 1024 * 1024) return error.Corrupt;
+    const total = DocHeader.size + @as(usize, hdr.key_len) + @as(usize, hdr.val_len);
+    if (buf.len < total) return error.TooShort;
     return .{
         .doc = .{
             .header = hdr,

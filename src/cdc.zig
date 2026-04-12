@@ -198,10 +198,21 @@ pub const CDCManager = struct {
                 return;
             }
             const ev = self.pending.orderedRemove(0);
-            const subs = self.subscriptions.items;
+            // Snapshot subscription count under lock — iterate by index so we
+            // re-read items pointer each iteration (safe if ArrayList grows).
+            const sub_count = self.subscriptions.items.len;
             self.mu.unlock();
 
-            for (subs) |sub| {
+            var si: usize = 0;
+            while (si < sub_count) : (si += 1) {
+                self.mu.lock();
+                if (si >= self.subscriptions.items.len) {
+                    self.mu.unlock();
+                    break;
+                }
+                const sub = self.subscriptions.items[si];
+                self.mu.unlock();
+
                 if (!matches(sub, ev)) continue;
                 const delivery = makeDelivery(sub, ev);
                 self.mu.lock();

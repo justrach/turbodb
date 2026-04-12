@@ -231,11 +231,10 @@ pub const WAL = struct {
 
         self.mu.lock();
         // Backpressure: wait until flusher drains the buffer below threshold.
-        var waits: u32 = 0;
-        while (self.write_buf.items.len >= MAX_WRITE_BUF and waits < 100) : (waits += 1) {
-            self.mu.unlock();
-            std.Thread.yield() catch {};
-            self.mu.lock();
+        // Use condition variable instead of yield-loop so the flusher can wake us.
+        while (self.write_buf.items.len >= MAX_WRITE_BUF) {
+            // Release lock and wait for flusher to signal.
+            self.cond.wait(&self.mu);
         }
         defer self.mu.unlock();
         try self.write_buf.appendSlice(self.allocator, std.mem.asBytes(&hdr));
