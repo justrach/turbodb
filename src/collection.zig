@@ -1603,6 +1603,13 @@ pub const Database = struct {
             kv.value.close();
             self.alloc.free(kv.key);
         }
+
+        // Delete the backing page file so data doesn't reappear on re-access.
+        var storage_name_buf: [MAX_TENANT_ID_LEN + MAX_COLLECTION_NAME_LEN + 4]u8 = undefined;
+        const storage_name = makeStorageName(&storage_name_buf, tenant_id, name) catch return;
+        var path_buf: [512]u8 = undefined;
+        const page_path = std.fmt.bufPrint(&path_buf, "{s}/{s}.pages", .{ self.dataDir(), storage_name }) catch return;
+        std.fs.cwd().deleteFile(page_path) catch {};
     }
 
     pub fn listCollectionsForTenant(self: *Database, tenant_id: []const u8, alloc: std.mem.Allocator) !std.ArrayList([]const u8) {
