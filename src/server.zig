@@ -228,9 +228,16 @@ fn handleConn(srv: *Server, conn: std.net.Server.Connection) void {
         if (n == 0) return;
         _ = srv.req_count.fetchAdd(1, .monotonic);
 
+        const initial = bufs.req[0..n];
+
+        // WebSocket upgrade: switch to persistent framed mode.
+        if (headerContains(initial, "upgrade", "websocket")) {
+            handleWebSocket(srv, conn, initial) catch {};
+            return; // WS handler owns the connection until close
+        }
+
         // For bulk inserts: read the full body based on Content-Length.
         // The initial read may only contain part of a large body.
-        const initial = bufs.req[0..n];
         const content_length = extractContentLength(initial);
         const is_bulk = std.mem.indexOf(u8, initial[0..@min(n, 256)], "/bulk") != null;
 
@@ -1122,6 +1129,224 @@ fn hexVal(c: u8) ?u4 {
     if (c >= 'a' and c <= 'f') return @intCast(c - 'a' + 10);
     if (c >= 'A' and c <= 'F') return @intCast(c - 'A' + 10);
     return null;
+}
+
+// ─── WebSocket ───────────────────────────────────────────────────────────
+
+/// Read exactly `buf.len` bytes from the stream, looping as needed.
+fn wsReadExact(conn: std.net.Server.Connection, buf: []u8) !void {
+    var filled: usize = 0;
+    while (filled < buf.len) {
+        const n = conn.stream.read(buf[filled..]) catch return error.ReadFailed;
+        if (n == 0) return error.ConnectionClosed;
+        filled += n;
+    }
+}
+/// Case-insensitive header value check.
+fn headerContains(raw: []const u8, name: []const u8, value: []const u8) bool {
+    const headers = raw[0..@min(raw.len, 4096)];
+    var i: usize = 0;
+    while (i + name.len + 2 < headers.len) : (i += 1) {
+        if (headers[i] == '\n') {
+            const line_start = i + 1;
+            if (line_start + name.len + 2 >= headers.len) continue;
+            var match = true;
+            for (0..name.len) |j| {
+                const a = headers[line_start + j];
+                const b = name[j];
+                const al = if (a >= 'A' and a <= 'Z') a + 32 else a;
+                const bl = if (b >= 'A' and b <= 'Z') b + 32 else b;
+                if (al != bl) { match = false; break; }
+            }
+            if (!match) continue;
+            if (headers[line_start + name.len] != ':') continue;
+            // Found header — check value (case-insensitive)
+            var vs = line_start + name.len + 1;
+            while (vs < headers.len and (headers[vs] == ' ' or headers[vs] == '\t')) vs += 1;
+            const ve = std.mem.indexOfScalarPos(u8, headers, vs, '\r') orelse
+                std.mem.indexOfScalarPos(u8, headers, vs, '\n') orelse headers.len;
+            const hval = headers[vs..ve];
+            if (hval.len < value.len) continue;
+            var vmatch = true;
+            for (0..value.len) |j| {
+                const a = hval[j];
+                const b = value[j];
+                const al = if (a >= 'A' and a <= 'Z') a + 32 else a;
+                const bl = if (b >= 'A' and b <= 'Z') b + 32 else b;
+                if (al != bl) { vmatch = false; break; }
+            }
+            if (vmatch) return true;
+        }
+    }
+    return false;
+}
+
+/// Extract a specific header value from raw HTTP request.
+fn headerValue(raw: []const u8, name: []const u8) ?[]const u8 {
+    const headers = raw[0..@min(raw.len, 4096)];
+    var i: usize = 0;
+    while (i + name.len + 2 < headers.len) : (i += 1) {
+        if (headers[i] == '\n') {
+            const ls = i + 1;
+            if (ls + name.len + 2 >= headers.len) continue;
+            var match = true;
+            for (0..name.len) |j| {
+                const a = headers[ls + j];
+                const b = name[j];
+                const al = if (a >= 'A' and a <= 'Z') a + 32 else a;
+                const bl = if (b >= 'A' and b <= 'Z') b + 32 else b;
+                if (al != bl) { match = false; break; }
+            }
+            if (!match) continue;
+            if (headers[ls + name.len] != ':') continue;
+            var vs = ls + name.len + 1;
+            while (vs < headers.len and (headers[vs] == ' ' or headers[vs] == '\t')) vs += 1;
+            const ve = std.mem.indexOfScalarPos(u8, headers, vs, '\r') orelse
+                std.mem.indexOfScalarPos(u8, headers, vs, '\n') orelse headers.len;
+            return headers[vs..ve];
+        }
+    }
+    return null;
+}
+
+const WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+/// Perform WebSocket upgrade handshake, then loop reading WS frames.
+/// Each text message is a JSON request dispatched through the normal
+/// HTTP handler; the response body is sent back as a WS text frame.
+fn handleWebSocket(srv: *Server, conn: std.net.Server.Connection, initial: []const u8) !void {
+    // Extract Sec-WebSocket-Key
+    const ws_key = headerValue(initial, "Sec-WebSocket-Key") orelse return error.MissingKey;
+
+    // Compute accept hash: SHA1(key ++ magic), base64-encoded
+    var sha = std.crypto.hash.Sha1.init(.{});
+    sha.update(ws_key);
+    sha.update(WS_MAGIC);
+    const digest = sha.finalResult();
+    var accept_buf: [28]u8 = undefined;
+    const accept = std.base64.standard.Encoder.encode(&accept_buf, &digest);
+
+    // Send upgrade response
+    var resp_buf: [256]u8 = undefined;
+    const resp_len = std.fmt.bufPrint(&resp_buf,
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n",
+        .{accept}) catch return error.FormatFailed;
+    conn.stream.writeAll(resp_len) catch return error.WriteFailed;
+
+    // WebSocket frame loop — heap-allocate frame buffer (too large for stack).
+    const frame_buf = std.heap.page_allocator.alloc(u8, MAX_BULK) catch return error.OutOfMemory;
+    defer std.heap.page_allocator.free(frame_buf);
+    while (true) {
+        // Read frame header (2 bytes minimum)
+        var hdr: [14]u8 = undefined;
+        wsReadExact(conn, hdr[0..2]) catch return;
+        const fin = hdr[0] & 0x80 != 0;
+        const opcode = hdr[0] & 0x0F;
+        const masked = hdr[1] & 0x80 != 0;
+        var payload_len: u64 = hdr[1] & 0x7F;
+
+        if (opcode == 0x8) return; // close frame
+        if (opcode == 0x9) { // ping → pong
+            hdr[0] = 0x8A; // FIN + pong
+            conn.stream.writeAll(hdr[0..2]) catch return;
+            continue;
+        }
+
+        // Extended payload length
+        if (payload_len == 126) {
+            wsReadExact(conn, hdr[2..4]) catch return;
+            payload_len = std.mem.readInt(u16, hdr[2..4], .big);
+        } else if (payload_len == 127) {
+            wsReadExact(conn, hdr[2..10]) catch return;
+            payload_len = std.mem.readInt(u64, hdr[2..10], .big);
+        }
+
+        if (payload_len > MAX_BULK) {
+            wsWriteClose(conn, 1009); // message too big
+            return;
+        }
+
+        // Read mask key (4 bytes if masked)
+        var mask: [4]u8 = .{0, 0, 0, 0};
+        if (masked) wsReadExact(conn, &mask) catch return;
+
+        // Read payload
+        const plen: usize = @intCast(payload_len);
+        const payload = frame_buf[0..plen];
+        wsReadExact(conn, payload) catch return;
+
+        // Unmask
+        if (masked) {
+            for (payload, 0..) |*b, j| b.* ^= mask[j % 4];
+        }
+
+        _ = fin; // TODO: handle fragmented messages
+
+        if (opcode == 0x1) { // text frame — dispatch as request
+            _ = srv.req_count.fetchAdd(1, .monotonic);
+
+            // Build a synthetic HTTP request from the WS message.
+            // Expected format: {"op":"insert","col":"name","key":"k","value":{...}}
+            // Or direct HTTP path: "POST /db/mycol\n{...body...}"
+            const resp_body = wsDispatch(srv, payload);
+            wsWriteText(conn, resp_body) catch return;
+        }
+    }
+}
+
+/// Dispatch a WebSocket text message. Supports two formats:
+///   1. Raw HTTP: "METHOD /path\n{body}" — reuses dispatch()
+///   2. JSON ops: {"op":"insert","col":"c","key":"k","value":{}} (future)
+fn wsDispatch(srv: *Server, msg: []const u8) []const u8 {
+    // Wrap as a minimal HTTP request so we can reuse dispatch().
+    // Find first \n to split method+path from body.
+    const nl = std.mem.indexOfScalar(u8, msg, '\n') orelse msg.len;
+    const req_line = msg[0..nl];
+    const body = if (nl < msg.len) msg[nl + 1 ..] else "";
+
+    // Build HTTP/1.1 request with Content-Length.
+    // Heap-allocate since WS messages can be up to 16MB.
+    const needed = req_line.len + 64 + body.len;
+    const http_buf = std.heap.page_allocator.alloc(u8, needed) catch
+        return "{\"error\":\"request too large\"}";
+    defer std.heap.page_allocator.free(http_buf);
+    const http_len = std.fmt.bufPrint(http_buf,
+        "{s} HTTP/1.1\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ req_line, body.len, body }) catch return "{\"error\":\"request too large\"}";
+
+    const resp_len = dispatch(srv, http_len, std.heap.page_allocator);
+    const resp = getRespBuf()[0..resp_len];
+
+    // Strip HTTP headers from response, return just the body
+    if (std.mem.indexOf(u8, resp, "\r\n\r\n")) |p| return resp[p + 4 ..];
+    return resp;
+}
+
+fn wsWriteText(conn: std.net.Server.Connection, payload: []const u8) !void {
+    var hdr: [10]u8 = undefined;
+    hdr[0] = 0x81; // FIN + text
+    var hdr_len: usize = 2;
+    if (payload.len < 126) {
+        hdr[1] = @intCast(payload.len);
+    } else if (payload.len < 65536) {
+        hdr[1] = 126;
+        std.mem.writeInt(u16, hdr[2..4], @intCast(payload.len), .big);
+        hdr_len = 4;
+    } else {
+        hdr[1] = 127;
+        std.mem.writeInt(u64, hdr[2..10], @intCast(payload.len), .big);
+        hdr_len = 10;
+    }
+    try conn.stream.writeAll(hdr[0..hdr_len]);
+    try conn.stream.writeAll(payload);
+}
+
+fn wsWriteClose(conn: std.net.Server.Connection, code: u16) void {
+    var frame: [4]u8 = undefined;
+    frame[0] = 0x88; // FIN + close
+    frame[1] = 2;    // payload = 2 bytes (status code)
+    std.mem.writeInt(u16, frame[2..4], code, .big);
+    conn.stream.writeAll(&frame) catch {};
 }
 
 test "parse as_of accepts seconds and milliseconds" {
