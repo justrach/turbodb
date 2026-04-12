@@ -996,9 +996,9 @@ fn jsonValue(json: []const u8, key: []const u8) ?[]const u8 {
         var i = start + 1;
         while (i < json.len) : (i += 1) {
             if (json[i] == '\\' and i + 1 < json.len) { i += 1; continue; }
-            if (json[i] == '"') break;
+            if (json[i] == '"') return json[start .. i + 1]; // include both quotes
         }
-        return json[start .. i + 1]; // include both quotes
+        return null; // unterminated string
     } else if (ch == '{' or ch == '[') {
         // Object or array — find matching close bracket
         const close: u8 = if (ch == '{') '}' else ']';

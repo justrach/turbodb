@@ -164,7 +164,7 @@ fn extractJsonFloatArray(json: []const u8, field_name: []const u8, out: []f32) ?
 pub const Collection = struct {
     pub const STRIPE_COUNT = 1024;
     // MVCC GC: trigger version chain cleanup every GC_INTERVAL inserts.
-    const GC_INTERVAL: u64 = 10_000;
+    const GC_INTERVAL: u64 = 500;
 
     name_buf: [128]u8,
     name_len: u8,
