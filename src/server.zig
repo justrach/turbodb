@@ -227,34 +227,47 @@ fn handleConn(srv: *Server, conn: std.net.Server.Connection) void {
         // The initial read may only contain part of a large body.
         const initial = bufs.req[0..n];
         const content_length = extractContentLength(initial);
-        if (content_length > MAX_REQ and content_length <= MAX_BULK) {
-            // Check this is actually a bulk request before allocating
-            const is_bulk = std.mem.indexOf(u8, initial[0..@min(n, 256)], "/bulk") != null;
-            if (is_bulk) {
-                // Find where headers end
-                const header_end = if (std.mem.indexOf(u8, initial, "\r\n\r\n")) |p| p + 4
-                    else if (std.mem.indexOf(u8, initial, "\n\n")) |p| p + 2
-                    else n;
-                const total_size = header_end + content_length;
-                if (total_size <= MAX_BULK) {
-                    const big_buf = std.heap.page_allocator.alloc(u8, total_size) catch {
-                        const resp_len = dispatch(srv, initial, std.heap.page_allocator);
-                        conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
-                        continue;
-                    };
-                    defer std.heap.page_allocator.free(big_buf);
-                    @memcpy(big_buf[0..n], initial);
-                    // Read remaining bytes
-                    while (n < total_size) {
-                        const r = conn.stream.read(big_buf[n..total_size]) catch break;
-                        if (r == 0) break;
-                        n += r;
-                    }
-                    const resp_len = dispatch(srv, big_buf[0..n], std.heap.page_allocator);
+        const is_bulk = std.mem.indexOf(u8, initial[0..@min(n, 256)], "/bulk") != null;
+
+        if (content_length > MAX_REQ and content_length <= MAX_BULK and is_bulk) {
+            // Large bulk: allocate a big buffer and read the full body.
+            const header_end = if (std.mem.indexOf(u8, initial, "\r\n\r\n")) |p| p + 4
+                else if (std.mem.indexOf(u8, initial, "\n\n")) |p| p + 2
+                else n;
+            const total_size = header_end + content_length;
+            if (total_size <= MAX_BULK) {
+                const big_buf = std.heap.page_allocator.alloc(u8, total_size) catch {
+                    const resp_len = dispatch(srv, initial, std.heap.page_allocator);
                     conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
                     continue;
+                };
+                defer std.heap.page_allocator.free(big_buf);
+                @memcpy(big_buf[0..n], initial);
+                // Read remaining bytes
+                while (n < total_size) {
+                    const r = conn.stream.read(big_buf[n..total_size]) catch break;
+                    if (r == 0) break;
+                    n += r;
                 }
+                const resp_len = dispatch(srv, big_buf[0..n], std.heap.page_allocator);
+                conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
+                continue;
             }
+        } else if (content_length > 0 and content_length <= MAX_REQ and is_bulk) {
+            // Small bulk: body fits in the req buffer but the initial read may
+            // not have received it all.  Keep reading until we have the full body.
+            const header_end = if (std.mem.indexOf(u8, initial, "\r\n\r\n")) |p| p + 4
+                else if (std.mem.indexOf(u8, initial, "\n\n")) |p| p + 2
+                else n;
+            const total_size = @min(header_end + content_length, bufs.req.len);
+            while (n < total_size) {
+                const r = conn.stream.read(bufs.req[n..total_size]) catch break;
+                if (r == 0) break;
+                n += r;
+            }
+            const resp_len = dispatch(srv, bufs.req[0..n], std.heap.page_allocator);
+            conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
+            continue;
         }
 
         const resp_len = dispatch(srv, initial, std.heap.page_allocator);
@@ -998,7 +1011,7 @@ fn jsonValue(json: []const u8, key: []const u8) ?[]const u8 {
             if (json[i] == '\\' and i + 1 < json.len) { i += 1; continue; }
             if (json[i] == '"') return json[start .. i + 1]; // include both quotes
         }
-        return null; // unterminated string
+        return null; // unterminated string — don't read past buffer
     } else if (ch == '{' or ch == '[') {
         // Object or array — find matching close bracket
         const close: u8 = if (ch == '{') '}' else ']';
