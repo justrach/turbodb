@@ -959,13 +959,28 @@ fn respond(code: u16, status: []const u8, body: []const u8) usize {
 // ─── mini parsers ────────────────────────────────────────────────────────
 
 fn extractContentLength(raw: []const u8) usize {
-    // Case-insensitive search for Content-Length header
+    // Fully case-insensitive search for Content-Length header.
     const headers = raw[0..@min(raw.len, 2048)]; // only scan headers
-    const needle = "ontent-length: "; // skip first char for case insensitivity
     var i: usize = 0;
-    while (i + needle.len < headers.len) : (i += 1) {
-        if ((headers[i] == 'C' or headers[i] == 'c') and std.mem.eql(u8, headers[i + 1 .. i + 1 + needle.len], needle)) {
-            const start = i + 1 + needle.len;
+    while (i + 16 < headers.len) : (i += 1) {
+        if ((headers[i] == 'C' or headers[i] == 'c') and
+            (headers[i + 1] == 'o' or headers[i + 1] == 'O') and
+            (headers[i + 2] == 'n' or headers[i + 2] == 'N') and
+            (headers[i + 3] == 't' or headers[i + 3] == 'T') and
+            (headers[i + 4] == 'e' or headers[i + 4] == 'E') and
+            (headers[i + 5] == 'n' or headers[i + 5] == 'N') and
+            (headers[i + 6] == 't' or headers[i + 6] == 'T') and
+            headers[i + 7] == '-' and
+            (headers[i + 8] == 'L' or headers[i + 8] == 'l') and
+            (headers[i + 9] == 'e' or headers[i + 9] == 'E') and
+            (headers[i + 10] == 'n' or headers[i + 10] == 'N') and
+            (headers[i + 11] == 'g' or headers[i + 11] == 'G') and
+            (headers[i + 12] == 't' or headers[i + 12] == 'T') and
+            (headers[i + 13] == 'h' or headers[i + 13] == 'H') and
+            headers[i + 14] == ':')
+        {
+            var start = i + 15;
+            while (start < headers.len and (headers[start] == ' ' or headers[start] == '\t')) start += 1;
             var end = start;
             while (end < headers.len and headers[end] >= '0' and headers[end] <= '9') : (end += 1) {}
             if (end > start) {
