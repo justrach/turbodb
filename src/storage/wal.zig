@@ -118,6 +118,9 @@ pub const WAL = struct {
     flush_thread: ?std.Thread,
     flush_running: std.atomic.Value(bool),
 
+    /// Backpressure: block writers if pending buffer exceeds this.
+    const MAX_WRITE_BUF: usize = 8 * 1024 * 1024; // 8 MiB
+
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     pub fn open(path: [:0]const u8, allocator: std.mem.Allocator) !WAL {
@@ -201,6 +204,7 @@ pub const WAL = struct {
 
     /// Encode an entry into the shared write buffer and return its LSN.
     /// Thread-safe.  Does NOT guarantee durability — call commit(lsn) for that.
+    /// Blocks if write buffer exceeds MAX_WRITE_BUF to apply backpressure.
     pub fn write(
         self:    *WAL,
         txn_id:  u64,
@@ -226,6 +230,13 @@ pub const WAL = struct {
         hdr.crc32 = entryChecksum(hdr_bytes, payload);
 
         self.mu.lock();
+        // Backpressure: wait until flusher drains the buffer below threshold.
+        var waits: u32 = 0;
+        while (self.write_buf.items.len >= MAX_WRITE_BUF and waits < 100) : (waits += 1) {
+            self.mu.unlock();
+            std.Thread.yield() catch {};
+            self.mu.lock();
+        }
         defer self.mu.unlock();
         try self.write_buf.appendSlice(self.allocator, std.mem.asBytes(&hdr));
         try self.write_buf.appendSlice(self.allocator, payload);

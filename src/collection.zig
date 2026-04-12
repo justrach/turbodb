@@ -30,7 +30,7 @@ pub const MAX_COLLECTION_NAME_LEN: usize = 64;
 // Lock-free MPSC queue for deferring trigram+word index builds to a background thread.
 // Insert path pushes owned (key, value) pairs; background thread pops and indexes.
 pub const IndexQueue = struct {
-    const CAPACITY = 32768; // 32K entries per queue
+    const CAPACITY = 131072; // 128K entries — sized for 100+ concurrent writers
 
     const Entry = struct {
         key: []const u8,
@@ -162,7 +162,7 @@ fn extractJsonFloatArray(json: []const u8, field_name: []const u8, out: []f32) ?
 }
 // ─── Collection ──────────────────────────────────────────────────────────
 pub const Collection = struct {
-    pub const STRIPE_COUNT = 1024;
+    pub const STRIPE_COUNT = 4096;
     // MVCC GC: trigger version chain cleanup every GC_INTERVAL inserts.
     const GC_INTERVAL: u64 = 500;
 
@@ -261,10 +261,10 @@ pub const Collection = struct {
         col.name_len = @intCast(n);
         try col.rebuildIndexes();
 
-        // Start background indexer thread. If spawn fails, inserts fall back to sync
+        // Start background indexer threads. If spawn fails, inserts fall back to sync
         // indexing via the queue-full path (queue stays empty, retries exhaust immediately).
         col.index_thread = std.Thread.spawn(.{}, indexWorkerQ, .{ col, &col.index_queue }) catch null;
-        col.index_thread2 = null; // Second worker slot — available for future use
+        col.index_thread2 = std.Thread.spawn(.{}, indexWorkerQ, .{ col, &col.index_queue2 }) catch null;
 
         return col;
     }

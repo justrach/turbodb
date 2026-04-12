@@ -111,11 +111,14 @@ pub const Server = struct {
             };
             // Reject if at connection limit to prevent OOM from thread exhaustion.
             if (self.active_conns.load(.monotonic) >= MAX_CONNECTIONS) {
+                // Return HTTP 503 instead of silent RST so clients can retry.
+                const reject = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 31\r\nConnection: close\r\n\r\n{\"error\":\"too many connections\"}";
+                conn.stream.writeAll(reject) catch {};
                 conn.stream.close();
                 _ = self.err_count.fetchAdd(1, .monotonic);
                 continue;
             }
-            const t = std.Thread.spawn(.{}, handleConnWrapped, .{self, conn}) catch {
+            const t = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, handleConnWrapped, .{self, conn}) catch {
                 conn.stream.close();
                 _ = self.err_count.fetchAdd(1, .monotonic);
                 continue;
@@ -149,11 +152,13 @@ pub const Server = struct {
             const stream = std.net.Stream{ .handle = client_fd };
             const conn = std.net.Server.Connection{ .stream = stream, .address = std.net.Address.initUnix(path) catch continue };
             if (self.active_conns.load(.monotonic) >= MAX_CONNECTIONS) {
+                const reject = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 31\r\nConnection: close\r\n\r\n{\"error\":\"too many connections\"}";
+                conn.stream.writeAll(reject) catch {};
                 conn.stream.close();
                 _ = self.err_count.fetchAdd(1, .monotonic);
                 continue;
             }
-            const t = std.Thread.spawn(.{}, handleConnWrapped, .{ self, conn }) catch {
+            const t = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, handleConnWrapped, .{ self, conn }) catch {
                 conn.stream.close();
                 continue;
             };
