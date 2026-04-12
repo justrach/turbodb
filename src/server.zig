@@ -480,6 +480,7 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
     _ = alloc;
     const start_ns = std.time.nanoTimestamp();
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    srv.db.ensureTenantStorageAvailable(tenant_id, body.len) catch return err(429, "tenant storage quota exceeded");
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
 
     var inserted: u32 = 0;
@@ -697,16 +698,19 @@ fn handleDiscoverContext(srv: *Server, tenant_id: []const u8, col_name: []const 
     }
     w.writeAll("\",\"matching_files\":[") catch {};
     for (result.matching_files, 0..) |d, i| {
+        if (fbs.pos + 128 >= MAX_BODY) break;
         if (i > 0) w.writeByte(',') catch {};
         std.fmt.format(w, "{{\"key\":\"{s}\",\"size\":{d}}}", .{ d.key, d.value.len }) catch {};
     }
     w.writeAll("],\"related_files\":[") catch {};
     for (result.related_files, 0..) |d, i| {
+        if (fbs.pos + 128 >= MAX_BODY) break;
         if (i > 0) w.writeByte(',') catch {};
         std.fmt.format(w, "{{\"key\":\"{s}\"}}", .{d.key}) catch {};
     }
     w.writeAll("],\"test_files\":[") catch {};
     for (result.test_files, 0..) |d, i| {
+        if (fbs.pos + 128 >= MAX_BODY) break;
         if (i > 0) w.writeByte(',') catch {};
         std.fmt.format(w, "{{\"key\":\"{s}\"}}", .{d.key}) catch {};
     }
