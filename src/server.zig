@@ -23,6 +23,9 @@ const MAX_BULK = 16 * 1024 * 1024; // 16 MiB for bulk inserts
 
 // Heap-allocated per-connection buffers (threadlocal pointers set in handleConn).
 // This avoids large threadlocal TLS segments that break in Release mode on macOS.
+// Note: connection threads use 2 MiB stacks (up from 256 KiB) because the
+// Collection.open call chain is deep and Zig's debug-mode stack probes need
+// headroom on macOS ARM64.  Production builds should use -Doptimize=ReleaseFast.
 const ConnBufs = struct {
     req:  [MAX_REQ]u8,
     resp: [MAX_RESP]u8,
@@ -118,7 +121,7 @@ pub const Server = struct {
                 _ = self.err_count.fetchAdd(1, .monotonic);
                 continue;
             }
-            const t = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, handleConnWrapped, .{self, conn}) catch {
+            const t = std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, handleConnWrapped, .{self, conn}) catch {
                 conn.stream.close();
                 _ = self.err_count.fetchAdd(1, .monotonic);
                 continue;
@@ -158,7 +161,7 @@ pub const Server = struct {
                 _ = self.err_count.fetchAdd(1, .monotonic);
                 continue;
             }
-            const t = std.Thread.spawn(.{ .stack_size = 256 * 1024 }, handleConnWrapped, .{ self, conn }) catch {
+            const t = std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, handleConnWrapped, .{ self, conn }) catch {
                 conn.stream.close();
                 continue;
             };
