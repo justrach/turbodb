@@ -670,6 +670,8 @@ pub const Collection = struct {
         _ = self.key_epochs.remove(key_hash);
         self.shared_mu.unlock();
         self.cache.invalidate(key_hash);
+        self.tri.removeFile(key);
+        self.words.removeFile(key);
         emitChange(self, .delete, key, "", old_doc.header.doc_id);
         return true;
     }
@@ -1103,7 +1105,7 @@ pub const Collection = struct {
         const vc = self.vectors orelse return self.searchText(text_query, limit, result_alloc);
 
         // Phase 1: Text pre-filter — get candidate doc keys
-        const text_results = try self.searchText(text_query, limit * 3, result_alloc);
+        var text_results = try self.searchText(text_query, limit * 3, result_alloc);
 
         if (text_results.docs.len == 0 or vector_query.len != vc.dims) {
             return text_results;
@@ -1150,10 +1152,8 @@ pub const Collection = struct {
             text_results.docs[i] = sd.doc;
         }
 
-        // If we have more docs than limit, shrink the slice
         if (text_results.docs.len > out_len) {
-            // We can't easily shrink, but the caller will respect .docs.len
-            // Just return the full text_results (already re-ranked in-place)
+            text_results.docs = text_results.docs[0..out_len];
         }
 
         return text_results;
