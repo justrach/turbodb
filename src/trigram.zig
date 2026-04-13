@@ -75,7 +75,7 @@ pub const TrigramIndex = struct {
             const key = trigramKey(value[i], value[i + 1], value[i + 2]);
             if (self.postings.getPtr(key)) |list| {
                 for (list.items) |*id| {
-                    if (id.* == doc_id) id.* = 0;
+                    if (id.* == doc_id) id.* = std.math.maxInt(u64);
                 }
             }
         }
@@ -126,7 +126,7 @@ pub const TrigramIndex = struct {
         errdefer result.deinit(alloc);
 
         for (seed) |id| {
-            if (id != 0) try result.append(alloc, id);
+            if (id != std.math.maxInt(u64)) try result.append(alloc, id);
         }
 
         // Intersect with remaining

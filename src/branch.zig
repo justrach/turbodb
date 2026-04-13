@@ -22,13 +22,12 @@ pub const Branch = struct {
     agent_id: [64]u8, // which agent owns this branch
     agent_id_len: u8,
 
-    // Branch-local storage: key_hash -> value (only modified keys)
+    // Branch-local storage: actual key string -> value (only modified keys)
     // This is the CoW layer — unmodified keys fall through to main
-    writes: std.AutoHashMap(u64, BranchWrite),
+    writes: std.StringHashMap(BranchWrite),
     allocator: Allocator,
 
     pub const BranchWrite = struct {
-        key: []const u8, // owned copy
         value: []const u8, // owned copy
         deleted: bool, // true = tombstone (deleted on branch)
         epoch: u64, // when this write happened
@@ -45,15 +44,14 @@ pub const Branch = struct {
     pub fn deinit(self: *Branch) void {
         var it = self.writes.iterator();
         while (it.next()) |entry| {
-            if (entry.value_ptr.key.len > 0) self.allocator.free(entry.value_ptr.key);
             if (entry.value_ptr.value.len > 0) self.allocator.free(entry.value_ptr.value);
+            self.allocator.free(@constCast(entry.key_ptr.*));
         }
         self.writes.deinit();
     }
 
     /// Write a key-value pair on this branch (CoW — only stores the delta)
     pub fn write(self: *Branch, key: []const u8, value: []const u8, epoch: u64) !void {
-        const key_hash = fnv1a(key);
         // Allocate new copies BEFORE freeing old ones — if alloc fails,
         // the existing entry stays valid.
         const owned_key = try self.allocator.dupe(u8, key);
@@ -61,12 +59,15 @@ pub const Branch = struct {
         const owned_val = try self.allocator.dupe(u8, value);
         errdefer self.allocator.free(owned_val);
         // Free old write if exists (safe — new copies already allocated)
-        if (self.writes.getPtr(key_hash)) |old| {
-            if (old.key.len > 0) self.allocator.free(old.key);
+        if (self.writes.getPtr(key)) |old| {
             if (old.value.len > 0) self.allocator.free(old.value);
+            // Free the old key that was used as the map key.
+            const old_map_key = self.writes.getKey(key).?;
+            self.allocator.free(@constCast(old_map_key));
+            // Remove old entry so we can insert with new owned key.
+            _ = self.writes.remove(key);
         }
-        try self.writes.put(key_hash, .{
-            .key = owned_key,
+        try self.writes.put(owned_key, .{
             .value = owned_val,
             .deleted = false,
             .epoch = epoch,
@@ -75,14 +76,14 @@ pub const Branch = struct {
 
     /// Mark a key as deleted on this branch
     pub fn delete(self: *Branch, key: []const u8, epoch: u64) !void {
-        const key_hash = fnv1a(key);
-        if (self.writes.getPtr(key_hash)) |old| {
-            if (old.key.len > 0) self.allocator.free(old.key);
+        if (self.writes.getPtr(key)) |old| {
             if (old.value.len > 0) self.allocator.free(old.value);
+            const old_map_key = self.writes.getKey(key).?;
+            self.allocator.free(@constCast(old_map_key));
+            _ = self.writes.remove(key);
         }
         const owned_key = try self.allocator.dupe(u8, key);
-        try self.writes.put(key_hash, .{
-            .key = owned_key,
+        try self.writes.put(owned_key, .{
             .value = &.{},
             .deleted = true,
             .epoch = epoch,
@@ -91,8 +92,7 @@ pub const Branch = struct {
 
     /// Read a key on this branch. Returns branch-local value or null (fall through to main).
     pub fn read(self: *const Branch, key: []const u8) ?BranchRead {
-        const key_hash = fnv1a(key);
-        if (self.writes.get(key_hash)) |w| {
+        if (self.writes.get(key)) |w| {
             if (w.deleted) return .{ .deleted = true, .value = null };
             return .{ .deleted = false, .value = w.value };
         }
@@ -111,7 +111,7 @@ pub const Branch = struct {
         while (it.next()) |entry| {
             const w = entry.value_ptr.*;
             try entries.append(alloc, .{
-                .key = w.key,
+                .key = entry.key_ptr.*,
                 .value = w.value,
                 .deleted = w.deleted,
                 .epoch = w.epoch,
@@ -168,7 +168,7 @@ pub fn compareBranches(branches: []*const Branch, alloc: Allocator) !CompareResu
     for (branches) |br| {
         var it = br.writes.iterator();
         while (it.next()) |entry| {
-            try all_keys.put(entry.value_ptr.key, {});
+            try all_keys.put(entry.key_ptr.*, {});
         }
     }
 
@@ -186,7 +186,7 @@ pub fn compareBranches(branches: []*const Branch, alloc: Allocator) !CompareResu
                     .agent_id = br.getAgentId(),
                     .value = r.value,
                     .deleted = r.deleted,
-                    .epoch = if (br.writes.get(fnv1a(key))) |w| w.epoch else 0,
+                    .epoch = if (br.writes.get(key)) |w| w.epoch else 0,
                 });
             }
         }
@@ -435,7 +435,7 @@ pub const BranchManager = struct {
             .status = .active,
             .agent_id = undefined,
             .agent_id_len = aid_len,
-            .writes = std.AutoHashMap(u64, Branch.BranchWrite).init(self.allocator),
+            .writes = std.StringHashMap(Branch.BranchWrite).init(self.allocator),
             .allocator = self.allocator,
         };
         @memcpy(branch.name[0..name_len], name_arg[0..name_len]);

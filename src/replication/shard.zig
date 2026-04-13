@@ -162,6 +162,8 @@ pub const ShardManager = struct {
         self.mu.lock();
         defer self.mu.unlock();
         try self.shard_map.put(self.alloc, entry.partition_id, entry);
+        // Also update the consistent hash ring so routeKey reflects new partitions.
+        try self.ring.addNode(entry.node_id);
     }
 
     /// Look up which node owns a partition.

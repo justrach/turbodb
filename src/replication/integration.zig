@@ -71,6 +71,11 @@ pub const ReplicatedDB = struct {
     receiver: ?PeerReceiver,
     alloc: std.mem.Allocator,
     next_txn_id: std.atomic.Value(u64),
+    executor_ptr: ?*calvin.CalvinExecutor,
+
+    /// Module-level context pointer for the executor callback.
+    /// Set once during startReplication; asserted to be set only once.
+    var g_ctx: ?*ReplicatedDB = null;
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -87,6 +92,7 @@ pub const ReplicatedDB = struct {
             .receiver = null,
             .alloc = alloc,
             .next_txn_id = std.atomic.Value(u64).init(1),
+            .executor_ptr = null,
         };
 
         if (config.enabled) {
@@ -100,24 +106,32 @@ pub const ReplicatedDB = struct {
 
     pub fn deinit(self: *ReplicatedDB) void {
         if (self.receiver) |*r| r.stop();
+        if (self.executor_ptr) |ptr| self.alloc.destroy(ptr);
         if (self.repl_mgr) |*mgr| mgr.deinit();
+        if (g_ctx == self) g_ctx = null;
     }
 
     /// Start replication (leader batch loop + replica receiver).
     pub fn startReplication(self: *ReplicatedDB) !void {
         if (self.repl_mgr) |*mgr| {
-            // Set global state for the executor callback
-            g_db_handle = self.db_handle;
-            g_ops = self.ops;
+            // Set module-level context for the executor callback (assert set-once).
+            std.debug.assert(g_ctx == null);
+            g_ctx = self;
             mgr.setBatchReadyHook(self, leaderBatchReady);
 
             try mgr.start();
 
             if (!self.config.is_leader) {
+                // Bug 2 fix: heap-allocate the executor to a stable location
+                // instead of taking a pointer into the optional field.
+                const executor_ptr = try self.alloc.create(calvin.CalvinExecutor);
+                executor_ptr.* = mgr.executor;
+                self.executor_ptr = executor_ptr;
+
                 self.receiver = PeerReceiver.init(
                     self.alloc,
                     self.config.repl_port,
-                    &mgr.executor,
+                    executor_ptr,
                     &executeTransaction,
                 );
                 const t = try std.Thread.spawn(.{}, PeerReceiver.run, .{&self.receiver.?});
@@ -146,12 +160,17 @@ pub const ReplicatedDB = struct {
 
             var data_buf: [4096]u8 = undefined;
             const data_len = packTxnData(&data_buf, branch_name, col_name, key, value);
+            if (data_len == 0) return null;
 
             const data = self.alloc.alloc(u8, data_len) catch return null;
-            @memcpy(data, data_buf[0..data_len]);
 
-            const ws = self.alloc.alloc(u64, 1) catch return null;
+            const ws = self.alloc.alloc(u64, 1) catch {
+                self.alloc.free(data);
+                return null;
+            };
             ws[0] = key_hash;
+
+            @memcpy(data, data_buf[0..data_len]);
 
             const txn_id = self.next_txn_id.fetchAdd(1, .monotonic);
             const txn = Transaction{
@@ -165,7 +184,11 @@ pub const ReplicatedDB = struct {
                 .owns_buffers = true,
             };
 
-            mgr.submit(txn) catch return null;
+            mgr.submit(txn) catch {
+                self.alloc.free(data);
+                self.alloc.free(ws);
+                return null;
+            };
             return txn_id;
         }
 
@@ -190,12 +213,17 @@ pub const ReplicatedDB = struct {
 
             var data_buf: [4096]u8 = undefined;
             const data_len = packTxnData(&data_buf, branch_name, col_name, key, value);
+            if (data_len == 0) return false;
 
             const data = self.alloc.alloc(u8, data_len) catch return false;
-            @memcpy(data, data_buf[0..data_len]);
 
-            const ws = self.alloc.alloc(u64, 1) catch return false;
+            const ws = self.alloc.alloc(u64, 1) catch {
+                self.alloc.free(data);
+                return false;
+            };
             ws[0] = key_hash;
+
+            @memcpy(data, data_buf[0..data_len]);
 
             const txn = Transaction{
                 .txn_id = self.next_txn_id.fetchAdd(1, .monotonic),
@@ -208,7 +236,11 @@ pub const ReplicatedDB = struct {
                 .owns_buffers = true,
             };
 
-            mgr.submit(txn) catch return false;
+            mgr.submit(txn) catch {
+                self.alloc.free(data);
+                self.alloc.free(ws);
+                return false;
+            };
             return true;
         }
 
@@ -232,12 +264,17 @@ pub const ReplicatedDB = struct {
 
             var data_buf: [256]u8 = undefined;
             const data_len = packTxnData(&data_buf, branch_name, col_name, key, "");
+            if (data_len == 0) return false;
 
             const data = self.alloc.alloc(u8, data_len) catch return false;
-            @memcpy(data, data_buf[0..data_len]);
 
-            const ws = self.alloc.alloc(u64, 1) catch return false;
+            const ws = self.alloc.alloc(u64, 1) catch {
+                self.alloc.free(data);
+                return false;
+            };
             ws[0] = key_hash;
+
+            @memcpy(data, data_buf[0..data_len]);
 
             const txn = Transaction{
                 .txn_id = self.next_txn_id.fetchAdd(1, .monotonic),
@@ -250,7 +287,11 @@ pub const ReplicatedDB = struct {
                 .owns_buffers = true,
             };
 
-            mgr.submit(txn) catch return false;
+            mgr.submit(txn) catch {
+                self.alloc.free(data);
+                self.alloc.free(ws);
+                return false;
+            };
             return true;
         }
 
@@ -276,6 +317,15 @@ pub const ReplicatedDB = struct {
 // Format: [branch_len:u8][branch][col_name_len:u8][col_name][key_len:u16 LE][key][value]
 
 fn packTxnData(buf: []u8, branch_name: []const u8, col_name: []const u8, key: []const u8, value: []const u8) usize {
+    // Bounds check: 1 (branch_len) + branch + 1 (col_len) + col + 2 (key_len) + key + value
+    const total = 4 + branch_name.len + col_name.len + key.len + value.len;
+    if (total > buf.len) return 0;
+
+    // Check that branch_name and col_name lengths fit in u8
+    if (branch_name.len > std.math.maxInt(u8)) return 0;
+    if (col_name.len > std.math.maxInt(u8)) return 0;
+    if (key.len > std.math.maxInt(u16)) return 0;
+
     var pos: usize = 0;
     buf[pos] = @intCast(branch_name.len);
     pos += 1;
@@ -317,9 +367,9 @@ fn unpackTxnData(data: []const u8) ?struct { branch: []const u8, col: []const u8
 }
 
 // ── Transaction executor (called by CalvinExecutor) ──────────────────────────
-
-var g_db_handle: ?*anyopaque = null;
-var g_ops: DBOps = .{};
+// Bug 1 fix: replaced global g_db_handle/g_ops with ReplicatedDB.g_ctx.
+// The executor callback signature is fixed (no context parameter), so we use
+// a module-level pointer that is set once during startReplication.
 
 const BranchCall = struct {
     branch_buf: [64]u8 = [_]u8{0} ** 64,
@@ -355,30 +405,32 @@ const BranchCall = struct {
 };
 
 fn executeTransaction(txn: *const Transaction) anyerror!void {
-    const db = g_db_handle orelse return error.DatabaseNotInitialized;
+    const ctx = ReplicatedDB.g_ctx orelse return error.DatabaseNotInitialized;
+    const db = ctx.db_handle;
+    const ops = ctx.ops;
     const parsed = unpackTxnData(txn.data) orelse return error.InvalidData;
 
     switch (txn.txn_type) {
         .put => {
             // put = insert or update (same semantics: upsert)
             if (parsed.branch.len > 0) {
-                if (g_ops.insert_branch_fn) |f| {
+                if (ops.insert_branch_fn) |f| {
                     _ = f(db, parsed.branch, parsed.col, parsed.key, parsed.val);
                     return;
                 }
             }
-            if (g_ops.insert_fn) |f| {
+            if (ops.insert_fn) |f| {
                 _ = f(db, parsed.col, parsed.key, parsed.val);
             }
         },
         .delete => {
             if (parsed.branch.len > 0) {
-                if (g_ops.delete_branch_fn) |f| {
+                if (ops.delete_branch_fn) |f| {
                     _ = f(db, parsed.branch, parsed.col, parsed.key);
                     return;
                 }
             }
-            if (g_ops.delete_fn) |f| {
+            if (ops.delete_fn) |f| {
                 _ = f(db, parsed.col, parsed.key);
             }
         },
@@ -386,8 +438,8 @@ fn executeTransaction(txn: *const Transaction) anyerror!void {
     }
 }
 
-fn leaderBatchReady(ctx: *anyopaque, batch: *const sequencer.Batch) anyerror!void {
-    const self: *ReplicatedDB = @ptrCast(@alignCast(ctx));
+fn leaderBatchReady(ctx_ptr: *anyopaque, batch: *const sequencer.Batch) anyerror!void {
+    const self: *ReplicatedDB = @ptrCast(@alignCast(ctx_ptr));
 
     const buf = try self.alloc.alloc(u8, 1 << 20);
     defer self.alloc.free(buf);
@@ -511,8 +563,13 @@ test "executeTransaction routes branch payloads to branch callbacks" {
     };
 
     var seen = BranchCall{};
-    g_db_handle = @ptrCast(&seen);
-    g_ops = ops;
+    // Use a temporary ReplicatedDB to set up g_ctx for the executor callback.
+    var rdb = try ReplicatedDB.init(std.testing.allocator, @ptrCast(&seen), ops, .{});
+    defer rdb.deinit();
+    ReplicatedDB.g_ctx = &rdb;
+    defer {
+        ReplicatedDB.g_ctx = null;
+    }
 
     var buf: [256]u8 = undefined;
     const len = packTxnData(&buf, "feature-x", "users", "alice", "{\"name\":\"Alice\"}");
@@ -554,8 +611,10 @@ test "leader batch hook executes queued writes locally" {
     });
     defer rdb.deinit();
 
-    g_db_handle = rdb.db_handle;
-    g_ops = rdb.ops;
+    ReplicatedDB.g_ctx = &rdb;
+    defer {
+        ReplicatedDB.g_ctx = null;
+    }
     try rdb.repl_mgr.?.executor.setLocalPartitions(&.{@as(u16, @intCast(fnv1a("alice") % 256))});
 
     const txn_id = rdb.insert("users", "alice", "{\"name\":\"Alice\"}");

@@ -666,13 +666,14 @@ export fn turbodb_branch_diff(
     var it = br.writes.iterator();
     while (it.next()) |entry| {
         const bw = entry.value_ptr.*;
+        const bw_key = entry.key_ptr.*;
         if (bw.deleted) continue;
 
         if (!first_file) w.writeByte(',') catch return -1;
         first_file = false;
 
         // Get main version for comparison
-        const main_doc = col.get(bw.key);
+        const main_doc = col.get(bw_key);
         const old_val = if (main_doc) |d| d.value else "";
 
         // Compute line diff
@@ -680,9 +681,8 @@ export fn turbodb_branch_diff(
         defer alloc.free(diffs);
 
         w.writeAll("{\"key\":\"") catch return -1;
-        w.writeAll(bw.key) catch return -1;
+        w.writeAll(bw_key) catch return -1;
         w.writeAll("\",\"lines\":[") catch return -1;
-
         for (diffs, 0..) |d, di| {
             if (di > 0) w.writeByte(',') catch return -1;
             const kind_str = switch (d.kind) {

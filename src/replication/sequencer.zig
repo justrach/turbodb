@@ -19,9 +19,10 @@ pub const Batch = struct {
     epoch: u64,
     sequence_start: u64,
     transactions: []Transaction,
+    owns_transactions: bool = true,
 
     pub fn deinit(self: *Batch, alloc: std.mem.Allocator) void {
-        alloc.free(self.transactions);
+        if (self.owns_transactions) alloc.free(self.transactions);
     }
 
     pub fn deinitDeep(self: *Batch, alloc: std.mem.Allocator) void {
@@ -32,7 +33,7 @@ pub const Batch = struct {
                 if (txn.read_set.len > 0) alloc.free(txn.read_set);
             }
         }
-        alloc.free(self.transactions);
+        if (self.owns_transactions) alloc.free(self.transactions);
     }
 };
 
@@ -262,6 +263,7 @@ test "sequencer: detect write-write conflicts" {
         .epoch = 0,
         .sequence_start = 0,
         .transactions = &txns,
+        .owns_transactions = false,
     };
 
     const conflicts = try Sequencer.detectConflicts(&batch, alloc);

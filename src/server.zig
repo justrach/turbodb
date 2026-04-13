@@ -629,9 +629,10 @@ fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_s
     const w = fbs.writer();
     std.fmt.format(w, "{{\"tenant\":\"{s}\",\"collection\":\"{s}\",\"count\":{d},\"docs\":[",
         .{ esc_tid, esc_col, result.docs.len }) catch {};
+    var truncated = false;
     for (result.docs, 0..) |d, i| {
         // Stop writing if buffer is nearly full to avoid truncated JSON.
-        if (fbs.pos + 256 >= MAX_BODY) break;
+        if (fbs.pos + 256 >= MAX_BODY) { truncated = true; break; }
         if (i > 0) w.writeByte(',') catch {};
         var esc_dk_buf: [1024]u8 = undefined;
         const esc_dk = jsonEscape(d.key, &esc_dk_buf);
@@ -650,6 +651,13 @@ fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_s
         }
     }
     w.writeAll("]}") catch {};
+    if (truncated) {
+        // Overwrite the trailing '}' with ',"truncated":true}'
+        if (fbs.pos >= 1) {
+            fbs.pos -= 1; // back over '}'
+            w.writeAll(",\"truncated\":true}") catch {};
+        }
+    }
     return ok(getBodyBuf()[0..fbs.pos]);
 
 }
@@ -682,8 +690,9 @@ fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query
     std.fmt.format(w,
         "\",\"hits\":{d},\"candidates\":{d},\"total_docs\":{d},\"total_files\":{d},\"results\":[",
         .{ result.docs.len, result.candidate_paths.len, col.docCount(), result.total_files }) catch {};
+    var truncated = false;
     for (result.docs, 0..) |d, i| {
-        if (fbs.pos + 256 >= MAX_BODY) break;
+        if (fbs.pos + 256 >= MAX_BODY) { truncated = true; break; }
         if (i > 0) w.writeByte(',') catch {};
         // Output value as valid JSON — objects/arrays as-is, strings quoted
         var esc_dk_buf: [1024]u8 = undefined;
@@ -704,6 +713,12 @@ fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query
         }
     }
     w.writeAll("]}") catch {};
+    if (truncated) {
+        if (fbs.pos >= 1) {
+            fbs.pos -= 1;
+            w.writeAll(",\"truncated\":true}") catch {};
+        }
+    }
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 

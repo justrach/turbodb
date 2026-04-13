@@ -325,9 +325,9 @@ pub const TrigramIndex = struct {
         }
         self.file_trigrams.deinit();
 
-        // Free owned path strings in id_to_path
+        // Free owned path strings in id_to_path (skip empty slots from removed files)
         for (self.id_to_path.items) |p| {
-            self.allocator.free(p);
+            if (p.len > 0) self.allocator.free(p);
         }
         self.id_to_path.deinit(self.allocator);
 
@@ -365,6 +365,16 @@ pub const TrigramIndex = struct {
         }
         trigrams.deinit(self.allocator);
         _ = self.file_trigrams.remove(file_id);
+
+        // Clean up path_to_id and id_to_path mappings
+        if (file_id < self.id_to_path.items.len) {
+            const path = self.id_to_path.items[file_id];
+            if (path.len > 0) {
+                _ = self.path_to_id.remove(path);
+                self.allocator.free(path);
+                self.id_to_path.items[file_id] = &.{};
+            }
+        }
     }
 
     /// Legacy wrapper for callers that pass a path string.
@@ -441,11 +451,18 @@ pub const TrigramIndex = struct {
         // Per-doc trigram sets collected outside the lock
         const BatchEntry = struct { tris: []Trigram };
         var batch: [64]BatchEntry = undefined;
+        const batch_len = @min(paths.len, 64);
 
-        for (paths, contents, 0..) |path, content, di| {
+        var allocated_count: usize = 0;
+        errdefer for (0..allocated_count) |i| {
+            if (batch[i].tris.len > 0) self.allocator.free(batch[i].tris);
+        };
+
+        for (paths[0..batch_len], contents[0..batch_len], 0..) |path, content, di| {
             _ = path;
             if (content.len < 3 or content.len > MAX_INDEX_FILE_SIZE) {
                 batch[di].tris = &.{};
+                allocated_count += 1;
                 continue;
             }
             reusable_tris.clearRetainingCapacity();
@@ -471,13 +488,14 @@ pub const TrigramIndex = struct {
                 idx += 1;
             }
             batch[di].tris = tris;
+            allocated_count += 1;
         }
 
         // Single lock acquisition for all docs
         self.mu.lock();
         defer self.mu.unlock();
 
-        for (paths, contents, 0..) |path, _, di| {
+        for (paths[0..batch_len], contents[0..batch_len], 0..) |path, _, di| {
             const tris = batch[di].tris;
             defer if (tris.len > 0) self.allocator.free(tris);
             if (tris.len == 0) continue;
@@ -1625,11 +1643,13 @@ pub fn buildCoveringSet(query: []const u8, allocator: std.mem.Allocator) ![]Spar
 /// In-memory sparse n-gram index.  Mirrors the TrigramIndex API so it can
 /// be used as a drop-in acceleration layer alongside the trigram index.
 pub const SparseNgramIndex = struct {
-    /// ngram hash → set of file paths that contain the n-gram
+    /// ngram hash -> set of file paths that contain the n-gram
     index: std.AutoHashMap(u64, std.StringHashMap(void)),
-    /// path → list of ngram hashes contributed (for cleanup on re-index)
+    /// path -> list of ngram hashes contributed (for cleanup on re-index)
     file_ngrams: std.StringHashMap(std.ArrayList(u64)),
     allocator: std.mem.Allocator,
+    /// Mutex for concurrent access.
+    mu: std.Thread.Mutex = .{},
 
     pub fn init(allocator: std.mem.Allocator) SparseNgramIndex {
         return .{
@@ -1642,6 +1662,11 @@ pub const SparseNgramIndex = struct {
     pub fn deinit(self: *SparseNgramIndex) void {
         var iter = self.index.iterator();
         while (iter.next()) |entry| {
+            // Free owned path keys inside each file_set
+            var key_iter = entry.value_ptr.keyIterator();
+            while (key_iter.next()) |k| {
+                self.allocator.free(k.*);
+            }
             entry.value_ptr.deinit();
         }
         self.index.deinit();
@@ -1654,10 +1679,19 @@ pub const SparseNgramIndex = struct {
     }
 
     pub fn removeFile(self: *SparseNgramIndex, path: []const u8) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.removeFileInner(path);
+    }
+
+    fn removeFileInner(self: *SparseNgramIndex, path: []const u8) void {
         const ngrams = self.file_ngrams.getPtr(path) orelse return;
         for (ngrams.items) |hash| {
             if (self.index.getPtr(hash)) |file_set| {
-                _ = file_set.remove(path);
+                // Find and free the owned key before removing from the set
+                if (file_set.fetchRemove(path)) |kv| {
+                    self.allocator.free(kv.key);
+                }
                 if (file_set.count() == 0) {
                     file_set.deinit();
                     _ = self.index.remove(hash);
@@ -1669,7 +1703,10 @@ pub const SparseNgramIndex = struct {
     }
 
     pub fn indexFile(self: *SparseNgramIndex, path: []const u8, content: []const u8) !void {
-        self.removeFile(path);
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        self.removeFileInner(path);
 
         const ngrams = try extractSparseNgrams(content, self.allocator);
         defer self.allocator.free(ngrams);
@@ -1683,7 +1720,12 @@ pub const SparseNgramIndex = struct {
             if (!gop.found_existing) {
                 gop.value_ptr.* = std.StringHashMap(void).init(self.allocator);
             }
-            _ = try gop.value_ptr.getOrPut(path);
+            // Dupe path so the index owns it
+            if (!gop.value_ptr.contains(path)) {
+                const owned_path = try self.allocator.dupe(u8, path);
+                errdefer self.allocator.free(owned_path);
+                try gop.value_ptr.put(owned_path, {});
+            }
             _ = try seen.getOrPut(ng.hash);
         }
 
@@ -1698,10 +1740,13 @@ pub const SparseNgramIndex = struct {
 
     /// Find candidate files that may contain the query string.
     /// Uses the sliding-window covering set from buildCoveringSet and returns
-    /// the UNION of all matching posting lists — a superset of true matches,
+    /// the UNION of all matching posting lists -- a superset of true matches,
     /// to be verified by content search.  Returns null when the query is too
     /// short.  Caller must free the returned slice.
     pub fn candidates(self: *SparseNgramIndex, query: []const u8, allocator: std.mem.Allocator) ?[]const []const u8 {
+        self.mu.lock();
+        defer self.mu.unlock();
+
         const ngrams = buildCoveringSet(query, allocator) catch return null;
         defer allocator.free(ngrams);
 
@@ -1744,7 +1789,7 @@ pub const SparseNgramIndex = struct {
     }
 };
 
-// ─── Tests ────────────────────────────────────────────────────────────────────
+// --- Tests ----------------------------------------------------------------
 
 test "trigram index skips files exceeding MAX_INDEX_FILE_SIZE" {
     const alloc = std.testing.allocator;

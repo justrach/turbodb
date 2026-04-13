@@ -427,7 +427,7 @@ pub const Collection = struct {
                 const owned_key = self.alloc.dupe(u8, key) catch null;
                 const owned_val = self.alloc.dupe(u8, value) catch null;
                 if (owned_key != null and owned_val != null) {
-                    const q = &self.index_queue;
+                    const q = if (self.queue_toggle.fetchAdd(1, .monotonic) % 2 == 0) &self.index_queue else &self.index_queue2;
                     var retries: u32 = 0;
                     while (!q.push(owned_key.?, owned_val.?)) {
                         retries += 1;
@@ -905,7 +905,7 @@ pub const Collection = struct {
 
     fn readEntry(self: *Collection, entry: BTreeEntry) ?Doc {
         const raw = self.pf.leafRead(entry.page_no, entry.page_off,
-            DocHeader.size + 1024 + 65536);
+            DocHeader.size + 1024 + 65536) orelse return null;
         const decoded = doc_mod.decode(raw) catch return null;
         if (decoded.doc.header.flags & DocHeader.DELETED != 0) return null;
         return decoded.doc;
@@ -1176,21 +1176,22 @@ pub const Collection = struct {
         var it = br.writes.iterator();
         while (it.next()) |entry| {
             const w = entry.value_ptr.*;
+            const key = entry.key_ptr.*;
 
             if (w.deleted) {
                 applied += 1;
                 continue;
             }
 
-            const key_hash = doc_mod.fnv1a(w.key);
+            const key_hash = doc_mod.fnv1a(key);
 
             // CONFLICT DETECTION: check if main modified this key after branch was created
             if (self.key_epochs.get(key_hash)) |main_epoch| {
                 if (main_epoch > br.base_epoch) {
                     // Main was modified after branch fork — this is a real conflict
-                    const main_doc = self.get(w.key);
+                    const main_doc = self.get(key);
                     try conflicts_list.append(merge_alloc, .{
-                        .key = w.key,
+                        .key = key,
                         .branch_value = w.value,
                         .main_value = if (main_doc) |d| d.value else "",
                     });
@@ -1199,7 +1200,7 @@ pub const Collection = struct {
             }
 
             // No conflict — safe to apply
-            _ = self.insert(w.key, w.value) catch continue;
+            _ = self.insert(key, w.value) catch continue;
             applied += 1;
         }
 
@@ -1260,20 +1261,21 @@ pub const Collection = struct {
         var it = br.writes.iterator();
         while (it.next()) |entry| {
             const w = entry.value_ptr.*;
+            const key = entry.key_ptr.*;
             if (w.deleted) continue;
             // Check if query appears in the branch-local value or key
-            if (containsInsensitive(w.value, query) or containsInsensitive(w.key, query)) {
+            if (containsInsensitive(w.value, query) or containsInsensitive(key, query)) {
                 try branch_matches.append(search_alloc, Doc{
                     .header = doc_mod.DocHeader{
                         .doc_id = w.epoch,
-                        .key_hash = doc_mod.fnv1a(w.key),
+                        .key_hash = doc_mod.fnv1a(key),
                         .val_len = @intCast(w.value.len),
-                        .key_len = @intCast(w.key.len),
+                        .key_len = @intCast(key.len),
                         .flags = 0,
                         .version = 0,
                         .next_ver = 0,
                     },
-                    .key = w.key,
+                    .key = key,
                     .value = w.value,
                 });
             }

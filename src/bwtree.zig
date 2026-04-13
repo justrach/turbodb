@@ -49,9 +49,11 @@ pub const BwTree = struct {
     next_page_id: std.atomic.Value(usize),
     allocator: std.mem.Allocator,
     // Deferred reclamation: old chains retired after consolidation are parked here
-    // and freed on the next consolidation or deinit (simple two-phase approach).
+    // and freed once they are at least 2 epochs old (epoch-based safe reclamation).
     retired: std.ArrayList(*Page),
+    retired_epochs: std.ArrayList(u64),
     retired_mu: std.Thread.Mutex,
+    epoch: u64,
 
     pub fn init(allocator: std.mem.Allocator) !BwTree {
         var tree: BwTree = undefined;
@@ -59,7 +61,9 @@ pub const BwTree = struct {
         tree.root_pid = 0;
         tree.next_page_id = std.atomic.Value(usize).init(1);
         tree.retired = std.ArrayList(*Page).init(allocator);
+        tree.retired_epochs = std.ArrayList(u64).init(allocator);
         tree.retired_mu = .{};
+        tree.epoch = 0;
 
         // Zero out all mapping slots
         var i: usize = 0;
@@ -78,9 +82,10 @@ pub const BwTree = struct {
     }
 
     pub fn deinit(self: *BwTree) void {
-        // Free all retired chains first
-        self.drainRetired();
+        // Free all retired chains unconditionally on shutdown
+        self.drainAllRetired();
         self.retired.deinit();
+        self.retired_epochs.deinit();
         var i: usize = 0;
         while (i < MAX_PAGES) : (i += 1) {
             const ptr_val = self.mapping[i].load(.acquire);
@@ -109,10 +114,30 @@ pub const BwTree = struct {
     fn drainRetired(self: *BwTree) void {
         self.retired_mu.lock();
         defer self.retired_mu.unlock();
+        const current_epoch = self.epoch;
+        // Free entries that are at least 2 epochs old -- any concurrent reader
+        // that started before the retirement has completed by now.
+        var i: usize = 0;
+        while (i < self.retired.items.len) {
+            if (current_epoch -| self.retired_epochs.items[i] >= 2) {
+                self.freeChain(self.retired.items[i]);
+                _ = self.retired.swapRemove(i);
+                _ = self.retired_epochs.swapRemove(i);
+            } else {
+                i += 1;
+            }
+        }
+    }
+
+    /// Drain ALL retired entries unconditionally (used by deinit).
+    fn drainAllRetired(self: *BwTree) void {
+        self.retired_mu.lock();
+        defer self.retired_mu.unlock();
         for (self.retired.items) |page| {
             self.freeChain(page);
         }
         self.retired.clearRetainingCapacity();
+        self.retired_epochs.clearRetainingCapacity();
     }
 
     // ─── allocPage ───────────────────────────────────────────────────────
@@ -245,8 +270,10 @@ pub const BwTree = struct {
 
     /// When delta chain exceeds MAX_DELTA_CHAIN, merge into a new base page.
     pub fn consolidate(self: *BwTree, page_id: usize) void {
-        // Drain previously retired chains — they've survived at least one full
-        // consolidation cycle, so readers from the previous epoch are done.
+        // Advance global epoch so drainRetired can age out old entries.
+        self.epoch +%= 1;
+
+        // Drain previously retired chains that are old enough.
         self.drainRetired();
 
         const old = self.mapping[page_id].load(.acquire);
@@ -290,11 +317,16 @@ pub const BwTree = struct {
         ) == null) {
             // Success — park old chain head for deferred reclamation.
             // Concurrent readers may still be traversing it; it will be freed
-            // on the next consolidation cycle (two-phase epoch approach).
+            // once the entry is at least 2 epochs old.
             self.retired_mu.lock();
             defer self.retired_mu.unlock();
             self.retired.append(page) catch {
-                // If we can't track it, leak it — better than use-after-free.
+                // If we can't track it, leak it -- better than use-after-free.
+                return;
+            };
+            self.retired_epochs.append(self.epoch) catch {
+                // Keep arrays in sync: undo the page append on epoch failure.
+                _ = self.retired.pop();
             };
         } else {
             // Another thread consolidated first; discard our work

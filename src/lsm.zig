@@ -443,6 +443,7 @@ pub const LSMTree = struct {
     data_dir_len: usize,
     alloc: std.mem.Allocator,
     flush_mu: std.Thread.Mutex,
+    mem_rw: std.Thread.RwLock,
 
     pub const MAX_LEVELS = 7;
     pub const MEMTABLE_SIZE = 4 * 1024 * 1024; // 4MB
@@ -456,6 +457,7 @@ pub const LSMTree = struct {
         lsm.alloc = alloc;
         lsm.next_sst_id = 0;
         lsm.flush_mu = .{};
+        lsm.mem_rw = .{};
 
         lsm.data_dir = std.mem.zeroes([256]u8);
         if (data_dir.len > 256) return error.PathTooLong;
@@ -492,7 +494,11 @@ pub const LSMTree = struct {
         }
     }
 
-    pub fn get(self: *const LSMTree, key_hash: u64) ?BTreeEntry {
+    pub fn get(self: *LSMTree, key_hash: u64) ?BTreeEntry {
+        // Acquire shared lock to prevent torn reads during memtable swap.
+        self.mem_rw.lockShared();
+        defer self.mem_rw.unlockShared();
+
         // 1. Check active memtable.
         if (memtableSearch(self.active_mem.entries.items, key_hash)) |result| return result.entry;
 
@@ -553,14 +559,23 @@ pub const LSMTree = struct {
         if (self.active_mem.entries.items.len == 0) return;
 
         // Rotate: move active → immutable.
-        var old = self.active_mem;
-        self.active_mem = MemTable.init(self.alloc);
+        // Acquire exclusive lock for the pointer swap so get() cannot see
+        // a half-swapped state (torn read).
+        var old: MemTable = undefined;
+        {
+            self.mem_rw.lock();
+            defer self.mem_rw.unlock();
+            old = self.active_mem;
+            self.active_mem = MemTable.init(self.alloc);
+            self.immutable_mem = old;
+        }
 
         defer {
             old.deinit();
+            self.mem_rw.lock();
+            defer self.mem_rw.unlock();
             self.immutable_mem = null;
         }
-        self.immutable_mem = old;
 
         // Create L0 SSTable.
         const id = self.next_sst_id;
@@ -615,8 +630,8 @@ pub const LSMTree = struct {
                 }
                 // j-1 is the newest entry for this key.
                 const entry = all.items[j - 1];
-                // Drop tombstones when compacting to deeper levels (> L1).
-                if (level > 0 or entry.value != .tombstone) {
+                // Drop tombstones only at the deepest level (no lower level to shadow).
+                if (level + 1 < MAX_LEVELS - 1 or entry.value != .tombstone) {
                     try deduped.append(self.alloc, entry);
                 }
                 i = j;

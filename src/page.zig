@@ -127,10 +127,11 @@ pub const PageFile = struct {
     }
 
     /// Read `len` bytes from page `pno` at usable-area offset `off`.
-    pub fn leafRead(self: *PageFile, pno: u32, off: u16, len: usize) []const u8 {
+    /// Returns null if the read would extend past the page boundary.
+    pub fn leafRead(self: *PageFile, pno: u32, off: u16, len: usize) ?[]const u8 {
+        if (@as(usize, off) + len > PAGE_USABLE) return null;
         const data = self.pageData(pno);
-        const end = @min(@as(usize, off) + len, PAGE_USABLE);
-        return data[off..end];
+        return data[off..][0..len];
     }
 
     /// Iterate all documents on a leaf page, calling `cb` for each raw record slice.

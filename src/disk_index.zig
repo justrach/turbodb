@@ -261,15 +261,18 @@ pub const DiskIndex = struct {
         defer idx_file.close();
         const idx_stat = try idx_file.stat();
         const idx_mmap = try std.posix.mmap(null, idx_stat.size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, idx_file.handle, 0);
+        errdefer std.posix.munmap(idx_mmap);
 
         const n_entries = std.mem.bytesToValue(u32, idx_mmap[0..4]);
         const entries_start = 4;
         const entries_end = entries_start + n_entries * @sizeOf(LookupEntry);
+        if (entries_end > idx_stat.size) return error.CorruptIndex;
         const lookup: []const LookupEntry = @alignCast(std.mem.bytesAsSlice(LookupEntry, idx_mmap[entries_start..entries_end]));
 
         // Open postings file for pread
         const posts_path = try std.fmt.bufPrint(&buf, "{s}/posts.tdb", .{dir_path});
         const posts_fd = try std.fs.cwd().openFile(posts_path, .{});
+        errdefer posts_fd.close();
 
         // mmap files table
         const files_path = try std.fmt.bufPrint(&buf, "{s}/files.tdb", .{dir_path});
@@ -277,6 +280,7 @@ pub const DiskIndex = struct {
         defer files_file.close();
         const files_stat = try files_file.stat();
         const files_mmap = try std.posix.mmap(null, files_stat.size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, files_file.handle, 0);
+        errdefer std.posix.munmap(files_mmap);
         const n_files = std.mem.bytesToValue(u32, files_mmap[0..4]);
 
         // mmap frequency table
@@ -285,6 +289,7 @@ pub const DiskIndex = struct {
         defer freq_file.close();
         const freq_stat = try freq_file.stat();
         const freq_mmap = try std.posix.mmap(null, freq_stat.size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, freq_file.handle, 0);
+        errdefer std.posix.munmap(freq_mmap);
 
         return .{
             .lookup = lookup,
@@ -465,9 +470,10 @@ pub fn extractSparseNgrams(
     var start: usize = 0;
 
     pi = 1;
-    while (pi < n_pairs) : (pi += 1) {
+    const max_pairs = @min(n_pairs, 1024);
+    while (pi < max_pairs) : (pi += 1) {
         // Is this a local maximum? Both neighbors have lower weight
-        const is_boundary = (pi == n_pairs - 1) or
+        const is_boundary = (pi == max_pairs - 1) or
             (weights[pi] >= weights[pi - 1] and weights[pi] >= weights[pi + 1]);
 
         if (is_boundary or pi - start >= 8) {

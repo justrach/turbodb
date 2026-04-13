@@ -44,34 +44,36 @@ pub const AuthContext = struct {
 pub const AuthStore = struct {
     keys: [MAX_KEYS]KeyEntry = undefined,
     count: u32 = 0,
-    enabled: bool = false,
+    enabled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     lock: std.Thread.RwLock = .{},
 
-    /// Add an API key. Returns the BLAKE3 hash for storage.
-    pub fn addKey(self: *AuthStore, raw_key: []const u8, name: []const u8, perm: Permission) [32]u8 {
+    /// Add an API key. Returns the BLAKE3 hash if added, null if at MAX_KEYS.
+    pub fn addKey(self: *AuthStore, raw_key: []const u8, name: []const u8, perm: Permission) ?[32]u8 {
         return self.addKeyForTenant(raw_key, name, "default", perm);
     }
 
-    pub fn addKeyForTenant(self: *AuthStore, raw_key: []const u8, name: []const u8, tenant_id: []const u8, perm: Permission) [32]u8 {
+    /// Add an API key for a specific tenant. Returns the BLAKE3 hash if added,
+    /// null if the key store is full (MAX_KEYS reached).
+    pub fn addKeyForTenant(self: *AuthStore, raw_key: []const u8, name: []const u8, tenant_id: []const u8, perm: Permission) ?[32]u8 {
         self.lock.lock();
         defer self.lock.unlock();
 
+        if (self.count >= MAX_KEYS) return null;
+
         const hash = crypto.blake3(raw_key);
-        if (self.count < MAX_KEYS) {
-            var entry = KeyEntry{
-                .hash = hash,
-                .name = undefined,
-                .name_len = @intCast(@min(name.len, 64)),
-                .tenant_id = undefined,
-                .tenant_id_len = @intCast(@min(tenant_id.len, 64)),
-                .perm = perm,
-            };
-            @memcpy(entry.name[0..entry.name_len], name[0..entry.name_len]);
-            @memcpy(entry.tenant_id[0..entry.tenant_id_len], tenant_id[0..entry.tenant_id_len]);
-            self.keys[self.count] = entry;
-            self.count += 1;
-            self.enabled = true;
-        }
+        var entry = KeyEntry{
+            .hash = hash,
+            .name = undefined,
+            .name_len = @intCast(@min(name.len, 64)),
+            .tenant_id = undefined,
+            .tenant_id_len = @intCast(@min(tenant_id.len, 64)),
+            .perm = perm,
+        };
+        @memcpy(entry.name[0..entry.name_len], name[0..entry.name_len]);
+        @memcpy(entry.tenant_id[0..entry.tenant_id_len], tenant_id[0..entry.tenant_id_len]);
+        self.keys[self.count] = entry;
+        self.count += 1;
+        self.enabled.store(true, .release);
         return hash;
     }
 
@@ -82,7 +84,9 @@ pub const AuthStore = struct {
     }
 
     pub fn resolve(self: *AuthStore, raw_key: []const u8) ?AuthContext {
-        if (!self.enabled) {
+        // Fast-path: if no keys have been added, skip hashing and locking.
+        // Uses acquire to see the latest store from addKeyForTenant.
+        if (!self.enabled.load(.acquire)) {
             return AuthContext{
                 .perm = .admin,
                 .tenant_id = [_]u8{0} ** 64,
@@ -108,7 +112,7 @@ pub const AuthStore = struct {
 
     /// Check if auth is enabled.
     pub fn isEnabled(self: *AuthStore) bool {
-        return self.enabled;
+        return self.enabled.load(.acquire);
     }
 
     /// Extract API key from HTTP headers.
