@@ -260,7 +260,11 @@ fn makeDelivery(sub: Subscription, ev: Event) Delivery {
         &delivery.payload,
         "{{\"seq\":{d},\"tenant\":\"{s}\",\"collection\":\"{s}\",\"op\":\"{s}\",\"key\":\"{s}\",\"doc_id\":{d},\"value\":{s}}}",
         .{ ev.seq, esc_tenant, esc_col, op_str, esc_key, ev.doc_id, if (ev.value_len > 0) ev.valueSlice() else "null" },
-    ) catch "{}";
+    ) catch std.fmt.bufPrint(
+        &delivery.payload,
+        "{{"seq":{d},"tenant":"{s}","collection":"{s}","op":"{s}","key":"{s}","doc_id":{d},"value":null,"truncated":true}}",
+        .{ ev.seq, esc_tenant, esc_col, op_str, esc_key, ev.doc_id },
+    ) catch return delivery;
     delivery.payload_len = @intCast(payload.len);
     delivery.signature_hex = crypto.hmacSha256Hex(sub.secretSlice(), payload);
     return delivery;
