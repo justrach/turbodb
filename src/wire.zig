@@ -26,15 +26,16 @@ const HDR: usize = 5;
 const MAX_FRAME: usize = 1048576;
 const RD_BUF: usize = 65536;
 const WR_BUF: usize = 131072;
-
+const MAX_WIRE_CONNECTIONS: u32 = 512;
 pub const WireServer = struct {
     db: *Database,
     port: u16,
     running: std.atomic.Value(bool),
     activity: activity.ActivityTracker,
+    conn_count: std.atomic.Value(u32),
 
     pub fn init(db: *Database, port: u16) WireServer {
-        return .{ .db = db, .port = port, .running = std.atomic.Value(bool).init(false), .activity = activity.ActivityTracker.init() };
+        return .{ .db = db, .port = port, .running = std.atomic.Value(bool).init(false), .activity = activity.ActivityTracker.init(), .conn_count = std.atomic.Value(u32).init(0) };
     }
 
     pub fn run(self: *WireServer) !void {
@@ -45,7 +46,16 @@ pub const WireServer = struct {
         std.log.info("TurboDB wire protocol on :{d}", .{self.port});
         while (self.running.load(.acquire)) {
             const conn = listener.accept() catch continue;
-            const t = std.Thread.spawn(.{}, handleConn, .{ self, conn }) catch continue;
+            if (self.conn_count.load(.acquire) >= MAX_WIRE_CONNECTIONS) {
+                conn.stream.close();
+                continue;
+            }
+            _ = self.conn_count.fetchAdd(1, .acq_rel);
+            const t = std.Thread.spawn(.{}, handleConn, .{ self, conn }) catch {
+                _ = self.conn_count.fetchSub(1, .acq_rel);
+                conn.stream.close();
+                continue;
+            };
             t.detach();
         }
     }
@@ -75,7 +85,16 @@ pub const WireServer = struct {
             const client_fd = std.posix.accept(fd, @ptrCast(&client_addr), &addr_len, 0) catch continue;
             const stream = std.net.Stream{ .handle = client_fd };
             const conn = std.net.Server.Connection{ .stream = stream, .address = std.net.Address.initUnix(path) catch continue };
-            const t = std.Thread.spawn(.{}, handleConn, .{ self, conn }) catch continue;
+            if (self.conn_count.load(.acquire) >= MAX_WIRE_CONNECTIONS) {
+                conn.stream.close();
+                continue;
+            }
+            _ = self.conn_count.fetchAdd(1, .acq_rel);
+            const t = std.Thread.spawn(.{}, handleConn, .{ self, conn }) catch {
+                _ = self.conn_count.fetchSub(1, .acq_rel);
+                conn.stream.close();
+                continue;
+            };
             t.detach();
         }
     }
@@ -89,6 +108,7 @@ const Bufs = struct { rd: [RD_BUF]u8, wr: [WR_BUF]u8 };
 
 fn handleConn(srv: *WireServer, conn: std.net.Server.Connection) void {
     defer conn.stream.close();
+    defer _ = srv.conn_count.fetchSub(1, .acq_rel);
     const bufs = std.heap.page_allocator.create(Bufs) catch return;
     defer std.heap.page_allocator.destroy(bufs);
 
@@ -277,7 +297,8 @@ fn doScan(srv: *WireServer, p: []const u8, w: *[WR_BUF]u8) usize {
     var pos: usize = HDR + 1 + 4; // header + status + count
     w[4] = OP_SCAN;
     w[5] = STATUS_OK;
-    wrU32LE(w[6..10], @intCast(result.docs.len));
+    // Count placeholder — will be overwritten after the loop
+    var written_count: u32 = 0;
 
     for (result.docs) |d| {
         const dsz = 8 + 1 + 2 + d.key.len + 4 + d.value.len;
@@ -290,7 +311,11 @@ fn doScan(srv: *WireServer, p: []const u8, w: *[WR_BUF]u8) usize {
         if (d.value.len > 0)
             @memcpy(w[pos + 15 + d.key.len ..][0..d.value.len], d.value);
         pos += dsz;
+        written_count += 1;
     }
+    // Write the actual count of docs serialized (may be less than result.docs.len
+    // if the write buffer was exhausted)
+    wrU32LE(w[6..10], written_count);
     wrU32BE(w, @intCast(pos));
     return pos;
 }

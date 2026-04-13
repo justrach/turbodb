@@ -96,7 +96,8 @@ pub const EpochManager = struct {
 
     /// Pin the current epoch.  Returns (reader_slot, snapshot_ts).
     /// The caller must call unpin(slot) when done.
-    pub fn pin(self: *EpochManager) struct { slot: usize, ts: u64 } {
+    /// Returns error.ReadersExhausted when all slots are occupied.
+    pub fn pin(self: *EpochManager) error{ReadersExhausted}!struct { slot: usize, ts: u64 } {
         const ts = self.global_ts.load(.acquire);
         // Find a free slot
         for (self.slots, 0..) |*s, i| {
@@ -106,8 +107,8 @@ pub const EpochManager = struct {
                     return .{ .slot = i, .ts = ts };
             }
         }
-        // Fallback: return slot 0 (reader count exceeded MAX_READERS — very rare)
-        return .{ .slot = 0, .ts = ts };
+        // All slots occupied — cannot safely pin
+        return error.ReadersExhausted;
     }
 
     pub fn unpin(self: *EpochManager, slot: usize) void {

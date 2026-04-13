@@ -76,7 +76,7 @@ pub const Delivery = struct {
     webhook_url: [256]u8,
     webhook_url_len: u16,
     signature_hex: [64]u8,
-    payload: [1024]u8,
+    payload: [8192]u8,
     payload_len: u16,
 
     pub fn tenant(self: *const Delivery) []const u8 {

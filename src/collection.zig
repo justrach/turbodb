@@ -342,7 +342,7 @@ pub const Collection = struct {
     }
 
     pub fn storageBytes(self: *const Collection) usize {
-        return self.pf.mm.len;
+        return self.pf.mm.dataLen();
     }
 
     // ─── MVCC read transaction ──────────────────────────────────────────
@@ -410,12 +410,15 @@ pub const Collection = struct {
         self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
         self.key_doc_ids.put(hdr.key_hash, doc_id) catch {};
         self.key_epochs.put(hdr.key_hash, doc_id) catch {}; // epoch = doc_id (monotonic)
-
-        // Periodic MVCC version chain GC to prevent unbounded memory growth.
-        if (self.gc_counter.fetchAdd(1, .monotonic) % GC_INTERVAL == GC_INTERVAL - 1) {
-            _ = self.versions.gc(self.alloc);
-        }
+        const should_gc = self.gc_counter.fetchAdd(1, .monotonic) % GC_INTERVAL == GC_INTERVAL - 1;
         self.shared_mu.unlock();
+
+        // Run GC outside shared_mu to avoid blocking all readers during collection.
+        if (should_gc) {
+            self.shared_mu.lock();
+            _ = self.versions.gc(self.alloc);
+            self.shared_mu.unlock();
+        }
 
         // Async trigram + word indexing — push to background queue, sync fallback if full or no worker.
         if (value.len >= 3) {
@@ -866,9 +869,23 @@ pub const Collection = struct {
         errdefer results.deinit(alloc);
 
         var skipped: u32 = 0;
+        // Snapshot key_doc_ids under shared_mu to avoid racing with insert().
+        self.shared_mu.lock();
         var it = self.key_doc_ids.iterator();
+        // Collect doc_id/epoch pairs while holding the lock (fast — just integers).
+        const Pair = struct { doc_id: u64 };
+        var pairs: std.ArrayList(Pair) = .empty;
+        defer pairs.deinit(alloc);
         while (it.next()) |entry| {
             const ver = self.versions.getAtEpoch(entry.value_ptr.*, epoch) orelse continue;
+            _ = ver;
+            pairs.append(alloc, .{ .doc_id = entry.value_ptr.* }) catch continue;
+        }
+        self.shared_mu.unlock();
+
+        // Now read pages outside the lock (safe — pages are stable after mmap rewrite).
+        for (pairs.items) |pair| {
+            const ver = self.versions.getAtEpoch(pair.doc_id, epoch) orelse continue;
             const doc = self.readLoc(ver.page_no, ver.page_off) orelse continue;
             if (skipped < offset) {
                 skipped += 1;
@@ -1185,8 +1202,12 @@ pub const Collection = struct {
 
             const key_hash = doc_mod.fnv1a(key);
 
-            // CONFLICT DETECTION: check if main modified this key after branch was created
-            if (self.key_epochs.get(key_hash)) |main_epoch| {
+            // CONFLICT DETECTION: check if main modified this key after branch was created.
+            // Acquire shared_mu to safely read key_epochs (concurrent inserts mutate it).
+            self.shared_mu.lock();
+            const main_epoch_opt = self.key_epochs.get(key_hash);
+            self.shared_mu.unlock();
+            if (main_epoch_opt) |main_epoch| {
                 if (main_epoch > br.base_epoch) {
                     // Main was modified after branch fork — this is a real conflict
                     const main_doc = self.get(key);

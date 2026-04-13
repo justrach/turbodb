@@ -41,7 +41,7 @@ pub const PageFile = struct {
         var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
         const path_z = try std.fmt.bufPrintZ(&path_buf, "{s}", .{path});
         const mm = try mmap.MmapFile.open(path_z, PAGE_SIZE * 16);
-        const page_count: u32 = @intCast(mm.len / PAGE_SIZE);
+        const page_count: u32 = @intCast(mm.dataLen() / PAGE_SIZE);
         return PageFile{
             .mm         = mm,
             .free_head  = std.atomic.Value(u32).init(0),
