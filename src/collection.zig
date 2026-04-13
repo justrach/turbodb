@@ -933,8 +933,10 @@ pub const Collection = struct {
     }
 
     fn readEntry(self: *Collection, entry: BTreeEntry) ?Doc {
-        const raw = self.pf.leafRead(entry.page_no, entry.page_off,
-            DocHeader.size + 1024 + 65536) orelse return null;
+        const ph = self.pf.pageHeader(entry.page_no);
+        if (entry.page_off >= ph.used_bytes) return null;
+        const data = self.pf.pageData(entry.page_no);
+        const raw = data[entry.page_off..ph.used_bytes];
         const decoded = doc_mod.decode(raw) catch return null;
         if (decoded.doc.header.flags & DocHeader.DELETED != 0) return null;
         return decoded.doc;
@@ -979,6 +981,7 @@ pub const Collection = struct {
                 };
                 if (d.header.flags & DocHeader.DELETED == 0) {
                     self.hash_idx.put(d.header.key_hash, entry) catch {};
+                    self.idx.insert(entry) catch {};
                     self.key_doc_ids.put(d.header.key_hash, d.header.doc_id) catch {};
                     if (d.value.len >= 3) {
                         self.tri.indexFile(d.key, d.value) catch {};
