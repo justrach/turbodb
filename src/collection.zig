@@ -625,6 +625,7 @@ pub const Collection = struct {
         // MVCC: register new version in the version chain (links to old automatically).
         const epoch = self.epochs.advance();
         self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
+        self.key_epochs.put(key_hash, doc_id) catch {};
         self.shared_mu.unlock();
         emitChange(self, .update, key, new_value, doc_id);
 
@@ -661,6 +662,8 @@ pub const Collection = struct {
         self.versions.appendVersion(self.alloc, old_doc.header.doc_id, pno, page_off, epoch) catch {};
         self.idx.delete(key_hash);
         _ = self.hash_idx.remove(key_hash);
+        _ = self.key_doc_ids.remove(key_hash);
+        _ = self.key_epochs.remove(key_hash);
         self.shared_mu.unlock();
         self.cache.invalidate(key_hash);
         emitChange(self, .delete, key, "", old_doc.header.doc_id);
@@ -984,6 +987,7 @@ pub const Collection = struct {
                     self.hash_idx.put(d.header.key_hash, entry) catch {};
                     self.idx.insert(entry) catch {};
                     self.key_doc_ids.put(d.header.key_hash, d.header.doc_id) catch {};
+                    self.key_epochs.put(d.header.key_hash, d.header.doc_id) catch {};
                     if (d.value.len >= 3) {
                         self.tri.indexFile(d.key, d.value) catch {};
                         self.words.indexFile(d.key, d.value) catch {};
