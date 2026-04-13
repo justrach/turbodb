@@ -180,22 +180,33 @@ pub const WAL = struct {
         self.write_buf = .empty;
         self.mu.unlock();
 
-        var io_err: ?anyerror = null;
+        // Write entries to file.  If writeAll fails, re-queue the buffer so
+        // entries are retried on the next flush cycle instead of being lost.
         self.file.writeAll(to_write.items) catch |e| {
-            io_err = e;
+            self.mu.lock();
+            // Prepend failed entries before any new writes that arrived.
+            to_write.appendSlice(self.allocator, self.write_buf.items) catch {};
+            self.write_buf.deinit(self.allocator);
+            self.write_buf = to_write;
+            self.io_err_flag = true;
+            self.flushing = false;
+            self.cond.broadcast();
+            self.mu.unlock();
+            std.log.err("WAL flushPending write error: {}", .{e});
+            return;
         };
         to_write.deinit(self.allocator);
-        if (io_err == null) self.file.sync() catch |e| {
-            io_err = e;
+
+        // Data is in the file.  fsync for durability — if sync fails the data
+        // is still in the kernel page cache (and the file), so advance
+        // synced_lsn either way to avoid permanently stalling the WAL.
+        self.file.sync() catch |e| {
+            self.io_err_flag = true;
+            std.log.err("WAL flushPending sync error (data written, not fsynced): {}", .{e});
         };
 
         self.mu.lock();
-        if (io_err) |e| {
-            self.io_err_flag = true;
-            std.log.err("WAL flushPending I/O error: {}", .{e});
-        } else {
-            self.synced_lsn = target;
-        }
+        self.synced_lsn = target;
         self.flushing = false;
         self.cond.broadcast();
         self.mu.unlock();
@@ -288,19 +299,32 @@ pub const WAL = struct {
         self.mu.unlock();
 
         // ── I/O outside lock ──────────────────────────────────────────────────
-        var io_err: ?anyerror = null;
-        self.file.writeAll(to_write.items) catch |e| { io_err = e; };
+        // If writeAll fails, re-queue the buffer so entries survive for retry.
+        self.file.writeAll(to_write.items) catch |e| {
+            self.mu.lock();
+            to_write.appendSlice(self.allocator, self.write_buf.items) catch {};
+            self.write_buf.deinit(self.allocator);
+            self.write_buf = to_write;
+            self.flushing = false;
+            self.cond.broadcast();
+            self.mu.unlock();
+            return e;
+        };
         to_write.deinit(self.allocator);
-        if (io_err == null) self.file.sync() catch |e| { io_err = e; };
+
+        // Data written — fsync for durability.  If sync fails, still advance
+        // synced_lsn (data is in page cache) but return the error to caller.
+        var sync_err: ?anyerror = null;
+        self.file.sync() catch |e| { sync_err = e; };
         // ─────────────────────────────────────────────────────────────────────
 
         self.mu.lock();
-        if (io_err == null) self.synced_lsn = target;
+        self.synced_lsn = target;
         self.flushing = false;
         self.cond.broadcast();
         self.mu.unlock();
 
-        if (io_err) |e| return e;
+        if (sync_err) |e| return e;
     }
 
     // ── Checkpoint ────────────────────────────────────────────────────────────
