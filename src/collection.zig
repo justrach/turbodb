@@ -396,13 +396,16 @@ pub const Collection = struct {
             .page_no  = pno,
             .page_off = page_off,
         };
-        try self.idx.insert(entry);
 
         // Lock shared state — hash_idx, key_doc_ids, key_epochs, and versions
         // are collection-wide and not protected by per-key stripe locks.
         // Without this, concurrent inserts to different keys race on HashMap
         // internals during resize, causing GPA panics or corruption.
         self.shared_mu.lock();
+        self.idx.insert(entry) catch |e| {
+            self.shared_mu.unlock();
+            return e;
+        };
         self.hash_idx.put(hdr.key_hash, entry) catch {};
 
         // MVCC: register version in the version chain.
@@ -524,7 +527,10 @@ pub const Collection = struct {
             }
         }
         // L3: B-tree (O(log n))
-        const entry = self.idx.search(key_hash) orelse return null;
+        self.shared_mu.lock();
+        const btree_entry = self.idx.search(key_hash);
+        self.shared_mu.unlock();
+        const entry = btree_entry orelse return null;
         const d = self.readEntry(entry) orelse return null;
         self.cache.insert(key_hash, entry.page_no, entry.page_off);
         return d;
@@ -583,7 +589,10 @@ pub const Collection = struct {
         self.stripe_locks[stripe].lock();
         defer self.stripe_locks[stripe].unlock();
 
-        const old_entry = self.idx.search(key_hash) orelse return false;
+        self.shared_mu.lock();
+        const old_entry_result = self.idx.search(key_hash);
+        self.shared_mu.unlock();
+        const old_entry = old_entry_result orelse return false;
         const old_doc = self.readEntry(old_entry) orelse return false;
 
         const doc_id = old_doc.header.doc_id;
@@ -629,7 +638,10 @@ pub const Collection = struct {
         self.stripe_locks[stripe].lock();
         defer self.stripe_locks[stripe].unlock();
 
-        const entry = self.idx.search(key_hash) orelse return false;
+        self.shared_mu.lock();
+        const del_entry_result = self.idx.search(key_hash);
+        self.shared_mu.unlock();
+        const entry = del_entry_result orelse return false;
 
         const old_doc = self.readEntry(entry) orelse return false;
         var tomb_hdr = doc_mod.newHeader(old_doc.header.doc_id, key, "");
