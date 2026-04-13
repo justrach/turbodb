@@ -358,6 +358,8 @@ pub const Collection = struct {
     /// Insert a new document. Returns assigned doc_id.
     /// Uses per-key stripe lock for fine-grained concurrency.
     pub fn insert(self: *Collection, key: []const u8, value: []const u8) !u64 {
+        if (key.len == 0 or key.len > std.math.maxInt(u16)) return error.InvalidKeyLength;
+        if (value.len > std.math.maxInt(u32)) return error.InvalidValueLength;
         const key_hash = doc_mod.fnv1a(key);
         const stripe = stripeIndex(key_hash);
         self.stripe_locks[stripe].lock();
@@ -584,6 +586,8 @@ pub const Collection = struct {
     /// Update an existing document (append new version, update index).
     /// Uses per-key stripe lock — concurrent updates to different keys proceed in parallel.
     pub fn update(self: *Collection, key: []const u8, new_value: []const u8) !bool {
+        if (key.len == 0 or key.len > std.math.maxInt(u16)) return error.InvalidKeyLength;
+        if (new_value.len > std.math.maxInt(u32)) return error.InvalidValueLength;
         const key_hash = doc_mod.fnv1a(key);
         const stripe = stripeIndex(key_hash);
         self.stripe_locks[stripe].lock();

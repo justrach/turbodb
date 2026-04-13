@@ -1055,11 +1055,11 @@ fn jsonEscape(raw: []const u8, buf: *[1024]u8) []const u8 {
     var pos: usize = 0;
     for (raw) |ch| {
         if (ch == '"' or ch == '\\') {
-            if (pos + 2 > buf.len) return raw; // overflow → fall back to raw
+            if (pos + 2 > buf.len) return buf[0..pos]; // truncate safely
             buf[pos] = '\\';
             pos += 1;
         } else {
-            if (pos + 1 > buf.len) return raw;
+            if (pos + 1 > buf.len) return buf[0..pos]; // truncate safely
         }
         buf[pos] = ch;
         pos += 1;
