@@ -619,6 +619,7 @@ pub const Collection = struct {
         };
         self.shared_mu.lock();
         self.hash_idx.put(key_hash, new_entry) catch {};
+        self.idx.insert(new_entry) catch {};
         self.cache.invalidate(key_hash);
 
         // MVCC: register new version in the version chain (links to old automatically).
