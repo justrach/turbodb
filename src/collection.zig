@@ -227,6 +227,10 @@ pub const Collection = struct {
         var path_buf: [512]u8 = undefined;
         const col = try alloc.create(Collection);
         errdefer alloc.destroy(col);
+        // Zero all bytes so that Mutex fields (os_unfair_lock) start as 0
+        // before any field assignment. GPA fills with 0xAA which macOS
+        // detects as corrupted unfair_lock state.
+        @memset(std.mem.asBytes(col), 0);
 
         try ensureDirPath(data_dir);
         const page_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.pages", .{ data_dir, storage_name });
@@ -369,27 +373,29 @@ pub const Collection = struct {
         const hdr = doc_mod.newHeader(doc_id, key, value);
         const d = Doc{ .header = hdr, .key = key, .value = value };
 
-        // Use stack buffer for small docs, heap for large ones (code files can be 100KB+)
-        var enc_buf: [65536]u8 = undefined;
         const total_size = DocHeader.size + key.len + value.len;
-        var heap_buf: ?[]u8 = null;
-        defer if (heap_buf) |hb| self.alloc.free(hb);
-        const buf = if (total_size <= enc_buf.len)
-            &enc_buf
-        else blk: {
-            heap_buf = try self.alloc.alloc(u8, total_size + 64);
-            break :blk heap_buf.?;
-        };
-        const enc = try d.encodeBuf(buf);
 
         // Write to WAL buffer (background flusher will commit periodically).
+        // Use stack buffer for WAL entry encoding.
+        var wal_buf: [65536]u8 = undefined;
+        var wal_heap: ?[]u8 = null;
+        defer if (wal_heap) |hb| self.alloc.free(hb);
+        const wal_enc_buf = if (total_size <= wal_buf.len)
+            &wal_buf
+        else blk: {
+            wal_heap = try self.alloc.alloc(u8, total_size + 64);
+            break :blk wal_heap.?;
+        };
+        const wal_enc = try d.encodeBuf(wal_enc_buf);
         const txn = self.wal_log.next_lsn.load(.monotonic);
-        _ = try self.wal_log.write(txn, .doc_insert, 0, 0, enc);
+        _ = try self.wal_log.write(txn, .doc_insert, 0, 0, wal_enc);
 
-        // Find (or allocate) a leaf page with enough space.
-        const pno = try self.findOrAllocLeaf(enc.len);
-        const page_off = self.pf.leafAppend(pno, enc) orelse
+        // Write directly to page memory (single copy, no intermediate buffer).
+        const pno = try self.findOrAllocLeaf(total_size);
+        const reserved = self.pf.leafReserve(pno, total_size) orelse
             return error.PageFull;
+        const page_off = reserved.off;
+        _ = d.encodeBuf(reserved.buf) catch return error.PageFull;
 
         // Index the document.
         const entry = BTreeEntry{
@@ -796,19 +802,30 @@ pub const Collection = struct {
         };
     }
 
+    /// Lookup table for fast ASCII lowercasing — avoids branch per byte.
+    const lower_lut: [256]u8 = blk: {
+        var t: [256]u8 = undefined;
+        for (0..256) |i| t[i] = if (i >= 'A' and i <= 'Z') @intCast(i + 32) else @intCast(i);
+        break :blk t;
+    };
+
     fn containsInsensitive(haystack: []const u8, needle: []const u8) bool {
         if (needle.len == 0) return true;
         if (haystack.len < needle.len) return false;
+        // Pre-lowercase the needle once (avoids repeated table lookups per position).
+        var lower_needle: [256]u8 = undefined;
+        const nlen = @min(needle.len, 256);
+        for (needle[0..nlen], 0..) |c, k| lower_needle[k] = lower_lut[c];
+        if (needle.len > 256) return false; // needle > 256 chars unsupported
+        const first = lower_needle[0];
         var i: usize = 0;
-        while (i + needle.len <= haystack.len) : (i += 1) {
+        const end = haystack.len - needle.len;
+        while (i <= end) : (i += 1) {
+            // Fast skip: check first byte before full comparison.
+            if (lower_lut[haystack[i]] != first) continue;
             var match = true;
-            var j: usize = 0;
-            while (j < needle.len) : (j += 1) {
-                const hc = haystack[i + j];
-                const nc = needle[j];
-                const hl = if (hc >= 'A' and hc <= 'Z') hc + 32 else hc;
-                const nl = if (nc >= 'A' and nc <= 'Z') nc + 32 else nc;
-                if (hl != nl) { match = false; break; }
+            for (1..nlen) |j| {
+                if (lower_lut[haystack[i + j]] != lower_needle[j]) { match = false; break; }
             }
             if (match) return true;
         }

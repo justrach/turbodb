@@ -35,7 +35,7 @@ pub const PageFile = struct {
     free_head: std.atomic.Value(u32),  // head of free-list (0 = empty)
     next_alloc: std.atomic.Value(u32), // next never-allocated page
     mu: std.Thread.Mutex,
-    leaf_mu: std.Thread.Mutex,         // protects leafAppend read-modify-write
+    leaf_shards: [64]std.Thread.Mutex,  // per-page-shard locks for leafAppend
 
     pub fn open(path: []const u8) !PageFile {
         var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
@@ -47,7 +47,7 @@ pub const PageFile = struct {
             .free_head  = std.atomic.Value(u32).init(0),
             .next_alloc = std.atomic.Value(u32).init(page_count),
             .mu         = .{},
-            .leaf_mu    = .{},
+            .leaf_shards = [1]std.Thread.Mutex{.{}} ** 64,
         };
     }
 
@@ -113,8 +113,8 @@ pub const PageFile = struct {
     /// Append bytes to a leaf page. Returns offset within the usable area,
     /// or null if there isn't enough space.
     pub fn leafAppend(self: *PageFile, pno: u32, data: []const u8) ?u16 {
-        self.leaf_mu.lock();
-        defer self.leaf_mu.unlock();
+        self.leaf_shards[pno % 64].lock();
+        defer self.leaf_shards[pno % 64].unlock();
 
         const ph = self.pageHeader(pno);
         const used = ph.used_bytes;
@@ -124,6 +124,21 @@ pub const PageFile = struct {
         ph.used_bytes += @intCast(data.len);
         ph.doc_count += 1;
         return used;
+    }
+
+    /// Reserve `len` bytes on a leaf page and return a writable slice + offset.
+    /// Caller writes directly into the page, avoiding a double copy.
+    pub fn leafReserve(self: *PageFile, pno: u32, len: usize) ?struct { buf: []u8, off: u16 } {
+        self.leaf_shards[pno % 64].lock();
+        defer self.leaf_shards[pno % 64].unlock();
+
+        const ph = self.pageHeader(pno);
+        const used = ph.used_bytes;
+        if (@as(usize, used) + len > PAGE_USABLE) return null;
+        const dest = self.pageData(pno);
+        ph.used_bytes += @intCast(len);
+        ph.doc_count += 1;
+        return .{ .buf = dest[used..][0..len], .off = used };
     }
 
     /// Read `len` bytes from page `pno` at usable-area offset `off`.
