@@ -34,8 +34,9 @@ pub const MmapFile = struct {
     /// concurrent readers (no lock needed thanks to the stable VA range).
     len:      std.atomic.Value(usize),
     /// How many bytes of the VA range are currently file-backed and mapped
-    /// PROT_READ|PROT_WRITE.  Protected by `grow_mu` (only grow mutates it).
-    capacity: usize,
+    /// PROT_READ|PROT_WRITE.  Atomic so concurrent at()/slice() callers
+    /// can read without holding grow_mu.
+    capacity: std.atomic.Value(usize),
     /// Serialises concurrent grow() calls.  NOT needed for readers.
     grow_mu:  std.Thread.Mutex,
 
@@ -80,7 +81,7 @@ pub const MmapFile = struct {
             .fd       = fd,
             .ptr      = base_ptr,
             .len      = std.atomic.Value(usize).init(existing),
-            .capacity = capacity,
+            .capacity = std.atomic.Value(usize).init(capacity),
             .grow_mu  = .{},
         };
     }
@@ -93,12 +94,14 @@ pub const MmapFile = struct {
 
     // ── Sync / Checkpoint ─────────────────────────────────────────────────────
 
-    pub fn syncAsync(self: MmapFile) void {
-        posix.msync(@alignCast(self.ptr[0..self.capacity]), posix.MSF.ASYNC) catch {};
+    pub fn syncAsync(self: *MmapFile) void {
+        const cap = self.capacity.load(.acquire);
+        posix.msync(@alignCast(self.ptr[0..cap]), posix.MSF.ASYNC) catch {};
     }
 
-    pub fn syncSync(self: MmapFile) !void {
-        try posix.msync(@alignCast(self.ptr[0..self.capacity]), posix.MSF.SYNC);
+    pub fn syncSync(self: *MmapFile) !void {
+        const cap = self.capacity.load(.acquire);
+        try posix.msync(@alignCast(self.ptr[0..cap]), posix.MSF.SYNC);
     }
 
     // ── Grow ──────────────────────────────────────────────────────────────────
@@ -107,7 +110,7 @@ pub const MmapFile = struct {
     /// extends the file and maps the new pages into the pre-reserved VA
     /// range with MAP_FIXED.  The base pointer never changes.
     pub fn grow(self: *MmapFile, needed_len: usize) !void {
-        if (needed_len <= self.capacity) {
+        if (needed_len <= self.capacity.load(.acquire)) {
             // Capacity is sufficient — just advance the logical length.
             self.len.store(needed_len, .release);
             return;
@@ -118,12 +121,13 @@ pub const MmapFile = struct {
         defer self.grow_mu.unlock();
 
         // Re-check after acquiring lock (another thread may have grown).
-        if (needed_len <= self.capacity) {
+        const cur_cap = self.capacity.load(.acquire);
+        if (needed_len <= cur_cap) {
             self.len.store(needed_len, .release);
             return;
         }
 
-        const old_cap = self.capacity;
+        const old_cap = cur_cap;
         const new_cap = alignUp(needed_len + GROW_CHUNK, OS_PAGE_ALIGN);
 
         std.debug.assert(new_cap <= MAX_VA_SIZE);
@@ -141,7 +145,7 @@ pub const MmapFile = struct {
             self.fd, @intCast(old_cap),
         );
 
-        self.capacity = new_cap;
+        self.capacity.store(new_cap, .release);
         self.len.store(needed_len, .release);
     }
 
@@ -150,14 +154,14 @@ pub const MmapFile = struct {
     /// Return a pointer to the record at byte offset `off`.
     /// Lock-free: the base pointer is stable for the lifetime of the mapping.
     pub fn at(self: *MmapFile, comptime T: type, off: usize) *T {
-        std.debug.assert(off + @sizeOf(T) <= self.capacity);
+        std.debug.assert(off + @sizeOf(T) <= self.capacity.load(.acquire));
         return @alignCast(@ptrCast(&self.ptr[off]));
     }
 
     /// Return a slice of T starting at byte offset `off`, `count` elements.
     /// Lock-free: the base pointer is stable for the lifetime of the mapping.
     pub fn slice(self: *MmapFile, comptime T: type, off: usize, count: usize) []T {
-        std.debug.assert(off + count * @sizeOf(T) <= self.capacity);
+        std.debug.assert(off + count * @sizeOf(T) <= self.capacity.load(.acquire));
         return @as([*]T, @alignCast(@ptrCast(&self.ptr[off])))[0..count];
     }
 

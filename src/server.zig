@@ -631,8 +631,7 @@ fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_s
         .{ esc_tid, esc_col, result.docs.len }) catch {};
     var truncated = false;
     for (result.docs, 0..) |d, i| {
-        // Stop writing if buffer is nearly full to avoid truncated JSON.
-        if (fbs.pos + 256 >= MAX_BODY) { truncated = true; break; }
+        const saved_pos = fbs.pos;
         if (i > 0) w.writeByte(',') catch {};
         var esc_dk_buf: [1024]u8 = undefined;
         const esc_dk = jsonEscape(d.key, &esc_dk_buf);
@@ -648,6 +647,13 @@ fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_s
                 w.writeByte(ch) catch {};
             }
             w.writeAll("\"}") catch {};
+        }
+        // If this doc pushed us near the buffer limit, rewind to discard the
+        // partial write and stop — this prevents broken JSON in the response.
+        if (fbs.pos + 64 >= MAX_BODY) {
+            fbs.pos = saved_pos;
+            truncated = true;
+            break;
         }
     }
     w.writeAll("]}") catch {};
@@ -692,7 +698,7 @@ fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query
         .{ result.docs.len, result.candidate_paths.len, col.docCount(), result.total_files }) catch {};
     var truncated = false;
     for (result.docs, 0..) |d, i| {
-        if (fbs.pos + 256 >= MAX_BODY) { truncated = true; break; }
+        const saved_pos = fbs.pos;
         if (i > 0) w.writeByte(',') catch {};
         // Output value as valid JSON — objects/arrays as-is, strings quoted
         var esc_dk_buf: [1024]u8 = undefined;
@@ -710,6 +716,11 @@ fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query
                 w.writeByte(ch) catch {};
             }
             w.writeAll("\"}") catch {};
+        }
+        if (fbs.pos + 64 >= MAX_BODY) {
+            fbs.pos = saved_pos;
+            truncated = true;
+            break;
         }
     }
     w.writeAll("]}") catch {};

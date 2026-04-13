@@ -78,7 +78,7 @@ pub const PageFile = struct {
         // Extend the file.
         const pno = self.next_alloc.fetchAdd(1, .seq_cst);
         const needed = (@as(usize, pno) + 1) * PAGE_SIZE;
-        if (needed > self.mm.capacity) try self.mm.grow(needed);
+        if (needed > self.mm.capacity.load(.acquire)) try self.mm.grow(needed);
 
         const ph = self.pageHeader(pno);
         ph.* = std.mem.zeroes(PageHeader);
