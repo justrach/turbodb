@@ -84,11 +84,11 @@ pub const WordIndex = struct {
 
     /// Index a file's content — tokenizes into words and records hits.
     pub fn indexFile(self: *WordIndex, path: []const u8, content: []const u8) !void {
+        if (content.len > TrigramIndex.MAX_INDEX_FILE_SIZE) return;
         self.mu.lock();
         defer self.mu.unlock();
         // Clean up old entries first
         self.removeFile(path);
-
         // Dupe path so hits survive after the caller's buffer is freed.
         const owned_path = try self.allocator.dupe(u8, path);
 
@@ -141,45 +141,54 @@ pub const WordIndex = struct {
         try self.file_words.put(owned_path, words_set);
     }
 
-    /// Look up all hits for a word. O(1) lookup + O(hits) iteration.
-    pub fn search(self: *WordIndex, word: []const u8) []const WordHit {
+    /// Look up all hits for a word. Returns an owned copy that the caller
+    /// must free with `allocator.free(result)`. The copy is made while the
+    /// mutex is held so the internal ArrayList buffer cannot be reallocated
+    /// by a concurrent indexFile() call.
+    pub fn search(self: *WordIndex, word: []const u8, allocator: std.mem.Allocator) ![]const WordHit {
         self.mu.lock();
         defer self.mu.unlock();
         if (self.index.get(word)) |hits| {
-            return hits.items;
+            const copy = try allocator.alloc(WordHit, hits.items.len);
+            @memcpy(copy, hits.items);
+            return copy;
         }
         return &.{};
     }
 
     /// Look up hits, returning results allocated by the caller.
-    /// Deduplicates by (path, line_num).
-pub fn searchDeduped(self: *WordIndex, word: []const u8, allocator: std.mem.Allocator) ![]const WordHit {
-    const hits = self.search(word);
-    if (hits.len == 0) return try allocator.alloc(WordHit, 0);
-    if (hits.len == 1) {
-        var out = try allocator.alloc(WordHit, 1);
-        out[0] = hits[0];
-        return out;
-    }
+    /// Deduplicates by (path, line_num). The mutex is held for the
+    /// duration of the read so the internal buffer stays valid.
+    pub fn searchDeduped(self: *WordIndex, word: []const u8, allocator: std.mem.Allocator) ![]const WordHit {
+        self.mu.lock();
+        defer self.mu.unlock();
 
-    const DedupKey = struct { path_ptr: usize, line_num: u32 };
-    var seen = std.AutoHashMap(DedupKey, void).init(allocator);
-    defer seen.deinit();
-    try seen.ensureTotalCapacity(@intCast(hits.len));
-
-    var result: std.ArrayList(WordHit) = .{};
-    errdefer result.deinit(allocator);
-    try result.ensureTotalCapacity(allocator, hits.len);
-
-    for (hits) |hit| {
-        const key = DedupKey{ .path_ptr = @intFromPtr(hit.path.ptr), .line_num = hit.line_num };
-        const gop = try seen.getOrPut(key);
-        if (!gop.found_existing) {
-            result.appendAssumeCapacity(hit);
+        const items = if (self.index.get(word)) |hits| hits.items else return try allocator.alloc(WordHit, 0);
+        if (items.len == 0) return try allocator.alloc(WordHit, 0);
+        if (items.len == 1) {
+            var out = try allocator.alloc(WordHit, 1);
+            out[0] = items[0];
+            return out;
         }
+
+        const DedupKey = struct { path_ptr: usize, line_num: u32 };
+        var seen = std.AutoHashMap(DedupKey, void).init(allocator);
+        defer seen.deinit();
+        try seen.ensureTotalCapacity(@intCast(items.len));
+
+        var result: std.ArrayList(WordHit) = .{};
+        errdefer result.deinit(allocator);
+        try result.ensureTotalCapacity(allocator, items.len);
+
+        for (items) |hit| {
+            const key = DedupKey{ .path_ptr = @intFromPtr(hit.path.ptr), .line_num = hit.line_num };
+            const gop = try seen.getOrPut(key);
+            if (!gop.found_existing) {
+                result.appendAssumeCapacity(hit);
+            }
+        }
+        return result.toOwnedSlice(allocator);
     }
-    return result.toOwnedSlice(allocator);
-}
 };
 
 // ── Trigram index ───────────────────────────────────────────
@@ -279,6 +288,18 @@ pub const TrigramIndex = struct {
     /// Mutex for concurrent access (background indexer writes, search reads).
     mu: std.Thread.Mutex = .{},
 
+    /// Cap posting list size per trigram. Once a trigram appears in this many files
+    /// it has no discrimination value for search — stop tracking it to bound memory.
+    const MAX_FILES_PER_TRIGRAM: usize = 10_000;
+
+    /// Cap unique trigrams stored per file. Large generated/minified files can produce
+    /// 10K+ unique trigrams — beyond this limit the memory cost outweighs search value.
+    const MAX_TRIGRAMS_PER_FILE: usize = 8_000;
+
+    /// Skip files larger than this for trigram indexing. Minified JS, generated code,
+    /// and data files waste memory for negligible search value.
+    pub const MAX_INDEX_FILE_SIZE: usize = 256 * 1024;
+
     pub fn init(allocator: std.mem.Allocator) TrigramIndex {
         return .{
             .index = std.AutoHashMap(Trigram, PostingList).init(allocator),
@@ -354,6 +375,7 @@ pub const TrigramIndex = struct {
 
     pub fn indexFile(self: *TrigramIndex, path: []const u8, content: []const u8) !void {
         if (content.len < 3) return;
+        if (content.len > MAX_INDEX_FILE_SIZE) return;
 
         // ── Pass 1 (no lock): collect unique trigrams into a temporary hashmap ──
         var unique_tris = std.AutoHashMap(Trigram, void).init(self.allocator);
@@ -369,6 +391,8 @@ pub const TrigramIndex = struct {
                 normalizeChar(content[i + 2]),
             );
             unique_tris.put(tri, {}) catch {};
+            // Stop collecting if we hit the per-file cap
+            if (unique_tris.count() >= MAX_TRIGRAMS_PER_FILE) break;
         }
 
         // ── Pass 2 (locked): update the global index once per unique trigram ──
@@ -389,12 +413,15 @@ pub const TrigramIndex = struct {
         var it = unique_tris.keyIterator();
         while (it.next()) |tri_ptr| {
             const tri = tri_ptr.*;
-            tri_list.appendAssumeCapacity(tri);
 
             const idx_gop = try self.index.getOrPut(tri);
             if (!idx_gop.found_existing) {
                 idx_gop.value_ptr.* = .{};
             }
+            // Skip trigrams that already appear in too many files
+            if (idx_gop.value_ptr.items.len >= MAX_FILES_PER_TRIGRAM) continue;
+
+            tri_list.appendAssumeCapacity(tri);
             postingSortedInsert(idx_gop.value_ptr, self.allocator, .{ .file_id = file_id, .mask = PostingMask{ .loc_mask = 0xFF, .next_mask = 0xFF } });
         }
 
@@ -417,7 +444,7 @@ pub const TrigramIndex = struct {
 
         for (paths, contents, 0..) |path, content, di| {
             _ = path;
-            if (content.len < 3) {
+            if (content.len < 3 or content.len > MAX_INDEX_FILE_SIZE) {
                 batch[di].tris = &.{};
                 continue;
             }
@@ -432,6 +459,7 @@ pub const TrigramIndex = struct {
                     normalizeChar(content[i + 2]),
                 );
                 reusable_tris.put(tri, {}) catch {};
+                if (reusable_tris.count() >= MAX_TRIGRAMS_PER_FILE) break;
             }
 
             // Copy unique trigrams to owned slice for this doc
@@ -464,15 +492,16 @@ pub const TrigramIndex = struct {
             tri_list.ensureTotalCapacity(self.allocator, tris.len) catch continue;
 
             for (tris) |tri| {
-                tri_list.appendAssumeCapacity(tri);
-
                 const idx_gop = self.index.getOrPut(tri) catch continue;
                 if (!idx_gop.found_existing) {
                     idx_gop.value_ptr.* = .{};
                 }
+                // Skip trigrams that already appear in too many files
+                if (idx_gop.value_ptr.items.len >= MAX_FILES_PER_TRIGRAM) continue;
+
+                tri_list.appendAssumeCapacity(tri);
                 postingSortedInsert(idx_gop.value_ptr, self.allocator, .{ .file_id = file_id, .mask = PostingMask{ .loc_mask = 0xFF, .next_mask = 0xFF } });
             }
-
             self.file_trigrams.put(file_id, tri_list) catch {};
         }
     }
@@ -1714,3 +1743,129 @@ pub const SparseNgramIndex = struct {
         return @intCast(self.file_ngrams.count());
     }
 };
+
+// ─── Tests ────────────────────────────────────────────────────────────────────
+
+test "trigram index skips files exceeding MAX_INDEX_FILE_SIZE" {
+    const alloc = std.testing.allocator;
+    var idx = TrigramIndex.init(alloc);
+    defer idx.deinit();
+
+    // Small file: should be indexed
+    try idx.indexFile("small.zig", "fn main() void {}");
+    try std.testing.expect(idx.fileCount() == 1);
+
+    // Large file (>256KB): should be skipped
+    const big = try alloc.alloc(u8, TrigramIndex.MAX_INDEX_FILE_SIZE + 1);
+    defer alloc.free(big);
+    @memset(big, 'a');
+    try idx.indexFile("big.bin", big);
+    // File count should still be 1 — big file was skipped
+    try std.testing.expect(idx.fileCount() == 1);
+}
+
+test "trigram index caps unique trigrams per file at MAX_TRIGRAMS_PER_FILE" {
+    const alloc = std.testing.allocator;
+    var idx = TrigramIndex.init(alloc);
+    defer idx.deinit();
+
+    // Generate content with many unique trigrams: cycling through all printable ASCII
+    // Each 3-byte window is unique if we use a non-repeating sequence long enough.
+    const len = 40_000; // would produce ~40K raw trigrams, many unique
+    const content = try alloc.alloc(u8, len);
+    defer alloc.free(content);
+    for (0..len) |i| {
+        content[i] = @intCast(32 + (i % 95)); // printable ASCII cycle
+    }
+
+    try idx.indexFile("many_trigrams.txt", content);
+    // The file_trigrams entry should be capped
+    const file_id = idx.path_to_id.get("many_trigrams.txt").?;
+    const tri_list = idx.file_trigrams.get(file_id).?;
+    try std.testing.expect(tri_list.items.len <= TrigramIndex.MAX_TRIGRAMS_PER_FILE);
+}
+
+test "trigram posting list caps at MAX_FILES_PER_TRIGRAM" {
+    const alloc = std.testing.allocator;
+    var idx = TrigramIndex.init(alloc);
+    defer idx.deinit();
+
+    // Index many files with the same content to force one trigram's posting list to grow
+    const content = "aaa"; // only one unique trigram: "aaa"
+    const N = TrigramIndex.MAX_FILES_PER_TRIGRAM + 100;
+    var name_buf: [32]u8 = undefined;
+    for (0..N) |i| {
+        const name_len = std.fmt.formatIntBuf(&name_buf, i, 10, .lower, .{});
+        try idx.indexFile(name_buf[0..name_len], content);
+    }
+
+    // The posting list for trigram "aaa" should be capped
+    const tri = packTrigram('a', 'a', 'a');
+    const posting = idx.index.get(tri).?;
+    try std.testing.expect(posting.items.len <= TrigramIndex.MAX_FILES_PER_TRIGRAM);
+}
+
+test "word index skips files exceeding MAX_INDEX_FILE_SIZE" {
+    const alloc = std.testing.allocator;
+    var wi = WordIndex.init(alloc);
+    defer wi.deinit();
+
+    // Small file: should index words
+    try wi.indexFile("small.zig", "hello world function");
+    const hits = try wi.search("hello", alloc);
+    defer if (hits.len > 0) alloc.free(hits);
+    try std.testing.expect(hits.len > 0);
+
+    // Large file: should be skipped entirely
+    const big = try alloc.alloc(u8, TrigramIndex.MAX_INDEX_FILE_SIZE + 1);
+    defer alloc.free(big);
+    @memset(big, 'x');
+    // Put a unique word near the start to verify it's NOT indexed
+    @memcpy(big[0..11], "uniquetoken");
+    try wi.indexFile("big.bin", big);
+    const big_hits = try wi.search("uniquetoken", alloc);
+    defer if (big_hits.len > 0) alloc.free(big_hits);
+    try std.testing.expect(big_hits.len == 0);
+}
+
+test "trigram indexBatch respects file size and per-file caps" {
+    const alloc = std.testing.allocator;
+    var idx = TrigramIndex.init(alloc);
+    defer idx.deinit();
+
+    // Create one normal file and one oversized file
+    const small_content = "fn main() void { return; }";
+    const big_content = try alloc.alloc(u8, TrigramIndex.MAX_INDEX_FILE_SIZE + 1);
+    defer alloc.free(big_content);
+    @memset(big_content, 'z');
+
+    const paths = [_][]const u8{ "ok.zig", "toobig.bin" };
+    const contents = [_][]const u8{ small_content, big_content };
+    var reusable = std.AutoHashMap(Trigram, void).init(alloc);
+    defer reusable.deinit();
+
+    try idx.indexBatch(&paths, &contents, &reusable);
+
+    // Only the small file should be indexed
+    try std.testing.expect(idx.path_to_id.contains("ok.zig"));
+    try std.testing.expect(!idx.path_to_id.contains("toobig.bin"));
+}
+
+test "word index MAX_HITS_PER_WORD prevents unbounded growth" {
+    const alloc = std.testing.allocator;
+    var wi = WordIndex.init(alloc);
+    defer wi.deinit();
+
+    // Index many files that all contain the same word
+    var name_buf: [32]u8 = undefined;
+    const N = WordIndex.MAX_HITS_PER_WORD + 500;
+    for (0..N) |i| {
+        const name_len = std.fmt.formatIntBuf(&name_buf, i, 10, .lower, .{});
+        const content = "common_word appears here";
+        try wi.indexFile(name_buf[0..name_len], content);
+    }
+
+    const hits = try wi.search("common_word", alloc);
+    defer if (hits.len > 0) alloc.free(hits);
+    try std.testing.expect(hits.len <= WordIndex.MAX_HITS_PER_WORD);
+}

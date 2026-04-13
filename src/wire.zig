@@ -92,16 +92,21 @@ fn handleConn(srv: *WireServer, conn: std.net.Server.Connection) void {
     const bufs = std.heap.page_allocator.create(Bufs) catch return;
     defer std.heap.page_allocator.destroy(bufs);
 
-    // Pre-resolve the most common collection for the fast path
-    var cached_col: ?*collection_mod.Collection = null;
+    // Cache only the collection name for fast-path lookups; the pointer
+    // is re-resolved every time via lookupCollection (O(1) RwLock + HashMap)
+    // to avoid dangling pointers when another connection drops a collection.
     var cached_col_name: [128]u8 = undefined;
     var cached_col_len: usize = 0;
 
     var rp: usize = 0;
 
     while (true) {
-        if (rp >= RD_BUF) rp = 0;
-        const n = conn.stream.read(bufs.rd[rp..]) catch return;
+        // Clamp read to remaining buffer space; wrap if exhausted.
+        const remaining = RD_BUF - rp;
+        if (remaining == 0) {
+            rp = 0;
+        }
+        const n = conn.stream.read(bufs.rd[rp..RD_BUF]) catch return;
         if (n == 0) return;
         rp += n;
 
@@ -116,12 +121,12 @@ fn handleConn(srv: *WireServer, conn: std.net.Server.Connection) void {
             // ── FAST PATH: inline GET with zero-copy ──
             if (op == OP_GET) {
                 srv.activity.recordQuery();
-                const wn = fastGet(srv, payload, &bufs.wr, &cached_col, &cached_col_name, &cached_col_len);
+                const wn = fastGet(srv, payload, &bufs.wr, &cached_col_name, &cached_col_len);
                 conn.stream.writeAll(bufs.wr[0..wn]) catch return;
             } else {
-                // Invalidate collection cache on writes
+                // Invalidate collection name cache on writes
                 if (op == OP_INSERT or op == OP_UPDATE or op == OP_DELETE) {
-                    cached_col = null;
+                    cached_col_len = 0;
                 }
                 srv.activity.recordQuery();
                 const wn = dispatch(srv, op, payload, &bufs.wr);
@@ -141,26 +146,23 @@ fn fastGet(
     srv: *WireServer,
     p: []const u8,
     w: *[WR_BUF]u8,
-    cached_col: *?*collection_mod.Collection,
     cached_name: *[128]u8,
     cached_len: *usize,
 ) usize {
     const a = parseKey(p) orelse return errResp(w, OP_GET, STATUS_ERROR);
 
-    // Fast collection lookup: skip mutex if same collection as last call
-    const col = blk: {
-        if (cached_col.*) |cc| {
-            if (cached_len.* == a.col.len and std.mem.eql(u8, cached_name[0..cached_len.*], a.col)) {
-                break :blk cc;
-            }
+    // Always re-resolve the collection pointer via lookupCollection to
+    // avoid dangling pointers.  The DB's internal path (RwLock read +
+    // HashMap get) is already O(1), so the overhead is negligible.
+    // We still cache the name so callers can invalidate on writes.
+    if (cached_len.* != a.col.len or !std.mem.eql(u8, cached_name[0..cached_len.*], a.col)) {
+        if (a.col.len <= cached_name.len) {
+            @memcpy(cached_name[0..a.col.len], a.col);
+            cached_len.* = a.col.len;
         }
-        const c = lookupCollection(srv, a.col) catch return errResp(w, OP_GET, STATUS_ERROR);
-        @memcpy(cached_name[0..a.col.len], a.col);
-        cached_len.* = a.col.len;
-        cached_col.* = c;
-        break :blk c;
-    };
+    }
 
+    const col = lookupCollection(srv, a.col) catch return errResp(w, OP_GET, STATUS_ERROR);
     const d = col.get(a.key) orelse return errResp(w, OP_GET, STATUS_NOT_FOUND);
 
     // Write response: [len:4][op:1][status:1][doc_id:8][ver:1][val_len:4][val:N]

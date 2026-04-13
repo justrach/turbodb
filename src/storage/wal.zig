@@ -113,6 +113,7 @@ pub const WAL = struct {
     cond:         std.Thread.Condition,
     synced_lsn:   u64,
     flushing:     bool,
+    io_err_flag:  bool,
 
     // Background flusher
     flush_thread: ?std.Thread,
@@ -137,6 +138,7 @@ pub const WAL = struct {
             .cond          = .{},
             .synced_lsn    = 0,
             .flushing      = false,
+            .io_err_flag   = false,
             .flush_thread  = null,
             .flush_running = std.atomic.Value(bool).init(false),
         };
@@ -178,12 +180,22 @@ pub const WAL = struct {
         self.write_buf = .empty;
         self.mu.unlock();
 
-        self.file.writeAll(to_write.items) catch {};
+        var io_err: ?anyerror = null;
+        self.file.writeAll(to_write.items) catch |e| {
+            io_err = e;
+        };
         to_write.deinit(self.allocator);
-        self.file.sync() catch {};
+        if (io_err == null) self.file.sync() catch |e| {
+            io_err = e;
+        };
 
         self.mu.lock();
-        self.synced_lsn = target;
+        if (io_err) |e| {
+            self.io_err_flag = true;
+            std.log.err("WAL flushPending I/O error: {}", .{e});
+        } else {
+            self.synced_lsn = target;
+        }
         self.flushing = false;
         self.cond.broadcast();
         self.mu.unlock();
@@ -301,25 +313,58 @@ pub const WAL = struct {
         std.mem.writeInt(u64, &p, self.checkpoint_lsn, .little);
         const lsn = try self.write(0, .checkpoint, db_tag, FLAG_COMMIT, &p);
         self.checkpoint_lsn = lsn;
-        // Force flush
+
+        // Hold the mutex for the entire flush+truncate to prevent concurrent
+        // writers from writing to the file between flush and truncation.
         self.mu.lock();
+        defer self.mu.unlock();
+
         self.flushing = true;
         var to_write = self.write_buf;
         self.write_buf = .empty;
-        self.mu.unlock();
-        self.file.writeAll(to_write.items) catch {};
+
+        // ── I/O under lock (blocks writers but guarantees correctness) ────────
+        var io_err: ?anyerror = null;
+        self.file.writeAll(to_write.items) catch |e| {
+            io_err = e;
+        };
         to_write.deinit(self.allocator);
-        try self.file.sync();
 
-        // Truncate WAL — all data is checkpointed to page files.
-        self.file.seekTo(0) catch {};
-        self.file.setEndPos(0) catch {};
+        if (io_err) |e| {
+            self.io_err_flag = true;
+            self.flushing = false;
+            self.cond.broadcast();
+            std.log.err("WAL checkpoint write error: {}", .{e});
+            return e;
+        }
 
-        self.mu.lock();
+        self.file.sync() catch |e| {
+            self.io_err_flag = true;
+            self.flushing = false;
+            self.cond.broadcast();
+            std.log.err("WAL checkpoint sync error: {}", .{e});
+            return e;
+        };
+
+        // Truncate WAL -- all data is checkpointed to page files.
+        self.file.seekTo(0) catch |e| {
+            self.io_err_flag = true;
+            self.flushing = false;
+            self.cond.broadcast();
+            std.log.err("WAL checkpoint seekTo error: {}", .{e});
+            return e;
+        };
+        self.file.setEndPos(0) catch |e| {
+            self.io_err_flag = true;
+            self.flushing = false;
+            self.cond.broadcast();
+            std.log.err("WAL checkpoint setEndPos error: {}", .{e});
+            return e;
+        };
+
         self.synced_lsn = lsn;
         self.flushing = false;
         self.cond.broadcast();
-        self.mu.unlock();
     }
 
     // ── Recovery ──────────────────────────────────────────────────────────────

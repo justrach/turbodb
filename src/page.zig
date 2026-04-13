@@ -35,6 +35,7 @@ pub const PageFile = struct {
     free_head: std.atomic.Value(u32),  // head of free-list (0 = empty)
     next_alloc: std.atomic.Value(u32), // next never-allocated page
     mu: std.Thread.Mutex,
+    leaf_mu: std.Thread.Mutex,         // protects leafAppend read-modify-write
 
     pub fn open(path: []const u8) !PageFile {
         var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
@@ -46,6 +47,7 @@ pub const PageFile = struct {
             .free_head  = std.atomic.Value(u32).init(0),
             .next_alloc = std.atomic.Value(u32).init(page_count),
             .mu         = .{},
+            .leaf_mu    = .{},
         };
     }
 
@@ -111,6 +113,9 @@ pub const PageFile = struct {
     /// Append bytes to a leaf page. Returns offset within the usable area,
     /// or null if there isn't enough space.
     pub fn leafAppend(self: *PageFile, pno: u32, data: []const u8) ?u16 {
+        self.leaf_mu.lock();
+        defer self.leaf_mu.unlock();
+
         const ph = self.pageHeader(pno);
         const used = ph.used_bytes;
         if (@as(usize, used) + data.len > PAGE_USABLE) return null;

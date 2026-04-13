@@ -109,6 +109,7 @@ pub const MmapFile = struct {
     pub fn at(self: *MmapFile, comptime T: type, off: usize) *T {
         self.rw_lock.lockShared();
         defer self.rw_lock.unlockShared();
+        std.debug.assert(off + @sizeOf(T) <= self.capacity);
         return @alignCast(@ptrCast(&self.ptr[off]));
     }
 
@@ -117,6 +118,7 @@ pub const MmapFile = struct {
     pub fn slice(self: *MmapFile, comptime T: type, off: usize, count: usize) []T {
         self.rw_lock.lockShared();
         defer self.rw_lock.unlockShared();
+        std.debug.assert(off + count * @sizeOf(T) <= self.capacity);
         return @as([*]T, @alignCast(@ptrCast(&self.ptr[off])))[0..count];
     }
 

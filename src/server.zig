@@ -478,10 +478,16 @@ fn doInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []co
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
     const doc_id = col.insert(key, value) catch return err(500, "insert failed");
     srv.recordQueryCost(tenant_id, "insert", 1, value.len, start_ns);
+    var esc_key_buf: [1024]u8 = undefined;
+    var esc_col_buf: [1024]u8 = undefined;
+    var esc_tid_buf: [1024]u8 = undefined;
+    const esc_key = jsonEscape(key, &esc_key_buf);
+    const esc_col = jsonEscape(col_name, &esc_col_buf);
+    const esc_tid = jsonEscape(tenant_id, &esc_tid_buf);
     var fbs = std.io.fixedBufferStream(getBodyBuf());
     std.fmt.format(fbs.writer(),
         "{{\"doc_id\":{d},\"key\":\"{s}\",\"collection\":\"{s}\",\"tenant\":\"{s}\"}}",
-        .{ doc_id, key, col_name, tenant_id }) catch {};
+        .{ doc_id, esc_key, esc_col, esc_tid }) catch {};
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 
@@ -524,10 +530,14 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
 
     srv.recordQueryCost(tenant_id, "bulk_insert", inserted, total_bytes, start_ns);
 
+    var esc_col_buf: [1024]u8 = undefined;
+    var esc_tid_buf: [1024]u8 = undefined;
+    const esc_col = jsonEscape(col_name, &esc_col_buf);
+    const esc_tid = jsonEscape(tenant_id, &esc_tid_buf);
     var fbs = std.io.fixedBufferStream(getBodyBuf());
     std.fmt.format(fbs.writer(),
         "{{\"inserted\":{d},\"errors\":{d},\"collection\":\"{s}\",\"tenant\":\"{s}\"}}",
-        .{ inserted, errors, col_name, tenant_id }) catch {};
+        .{ inserted, errors, esc_col, esc_tid }) catch {};
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, as_of: ?i64) usize {
@@ -569,7 +579,7 @@ fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []c
 
         // Move body right after headers (memmove if needed)
         if (hdr_len < HEADER_RESERVE) {
-            std.mem.copyForwards(u8, resp[hdr_len .. hdr_len + body_len], resp[HEADER_RESERVE .. HEADER_RESERVE + body_len]);
+            std.mem.copyBackwards(u8, resp[hdr_len .. hdr_len + body_len], resp[HEADER_RESERVE .. HEADER_RESERVE + body_len]);
         }
         return hdr_len + body_len;
     }
@@ -611,20 +621,26 @@ fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_s
     for (result.docs) |d| bytes_read += d.key.len + d.value.len;
     srv.recordQueryCost(tenant_id, "scan", result.docs.len, bytes_read, start_ns);
 
+    var esc_tid_buf: [1024]u8 = undefined;
+    var esc_col_buf: [1024]u8 = undefined;
+    const esc_tid = jsonEscape(tenant_id, &esc_tid_buf);
+    const esc_col = jsonEscape(col_name, &esc_col_buf);
     var fbs = std.io.fixedBufferStream(getBodyBuf());
     const w = fbs.writer();
     std.fmt.format(w, "{{\"tenant\":\"{s}\",\"collection\":\"{s}\",\"count\":{d},\"docs\":[",
-        .{ tenant_id, col_name, result.docs.len }) catch {};
+        .{ esc_tid, esc_col, result.docs.len }) catch {};
     for (result.docs, 0..) |d, i| {
         // Stop writing if buffer is nearly full to avoid truncated JSON.
         if (fbs.pos + 256 >= MAX_BODY) break;
         if (i > 0) w.writeByte(',') catch {};
+        var esc_dk_buf: [1024]u8 = undefined;
+        const esc_dk = jsonEscape(d.key, &esc_dk_buf);
         const val = if (d.value.len > 0) d.value else "{}";
         const is_json = val.len > 0 and (val[0] == '{' or val[0] == '[' or val[0] == '"');
         if (is_json) {
-            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}", .{ d.header.doc_id, d.key, d.header.version, val }) catch {};
+            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}", .{ d.header.doc_id, esc_dk, d.header.version, val }) catch {};
         } else {
-            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":\"", .{ d.header.doc_id, d.key, d.header.version }) catch {};
+            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":\"", .{ d.header.doc_id, esc_dk, d.header.version }) catch {};
             for (val) |ch| {
                 if (ch == '"' or ch == '\\') w.writeByte('\\') catch {};
                 if (ch == '\n') { w.writeAll("\\n") catch {}; continue; }
@@ -670,13 +686,15 @@ fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query
         if (fbs.pos + 256 >= MAX_BODY) break;
         if (i > 0) w.writeByte(',') catch {};
         // Output value as valid JSON — objects/arrays as-is, strings quoted
+        var esc_dk_buf: [1024]u8 = undefined;
+        const esc_dk = jsonEscape(d.key, &esc_dk_buf);
         const val = if (d.value.len > 0) d.value else "{}";
         const is_json = val.len > 0 and (val[0] == '{' or val[0] == '[' or val[0] == '"');
         if (is_json) {
-            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":{s}}}", .{ d.header.doc_id, d.key, val }) catch {};
+            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":{s}}}", .{ d.header.doc_id, esc_dk, val }) catch {};
         } else {
             w.writeAll("{\"doc_id\":") catch {};
-            std.fmt.format(w, "{d},\"key\":\"{s}\",\"value\":\"", .{ d.header.doc_id, d.key }) catch {};
+            std.fmt.format(w, "{d},\"key\":\"{s}\",\"value\":\"", .{ d.header.doc_id, esc_dk }) catch {};
             for (val) |ch| {
                 if (ch == '"' or ch == '\\') w.writeByte('\\') catch {};
                 if (ch == '\n') { w.writeAll("\\n") catch {}; continue; }
@@ -1010,6 +1028,30 @@ fn extractContentLength(raw: []const u8) usize {
     return 0;
 }
 
+/// Escape a string for safe JSON interpolation: `"` → `\"`, `\` → `\\`.
+/// Writes into the provided stack buffer; returns the escaped slice or the
+/// original string unchanged when no escaping is needed.
+fn jsonEscape(raw: []const u8, buf: *[1024]u8) []const u8 {
+    var needs_escape = false;
+    for (raw) |ch| {
+        if (ch == '"' or ch == '\\') { needs_escape = true; break; }
+    }
+    if (!needs_escape) return raw;
+    var pos: usize = 0;
+    for (raw) |ch| {
+        if (ch == '"' or ch == '\\') {
+            if (pos + 2 > buf.len) return raw; // overflow → fall back to raw
+            buf[pos] = '\\';
+            pos += 1;
+        } else {
+            if (pos + 1 > buf.len) return raw;
+        }
+        buf[pos] = ch;
+        pos += 1;
+    }
+    return buf[0..pos];
+}
+
 fn jsonStr(json: []const u8, key: []const u8) ?[]const u8 {
     var kbuf: [64]u8 = undefined;
     const needle = std.fmt.bufPrint(&kbuf, "\"{s}\":", .{key}) catch return null;
@@ -1247,8 +1289,33 @@ fn handleWebSocket(srv: *Server, conn: std.net.Server.Connection, initial: []con
 
         if (opcode == 0x8) return; // close frame
         if (opcode == 0x9) { // ping → pong
-            hdr[0] = 0x8A; // FIN + pong
-            conn.stream.writeAll(hdr[0..2]) catch return;
+            // Resolve the full payload length (may be extended).
+            var ping_len: u64 = payload_len;
+            if (ping_len == 126) {
+                wsReadExact(conn, hdr[2..4]) catch return;
+                ping_len = std.mem.readInt(u16, hdr[2..4], .big);
+            } else if (ping_len == 127) {
+                wsReadExact(conn, hdr[2..10]) catch return;
+                ping_len = std.mem.readInt(u64, hdr[2..10], .big);
+            }
+            // Read and discard mask key if present.
+            var ping_mask: [4]u8 = .{0, 0, 0, 0};
+            if (masked) wsReadExact(conn, &ping_mask) catch return;
+            // Read the ping payload so the stream stays synchronised.
+            const pl: usize = @intCast(ping_len);
+            if (pl > 0 and pl <= frame_buf.len) {
+                wsReadExact(conn, frame_buf[0..pl]) catch return;
+                // Unmask payload before echoing it back.
+                if (masked) {
+                    for (frame_buf[0..pl], 0..) |*b, j| b.* ^= ping_mask[j % 4];
+                }
+            }
+            // Send pong with the same payload.
+            var pong_hdr: [2]u8 = .{ 0x8A, @intCast(ping_len & 0x7F) };
+            conn.stream.writeAll(&pong_hdr) catch return;
+            if (pl > 0 and pl <= frame_buf.len) {
+                conn.stream.writeAll(frame_buf[0..pl]) catch return;
+            }
             continue;
         }
 
