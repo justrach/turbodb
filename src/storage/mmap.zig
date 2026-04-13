@@ -22,7 +22,7 @@ const OS_PAGE_ALIGN: usize = std.heap.page_size_min;
 
 /// 4 GiB virtual reservation.  Costs zero physical memory — pages are
 /// only materialised when backed by ftruncate + MAP_FIXED.
-pub const MAX_VA_SIZE: usize = 4 * 1024 * 1024 * 1024;
+pub const MAX_VA_SIZE: usize = 1024 * 1024 * 1024; // 1 GiB
 
 pub const MmapFile = struct {
     fd:       posix.fd_t,
