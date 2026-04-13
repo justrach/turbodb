@@ -17,7 +17,7 @@ const collection = @import("collection.zig");
 const Database = collection.Database;
 
 const MAX_REQ  = 65536;  // 64 KiB (initial read)
-const MAX_RESP = 131072; // 128 KiB
+const MAX_RESP = 65536; // 64 KiB
 const MAX_BODY = 65536;  // 64 KiB
 const MAX_BULK = 16 * 1024 * 1024; // 16 MiB for bulk inserts
 

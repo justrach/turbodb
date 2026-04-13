@@ -30,7 +30,7 @@ pub const MAX_COLLECTION_NAME_LEN: usize = 64;
 // Lock-free MPSC queue for deferring trigram+word index builds to a background thread.
 // Insert path pushes owned (key, value) pairs; background thread pops and indexes.
 pub const IndexQueue = struct {
-    const CAPACITY = 131072; // 128K entries — sized for 100+ concurrent writers
+    const CAPACITY = 16384; // 16K entries — balances burst capacity vs memory
 
     const Entry = struct {
         key: []const u8,
@@ -162,7 +162,7 @@ fn extractJsonFloatArray(json: []const u8, field_name: []const u8, out: []f32) ?
 }
 // ─── Collection ──────────────────────────────────────────────────────────
 pub const Collection = struct {
-    pub const STRIPE_COUNT = 4096;
+    pub const STRIPE_COUNT = 256;
     // MVCC GC: trigger version chain cleanup every GC_INTERVAL inserts.
     const GC_INTERVAL: u64 = 500;
 

@@ -13,7 +13,7 @@
 const std   = @import("std");
 const posix = std.posix;
 
-pub const GROW_CHUNK: usize = 256 * 1024 * 1024; // 256 MiB
+pub const GROW_CHUNK: usize = 64 * 1024 * 1024; // 64 MiB
 pub const PAGE_SIZE:  usize = 4096;
 
 /// OS minimum page alignment — on Apple Silicon this is 16384, on x86-64

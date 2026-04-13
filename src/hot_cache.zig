@@ -10,7 +10,7 @@ pub const HotCache = struct {
     misses: std.atomic.Value(u64),
     mutex: std.Thread.Mutex,
 
-    const CACHE_SIZE: u32 = 16384; // power of 2 for fast modulo
+    const CACHE_SIZE: u32 = 4096; // power of 2 for fast modulo
     const MASK: u32 = CACHE_SIZE - 1;
     const PROBE_LIMIT: u32 = 4;
 
