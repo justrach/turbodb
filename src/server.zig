@@ -503,31 +503,44 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
     srv.db.ensureTenantStorageAvailable(tenant_id, body.len) catch return err(429, "tenant storage quota exceeded");
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
 
+    // Parse all NDJSON lines into key/value slices, then batch-insert.
+    const MaxLines = 4096;
+    var key_buf: [MaxLines][]const u8 = undefined;
+    var val_buf: [MaxLines][]const u8 = undefined;
+    var n_lines: usize = 0;
+
     var inserted: u32 = 0;
     var errors: u32 = 0;
     var total_bytes: u64 = 0;
 
-    // Parse NDJSON: iterate lines, each is a {"key":"...","value":...} object
     var pos: usize = 0;
     while (pos < body.len) {
-        // Find end of line
         const line_end = std.mem.indexOfScalarPos(u8, body, pos, '\n') orelse body.len;
         const line = std.mem.trim(u8, body[pos..line_end], " \t\r");
         pos = line_end + 1;
 
-        if (line.len < 2) continue; // skip empty lines
-
-        // Extract key from this JSON line
+        if (line.len < 2) continue;
         const key = jsonStr(line, "key") orelse continue;
-        // Extract value field; fall back to full line for backwards compat.
         const value = jsonValue(line, "value") orelse line;
 
-        _ = col.insert(key, value) catch {
-            errors += 1;
-            continue;
-        };
-        inserted += 1;
+        key_buf[n_lines] = key;
+        val_buf[n_lines] = value;
         total_bytes += line.len;
+        n_lines += 1;
+
+        if (n_lines >= MaxLines) {
+            // Flush batch.
+            const r = col.insertBatch(key_buf[0..n_lines], val_buf[0..n_lines]);
+            inserted += r.inserted;
+            errors += r.errors;
+            n_lines = 0;
+        }
+    }
+    // Flush remaining.
+    if (n_lines > 0) {
+        const r = col.insertBatch(key_buf[0..n_lines], val_buf[0..n_lines]);
+        inserted += r.inserted;
+        errors += r.errors;
     }
 
     srv.recordQueryCost(tenant_id, "bulk_insert", inserted, total_bytes, start_ns);

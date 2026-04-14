@@ -488,6 +488,134 @@ pub const Collection = struct {
         return doc_id;
     }
 
+    /// Fast-path batch insert for bulk operations. Takes shared_mu ONCE for all
+    /// HashMap operations, skips per-doc WAL txn overhead, and defers trigram
+    /// indexing entirely to background workers.
+    pub fn insertBatch(self: *Collection, keys: []const []const u8, values: []const []const u8) InsertBatchResult {
+        var result = InsertBatchResult{ .inserted = 0, .errors = 0 };
+        if (keys.len == 0) return result;
+        const count = @min(keys.len, values.len);
+
+        // Phase 1: encode + write pages (no shared lock needed — page-level locking).
+        const MaxBatch = 1024;
+        var entries: [MaxBatch]BTreeEntry = undefined;
+        var doc_ids: [MaxBatch]u64 = undefined;
+        var hashes: [MaxBatch]u64 = undefined;
+        var batch_n: usize = 0;
+
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            if (batch_n >= MaxBatch) {
+                // Flush accumulated batch to indexes.
+                self.flushBatch(entries[0..batch_n], doc_ids[0..batch_n], hashes[0..batch_n], keys, values, i - batch_n);
+                result.inserted += @intCast(batch_n);
+                batch_n = 0;
+            }
+            const key = keys[i];
+            const value = values[i];
+            if (key.len == 0 or key.len > std.math.maxInt(u16)) { result.errors += 1; continue; }
+            if (value.len > std.math.maxInt(u32)) { result.errors += 1; continue; }
+
+            const doc_id = self.next_doc_id.fetchAdd(1, .monotonic);
+            const hdr = doc_mod.newHeader(doc_id, key, value);
+            const d = Doc{ .header = hdr, .key = key, .value = value };
+            const total_size = DocHeader.size + key.len + value.len;
+
+            // WAL (fast — just buffer append)
+            var wal_buf: [65536]u8 = undefined;
+            const wal_enc = d.encodeBuf(&wal_buf) catch { result.errors += 1; continue; };
+            _ = self.wal_log.write(0, .doc_insert, 0, 0, wal_enc) catch { result.errors += 1; continue; };
+
+            // Page write
+            const pno = self.findOrAllocLeaf(total_size) catch { result.errors += 1; continue; };
+            const reserved = self.pf.leafReserve(pno, total_size) orelse { result.errors += 1; continue; };
+            _ = d.encodeBuf(reserved.buf) catch { result.errors += 1; continue; };
+
+            entries[batch_n] = BTreeEntry{
+                .key_hash = hdr.key_hash,
+                .doc_id   = doc_id,
+                .page_no  = pno,
+                .page_off = reserved.off,
+            };
+            doc_ids[batch_n] = doc_id;
+            hashes[batch_n] = hdr.key_hash;
+            batch_n += 1;
+        }
+        // Flush remaining.
+        if (batch_n > 0) {
+            self.flushBatch(entries[0..batch_n], doc_ids[0..batch_n], hashes[0..batch_n], keys, values, count - batch_n);
+            result.inserted += @intCast(batch_n);
+        }
+        return result;
+    }
+
+    const InsertBatchResult = struct { inserted: u32, errors: u32 };
+
+    /// Phase 2 of batch insert: acquire shared_mu ONCE, insert all entries into
+    /// indexes, then push all docs to async indexer.
+    fn flushBatch(
+        self: *Collection,
+        entries: []const BTreeEntry,
+        doc_ids: []const u64,
+        hashes: []const u64,
+        keys: []const []const u8,
+        values: []const []const u8,
+        key_offset: usize,
+    ) void {
+        // Pre-grow HashMaps to avoid rehash under lock.
+        const needed = entries.len + self.hash_idx.count();
+        self.hash_idx.ensureTotalCapacity(@intCast(needed)) catch {};
+        self.key_doc_ids.ensureTotalCapacity(@intCast(needed)) catch {};
+        self.key_epochs.ensureTotalCapacity(@intCast(needed)) catch {};
+
+        self.shared_mu.lock();
+        var last_epoch: u64 = 0;
+        for (entries, 0..) |entry, j| {
+            self.idx.insert(entry) catch continue;
+            self.hash_idx.put(entry.key_hash, entry) catch {};
+            const epoch = self.epochs.advance();
+            self.versions.appendVersion(self.alloc, doc_ids[j], entry.page_no, entry.page_off, epoch) catch {};
+            last_epoch = epoch;
+            self.key_doc_ids.put(hashes[j], doc_ids[j]) catch {};
+            self.key_epochs.put(hashes[j], doc_ids[j]) catch {};
+            _ = self.gc_counter.fetchAdd(1, .monotonic);
+        }
+        if (last_epoch > 0) self.versions.current_epoch.store(last_epoch, .release);
+        const gc_val = self.gc_counter.load(.monotonic);
+        self.shared_mu.unlock();
+
+        // GC if needed (outside lock).
+        if (gc_val >= GC_INTERVAL and gc_val % GC_INTERVAL < entries.len) {
+            self.shared_mu.lock();
+            _ = self.versions.gc(self.alloc);
+            self.shared_mu.unlock();
+        }
+
+        // Push to async trigram/word index queues.
+        for (entries, 0..) |_, j| {
+            const ki = key_offset + j;
+            if (ki >= keys.len) break;
+            const value = values[ki];
+            const key = keys[ki];
+            if (value.len < 3) continue;
+            const owned_key = self.alloc.dupe(u8, key) catch continue;
+            const owned_val = self.alloc.dupe(u8, value) catch { self.alloc.free(owned_key); continue; };
+            const q = if (self.queue_toggle.fetchAdd(1, .monotonic) % 2 == 0) &self.index_queue else &self.index_queue2;
+            if (!q.push(owned_key, owned_val)) {
+                // Queue full — just skip async indexing for this doc.
+                // The data is still in the page store and searchable via scan.
+                self.alloc.free(owned_key);
+                self.alloc.free(owned_val);
+            }
+        }
+
+        // Emit CDC for each doc.
+        for (entries, 0..) |_, j| {
+            const ki = key_offset + j;
+            if (ki >= keys.len) break;
+            emitChange(self, .insert, keys[ki], values[ki], doc_ids[j]);
+        }
+    }
     /// Insert a document with a pre-computed embedding (no JSON parsing needed).
     /// This is the fast path — embedding is passed directly as f32 slice.
     pub fn insertWithEmbedding(self: *Collection, key: []const u8, value: []const u8, embedding: []const f32) !u64 {
