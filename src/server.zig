@@ -239,8 +239,7 @@ fn handleConn(srv: *Server, conn: std.net.Server.Connection) void {
             return; // WS handler owns the connection until close
         }
 
-        // For bulk inserts: read the full body based on Content-Length.
-        // The initial read may only contain part of a large body.
+        // Read the full body based on Content-Length if we don't have it yet.
         const content_length = extractContentLength(initial);
         const is_bulk = std.mem.indexOf(u8, initial[0..@min(n, 256)], "/bulk") != null;
 
@@ -268,9 +267,9 @@ fn handleConn(srv: *Server, conn: std.net.Server.Connection) void {
                 conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
                 continue;
             }
-        } else if (content_length > 0 and content_length <= MAX_REQ and is_bulk) {
-            // Small bulk: body fits in the req buffer but the initial read may
-            // not have received it all.  Keep reading until we have the full body.
+        } else if (content_length > 0 and content_length <= MAX_REQ) {
+            // Body fits in the req buffer but the initial read may not have
+            // received it all.  Keep reading until we have the full body.
             const header_end = if (std.mem.indexOf(u8, initial, "\r\n\r\n")) |p| p + 4
                 else if (std.mem.indexOf(u8, initial, "\n\n")) |p| p + 2
                 else n;
@@ -559,14 +558,19 @@ fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []c
         var fbs = std.io.fixedBufferStream(resp[HEADER_RESERVE..]);
         const val = if (d.value.len > 0) d.value else "{}";
         const is_json = val.len > 0 and (val[0] == '{' or val[0] == '[' or val[0] == '"');
+        var esc_key_buf: [1024]u8 = undefined;
+        const esc_key = jsonEscape(d.key, &esc_key_buf);
         const w = fbs.writer();
         if (is_json) {
-            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}", .{ d.header.doc_id, d.key, d.header.version, val }) catch {};
+            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}", .{ d.header.doc_id, esc_key, d.header.version, val }) catch {};
         } else {
-            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":\"", .{ d.header.doc_id, d.key, d.header.version }) catch {};
+            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":\"", .{ d.header.doc_id, esc_key, d.header.version }) catch {};
             for (val) |ch| {
-                if (ch == '"' or ch == '\\') w.writeByte('\\') catch {};
+                if (ch == '"' or ch == '\\') { w.writeByte('\\') catch {}; w.writeByte(ch) catch {}; continue; }
                 if (ch == '\n') { w.writeAll("\\n") catch {}; continue; }
+                if (ch == '\r') { w.writeAll("\\r") catch {}; continue; }
+                if (ch == '\t') { w.writeAll("\\t") catch {}; continue; }
+                if (ch < 0x20) continue;
                 w.writeByte(ch) catch {};
             }
             w.writeAll("\"}") catch {};
@@ -645,8 +649,11 @@ fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_s
         } else {
             std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":\"", .{ d.header.doc_id, esc_dk, d.header.version }) catch {};
             for (val) |ch| {
-                if (ch == '"' or ch == '\\') w.writeByte('\\') catch {};
+                if (ch == '"' or ch == '\\') { w.writeByte('\\') catch {}; w.writeByte(ch) catch {}; continue; }
                 if (ch == '\n') { w.writeAll("\\n") catch {}; continue; }
+                if (ch == '\r') { w.writeAll("\\r") catch {}; continue; }
+                if (ch == '\t') { w.writeAll("\\t") catch {}; continue; }
+                if (ch < 0x20) continue;
                 w.writeByte(ch) catch {};
             }
             w.writeAll("\"}") catch {};
@@ -714,8 +721,11 @@ fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query
             w.writeAll("{\"doc_id\":") catch {};
             std.fmt.format(w, "{d},\"key\":\"{s}\",\"value\":\"", .{ d.header.doc_id, esc_dk }) catch {};
             for (val) |ch| {
-                if (ch == '"' or ch == '\\') w.writeByte('\\') catch {};
+                if (ch == '"' or ch == '\\') { w.writeByte('\\') catch {}; w.writeByte(ch) catch {}; continue; }
                 if (ch == '\n') { w.writeAll("\\n") catch {}; continue; }
+                if (ch == '\r') { w.writeAll("\\r") catch {}; continue; }
+                if (ch == '\t') { w.writeAll("\\t") catch {}; continue; }
+                if (ch < 0x20) continue;
                 w.writeByte(ch) catch {};
             }
             w.writeAll("\"}") catch {};
@@ -1063,20 +1073,46 @@ fn extractContentLength(raw: []const u8) usize {
 fn jsonEscape(raw: []const u8, buf: *[1024]u8) []const u8 {
     var needs_escape = false;
     for (raw) |ch| {
-        if (ch == '"' or ch == '\\') { needs_escape = true; break; }
+        if (ch == '"' or ch == '\\' or ch < 0x20) { needs_escape = true; break; }
     }
     if (!needs_escape) return raw;
     var pos: usize = 0;
     for (raw) |ch| {
         if (ch == '"' or ch == '\\') {
-            if (pos + 2 > buf.len) return buf[0..pos]; // truncate safely
+            if (pos + 2 > buf.len) return buf[0..pos];
             buf[pos] = '\\';
-            pos += 1;
+            buf[pos + 1] = ch;
+            pos += 2;
+        } else if (ch == '\n') {
+            if (pos + 2 > buf.len) return buf[0..pos];
+            buf[pos] = '\\';
+            buf[pos + 1] = 'n';
+            pos += 2;
+        } else if (ch == '\r') {
+            if (pos + 2 > buf.len) return buf[0..pos];
+            buf[pos] = '\\';
+            buf[pos + 1] = 'r';
+            pos += 2;
+        } else if (ch == '\t') {
+            if (pos + 2 > buf.len) return buf[0..pos];
+            buf[pos] = '\\';
+            buf[pos + 1] = 't';
+            pos += 2;
+        } else if (ch < 0x20) {
+            if (pos + 6 > buf.len) return buf[0..pos];
+            const hex = "0123456789abcdef";
+            buf[pos] = '\\';
+            buf[pos + 1] = 'u';
+            buf[pos + 2] = '0';
+            buf[pos + 3] = '0';
+            buf[pos + 4] = hex[ch >> 4];
+            buf[pos + 5] = hex[ch & 0x0f];
+            pos += 6;
         } else {
-            if (pos + 1 > buf.len) return buf[0..pos]; // truncate safely
+            if (pos + 1 > buf.len) return buf[0..pos];
+            buf[pos] = ch;
+            pos += 1;
         }
-        buf[pos] = ch;
-        pos += 1;
     }
     return buf[0..pos];
 }
@@ -1090,8 +1126,13 @@ fn jsonStr(json: []const u8, key: []const u8) ?[]const u8 {
     while (start < json.len and (json[start] == ' ' or json[start] == '\t')) start += 1;
     if (start >= json.len or json[start] != '"') return null;
     start += 1; // skip opening quote
-    const end = std.mem.indexOfScalarPos(u8, json, start, '"') orelse return null;
-    return json[start..end];
+    // Scan for closing quote, skipping escaped quotes
+    var i = start;
+    while (i < json.len) : (i += 1) {
+        if (json[i] == '\\' and i + 1 < json.len) { i += 1; continue; }
+        if (json[i] == '"') return json[start..i];
+    }
+    return null;
 }
 
 // Extract a JSON value (string, object, array, number, bool, null) for the given key.

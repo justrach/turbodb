@@ -23,7 +23,7 @@ const STATUS_NOT_FOUND: u8 = 0x01;
 const STATUS_ERROR: u8 = 0x02;
 
 const HDR: usize = 5;
-const MAX_FRAME: usize = 1048576;
+const MAX_FRAME: usize = RD_BUF;
 const RD_BUF: usize = 65536;
 const WR_BUF: usize = 131072;
 const MAX_WIRE_CONNECTIONS: u32 = 512;
@@ -121,10 +121,12 @@ fn handleConn(srv: *WireServer, conn: std.net.Server.Connection) void {
     var rp: usize = 0;
 
     while (true) {
-        // Clamp read to remaining buffer space; wrap if exhausted.
+        // Clamp read to remaining buffer space.
         const remaining = RD_BUF - rp;
         if (remaining == 0) {
-            rp = 0;
+            // Buffer full with an incomplete frame — the frame is larger
+            // than RD_BUF so it can never be processed.  Close connection.
+            return;
         }
         const n = conn.stream.read(bufs.rd[rp..RD_BUF]) catch return;
         if (n == 0) return;

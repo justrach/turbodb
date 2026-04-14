@@ -205,31 +205,34 @@ pub const CDCManager = struct {
                 self.mu.unlock();
                 return;
             }
-            const ev = self.pending.orderedRemove(0);
-            // Snapshot subscription count under lock — iterate by index so we
-            // re-read items pointer each iteration (safe if ArrayList grows).
+            // Drain all pending events in one batch to avoid O(n) orderedRemove(0) per event.
+            var batch = self.pending;
+            self.pending = .empty;
             const sub_count = self.subscriptions.items.len;
             self.mu.unlock();
 
-            var si: usize = 0;
-            while (si < sub_count) : (si += 1) {
-                self.mu.lock();
-                if (si >= self.subscriptions.items.len) {
+            for (batch.items) |ev| {
+                var si: usize = 0;
+                while (si < sub_count) : (si += 1) {
+                    self.mu.lock();
+                    if (si >= self.subscriptions.items.len) {
+                        self.mu.unlock();
+                        break;
+                    }
+                    const sub = self.subscriptions.items[si];
                     self.mu.unlock();
-                    break;
-                }
-                const sub = self.subscriptions.items[si];
-                self.mu.unlock();
 
-                if (!matches(sub, ev)) continue;
-                const delivery = makeDelivery(sub, ev);
-                self.mu.lock();
-                self.deliveries.append(self.allocator, delivery) catch {};
-                if (self.deliveries.items.len > 4096) {
-                    _ = self.deliveries.orderedRemove(0);
+                    if (!matches(sub, ev)) continue;
+                    const delivery = makeDelivery(sub, ev);
+                    self.mu.lock();
+                    self.deliveries.append(self.allocator, delivery) catch {};
+                    if (self.deliveries.items.len > 4096) {
+                        _ = self.deliveries.orderedRemove(0);
+                    }
+                    self.mu.unlock();
                 }
-                self.mu.unlock();
             }
+            batch.deinit(self.allocator);
         }
     }
 };

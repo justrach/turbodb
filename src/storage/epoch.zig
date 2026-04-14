@@ -68,6 +68,14 @@ pub const EpochManager = struct {
         self.timeline_mu.lock();
         defer self.timeline_mu.unlock();
         self.timeline.append(self.allocator, .{ .epoch = epoch, .ts_ms = ts_ms }) catch {};
+        // Prune old timeline entries to prevent unbounded memory growth.
+        // Keep at most 100K entries (~1.6 MiB); drop the oldest half when full.
+        const TIMELINE_CAP = 100_000;
+        if (self.timeline.items.len > TIMELINE_CAP) {
+            const drop = self.timeline.items.len / 2;
+            std.mem.copyForwards(EpochPoint, self.timeline.items[0..self.timeline.items.len - drop], self.timeline.items[drop..]);
+            self.timeline.items.len -= drop;
+        }
         return epoch;
     }
 

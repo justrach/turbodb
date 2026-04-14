@@ -419,6 +419,7 @@ pub const Collection = struct {
         // MVCC: register version in the version chain.
         const epoch = self.epochs.advance();
         self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
+        self.versions.current_epoch.store(epoch, .release);
         self.key_doc_ids.put(hdr.key_hash, doc_id) catch {};
         self.key_epochs.put(hdr.key_hash, doc_id) catch {}; // epoch = doc_id (monotonic)
         const should_gc = self.gc_counter.fetchAdd(1, .monotonic) % GC_INTERVAL == GC_INTERVAL - 1;
@@ -635,8 +636,15 @@ pub const Collection = struct {
         // MVCC: register new version in the version chain (links to old automatically).
         const epoch = self.epochs.advance();
         self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
+        self.versions.current_epoch.store(epoch, .release);
         self.key_epochs.put(key_hash, doc_id) catch {};
+        const should_gc = self.gc_counter.fetchAdd(1, .monotonic) % GC_INTERVAL == GC_INTERVAL - 1;
         self.shared_mu.unlock();
+        if (should_gc) {
+            self.shared_mu.lock();
+            _ = self.versions.gc(self.alloc);
+            self.shared_mu.unlock();
+        }
         emitChange(self, .update, key, new_value, doc_id);
 
         return true;
@@ -670,11 +678,18 @@ pub const Collection = struct {
         self.shared_mu.lock();
         const epoch = self.epochs.advance();
         self.versions.appendVersion(self.alloc, old_doc.header.doc_id, pno, page_off, epoch) catch {};
+        self.versions.current_epoch.store(epoch, .release);
         self.idx.delete(key_hash);
         _ = self.hash_idx.remove(key_hash);
         _ = self.key_doc_ids.remove(key_hash);
         _ = self.key_epochs.remove(key_hash);
+        const should_gc = self.gc_counter.fetchAdd(1, .monotonic) % GC_INTERVAL == GC_INTERVAL - 1;
         self.shared_mu.unlock();
+        if (should_gc) {
+            self.shared_mu.lock();
+            _ = self.versions.gc(self.alloc);
+            self.shared_mu.unlock();
+        }
         self.cache.invalidate(key_hash);
         self.tri.removeFile(key);
         self.words.removeFile(key);
@@ -1536,7 +1551,7 @@ fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
         }
         if (n == 0) {
             _ = col.indexing_count.fetchSub(1, .release);
-            std.Thread.yield() catch {};
+            std.Thread.sleep(1_000_000); // 1ms — avoid busy-spin when queue is empty
             continue;
         }
         // Batch trigram indexing (single lock acquisition for all docs).
