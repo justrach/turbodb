@@ -249,8 +249,11 @@ pub const Collection = struct {
             lock.* = .{};
         }
         col.hash_idx = std.AutoHashMap(u64, BTreeEntry).init(alloc);
+        col.hash_idx.ensureTotalCapacity(4096) catch {};
         col.key_doc_ids = std.AutoHashMap(u64, u64).init(alloc);
+        col.key_doc_ids.ensureTotalCapacity(4096) catch {};
         col.key_epochs = std.AutoHashMap(u64, u64).init(alloc);
+        col.key_epochs.ensureTotalCapacity(4096) catch {};
         col.alloc = alloc;
         col.cache = hot_cache.HotCache.init();
         col.versions = mvcc_mod.VersionChain.init(alloc);
@@ -388,8 +391,7 @@ pub const Collection = struct {
             break :blk wal_heap.?;
         };
         const wal_enc = try d.encodeBuf(wal_enc_buf);
-        const txn = self.wal_log.next_lsn.load(.monotonic);
-        _ = try self.wal_log.write(txn, .doc_insert, 0, 0, wal_enc);
+        _ = try self.wal_log.write(0, .doc_insert, 0, 0, wal_enc);
 
         // Write directly to page memory (single copy, no intermediate buffer).
         const pno = try self.findOrAllocLeaf(total_size);
@@ -447,7 +449,7 @@ pub const Collection = struct {
                     var retries: u32 = 0;
                     while (!q.push(owned_key.?, owned_val.?)) {
                         retries += 1;
-                        if (retries > 1000) {
+                        if (retries > 64) {
                             // Queue full — fall back to synchronous indexing.
                             self.tri.indexFile(owned_key.?, owned_val.?) catch {};
                             self.words.indexFile(owned_key.?, owned_val.?) catch {};
@@ -455,7 +457,7 @@ pub const Collection = struct {
                             self.alloc.free(owned_val.?);
                             break;
                         }
-                        std.Thread.yield() catch {};
+                        std.atomic.spinLoopHint();
                     }
                 }
             }
@@ -617,8 +619,7 @@ pub const Collection = struct {
         var enc_buf: [65536]u8 = undefined;
         const enc = try d.encodeBuf(&enc_buf);
 
-        const txn = self.wal_log.next_lsn.load(.monotonic);
-        _ = try self.wal_log.write(txn, .doc_update, 0, 0, enc);
+        _ = try self.wal_log.write(0, .doc_update, 0, 0, enc);
 
         const pno = try self.findOrAllocLeaf(enc.len);
         const page_off = self.pf.leafAppend(pno, enc) orelse return error.PageFull;
@@ -669,8 +670,7 @@ pub const Collection = struct {
         tomb_hdr.flags |= DocHeader.DELETED;
         tomb_hdr.version = old_doc.header.version +% 1;
         tomb_hdr.next_ver = (@as(u64, entry.page_no) << 16) | entry.page_off;
-        const txn = self.wal_log.next_lsn.load(.monotonic);
-        _ = try self.wal_log.write(txn, .doc_delete, 0, 0, std.mem.asBytes(&tomb_hdr));
+        _ = try self.wal_log.write(0, .doc_delete, 0, 0, std.mem.asBytes(&tomb_hdr));
         const tomb_doc = Doc{ .header = tomb_hdr, .key = key, .value = "" };
         var enc_buf: [65536]u8 = undefined;
         const enc = try tomb_doc.encodeBuf(&enc_buf);
@@ -900,13 +900,17 @@ pub const Collection = struct {
         const total_pages = self.pf.next_alloc.load(.acquire);
         var skipped: u32 = 0;
         var pno: u32 = 0;
+        // Snapshot used_bytes per page under shared_mu to avoid reading
+        // partially-written documents from concurrent inserts.
+        self.shared_mu.lock();
         outer: while (pno < total_pages) : (pno += 1) {
             const ph = self.pf.pageHeader(pno);
             if (@as(page_mod.PageType, @enumFromInt(ph.page_type)) != .leaf) continue;
+            const used = ph.used_bytes;
             const data = self.pf.pageData(pno);
             var pos: usize = 0;
-            while (pos + DocHeader.size <= ph.used_bytes) {
-                const rem = data[pos..ph.used_bytes];
+            while (pos + DocHeader.size <= used) {
+                const rem = data[pos..used];
                 const decoded = doc_mod.decode(rem) catch break;
                 const d = decoded.doc;
                 pos += decoded.consumed;
@@ -916,6 +920,7 @@ pub const Collection = struct {
                 if (results.items.len >= limit) break :outer;
             }
         }
+        self.shared_mu.unlock();
         return ScanResult{ .docs = try results.toOwnedSlice(alloc), .alloc = alloc };
     }
 
