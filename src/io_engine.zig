@@ -428,6 +428,7 @@ pub fn MpscRing(comptime T: type, comptime cap: usize) type {
                     return true;
                 }
                 // CAS failed, retry.
+                std.atomic.spinLoopHint();
             }
         }
 

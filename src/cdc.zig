@@ -146,6 +146,8 @@ pub const CDCManager = struct {
         self.worker = null;
     }
 
+    const MAX_SUBSCRIPTIONS: usize = 1024;
+
     pub fn registerWebhook(self: *CDCManager, tenant_id: []const u8, collection: []const u8, webhook_url: []const u8, secret: []const u8) !u64 {
         var sub = std.mem.zeroes(Subscription);
         sub.id = self.next_subscription_id.fetchAdd(1, .monotonic);
@@ -156,8 +158,21 @@ pub const CDCManager = struct {
 
         self.mu.lock();
         defer self.mu.unlock();
+        if (self.subscriptions.items.len >= MAX_SUBSCRIPTIONS) return error.TooManySubscriptions;
         try self.subscriptions.append(self.allocator, sub);
         return sub.id;
+    }
+
+    pub fn removeWebhook(self: *CDCManager, sub_id: u64) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.subscriptions.items, 0..) |sub, i| {
+            if (sub.id == sub_id) {
+                _ = self.subscriptions.swapRemove(i);
+                return true;
+            }
+        }
+        return false;
     }
 
     pub fn emit(self: *CDCManager, tenant_id: []const u8, collection: []const u8, key: []const u8, value: []const u8, doc_id: u64, op: Op) void {

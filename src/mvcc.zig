@@ -138,6 +138,7 @@ pub const VersionChain = struct {
         while (epoch < min) {
             if (self.min_active_epoch.cmpxchgWeak(min, epoch, .release, .monotonic)) |actual| {
                 min = actual;
+                std.atomic.spinLoopHint();
             } else break;
         }
         return ReadTxn{

@@ -63,6 +63,7 @@ pub const IndexQueue = struct {
             if (next == self.tail.load(.acquire)) return false; // full
             // Atomically claim this slot by advancing head.
             if (self.head.cmpxchgWeak(h, next, .acq_rel, .monotonic)) |_| {
+                std.atomic.spinLoopHint();
                 continue; // CAS failed — another producer won, retry
             }
             // We own slot h — write data then signal readiness.

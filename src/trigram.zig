@@ -67,16 +67,21 @@ pub const TrigramIndex = struct {
         self.doc_count += 1;
     }
 
-    /// Remove a document from all posting lists (lazy tombstone).
+    /// Remove a document from all posting lists (compact in-place).
     pub fn removeDoc(self: *TrigramIndex, doc_id: u64, value: []const u8) void {
         if (value.len < 3) return;
         var i: usize = 0;
         while (i + 2 < value.len) : (i += 1) {
             const key = trigramKey(value[i], value[i + 1], value[i + 2]);
             if (self.postings.getPtr(key)) |list| {
-                for (list.items) |*id| {
-                    if (id.* == doc_id) id.* = std.math.maxInt(u64);
+                var write: usize = 0;
+                for (list.items) |id| {
+                    if (id != doc_id) {
+                        list.items[write] = id;
+                        write += 1;
+                    }
                 }
+                list.items.len = write;
             }
         }
         if (self.doc_count > 0) self.doc_count -= 1;
@@ -126,7 +131,7 @@ pub const TrigramIndex = struct {
         errdefer result.deinit(alloc);
 
         for (seed) |id| {
-            if (id != std.math.maxInt(u64)) try result.append(alloc, id);
+            try result.append(alloc, id);
         }
 
         // Intersect with remaining

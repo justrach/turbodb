@@ -338,16 +338,16 @@ pub const WAL = struct {
         const lsn = try self.write(0, .checkpoint, db_tag, FLAG_COMMIT, &p);
         self.checkpoint_lsn = lsn;
 
-        // Hold the mutex for the entire flush+truncate to prevent concurrent
-        // writers from writing to the file between flush and truncation.
+        // Swap write buffer under lock, then release so writers can continue
+        // appending to the fresh buffer while we flush + sync.
         self.mu.lock();
-        defer self.mu.unlock();
-
         self.flushing = true;
         var to_write = self.write_buf;
         self.write_buf = .empty;
+        self.cond.broadcast(); // wake writers waiting on full buffer
+        self.mu.unlock();
 
-        // ── I/O under lock (blocks writers but guarantees correctness) ────────
+        // ── I/O without lock (writers append to new write_buf concurrently) ──
         var io_err: ?anyerror = null;
         self.file.writeAll(to_write.items) catch |e| {
             io_err = e;
@@ -355,22 +355,29 @@ pub const WAL = struct {
         to_write.deinit(self.allocator);
 
         if (io_err) |e| {
+            self.mu.lock();
             self.io_err_flag = true;
             self.flushing = false;
             self.cond.broadcast();
+            self.mu.unlock();
             std.log.err("WAL checkpoint write error: {}", .{e});
             return e;
         }
 
         self.file.sync() catch |e| {
+            self.mu.lock();
             self.io_err_flag = true;
             self.flushing = false;
             self.cond.broadcast();
+            self.mu.unlock();
             std.log.err("WAL checkpoint sync error: {}", .{e});
             return e;
         };
 
-        // Truncate WAL -- all data is checkpointed to page files.
+        // Reacquire lock for truncation + state update.
+        self.mu.lock();
+        defer self.mu.unlock();
+
         self.file.seekTo(0) catch |e| {
             self.io_err_flag = true;
             self.flushing = false;
@@ -390,7 +397,6 @@ pub const WAL = struct {
         self.flushing = false;
         self.cond.broadcast();
     }
-
     // ── Recovery ──────────────────────────────────────────────────────────────
 
     /// Replay WAL from the beginning.  apply_fn is called for every committed

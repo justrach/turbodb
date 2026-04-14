@@ -231,6 +231,7 @@ pub const BwTree = struct {
             } else {
                 // CAS failed — another thread won; free our delta and retry
                 self.allocator.destroy(new_delta);
+                std.atomic.spinLoopHint();
             }
         }
     }
@@ -262,6 +263,7 @@ pub const BwTree = struct {
                 return;
             } else {
                 self.allocator.destroy(new_delta);
+                std.atomic.spinLoopHint();
             }
         }
     }
