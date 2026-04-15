@@ -493,9 +493,31 @@ fn doInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []co
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 
-/// POST /db/:col/bulk — insert multiple documents in one request.
-/// Body: NDJSON — one {"key":"...","value":"..."} per line.
-/// Response: {"inserted":N,"errors":M,"collection":"...","tenant":"..."}
+/// SIMD-accelerated scan for the next newline byte starting at `start`.
+/// Uses 16-byte vector comparison (SSE2 on x86_64, NEON on aarch64).
+fn simdFindNewline(data: []const u8, start: usize) ?usize {
+    const VEC_LEN = 16;
+    const Vec = @Vector(VEC_LEN, u8);
+    const nl_vec: Vec = @splat('\n');
+
+    var pos = start;
+
+    // Vector scan: compare VEC_LEN bytes per iteration.
+    while (pos + VEC_LEN <= data.len) {
+        const chunk: Vec = data[pos..][0..VEC_LEN].*;
+        const mask: u16 = @bitCast(chunk == nl_vec);
+        if (mask != 0) return pos + @ctz(mask);
+        pos += VEC_LEN;
+    }
+
+    // Scalar tail for remaining bytes.
+    while (pos < data.len) : (pos += 1) {
+        if (data[pos] == '\n') return pos;
+    }
+    return null;
+}
+
+/// POST /db/:col/bulk — NDJSON batch insert with SIMD line scanning.
 fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
     _ = alloc;
     const start_ns = std.time.nanoTimestamp();
@@ -503,23 +525,26 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
     srv.db.ensureTenantStorageAvailable(tenant_id, body.len) catch return err(429, "tenant storage quota exceeded");
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
 
-    // Parse all NDJSON lines into key/value slices, then batch-insert.
+    var inserted: u32 = 0;
+    var errors: u32 = 0;
+    var total_bytes: u64 = 0;
+
+    // Parse NDJSON into batch arrays, flush via insertBatch per chunk.
+    // Matches insertBatch's internal MaxBatch — one flush per HTTP batch.
     const MaxLines = 4096;
     var key_buf: [MaxLines][]const u8 = undefined;
     var val_buf: [MaxLines][]const u8 = undefined;
     var n_lines: usize = 0;
 
-    var inserted: u32 = 0;
-    var errors: u32 = 0;
-    var total_bytes: u64 = 0;
-
     var pos: usize = 0;
     while (pos < body.len) {
-        const line_end = std.mem.indexOfScalarPos(u8, body, pos, '\n') orelse body.len;
+        // SIMD-accelerated newline scan (16-byte vector comparison)
+        const line_end = simdFindNewline(body, pos) orelse body.len;
         const line = std.mem.trim(u8, body[pos..line_end], " \t\r");
         pos = line_end + 1;
 
         if (line.len < 2) continue;
+
         const key = jsonStr(line, "key") orelse continue;
         const value = jsonValue(line, "value") orelse line;
 
@@ -529,7 +554,6 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
         n_lines += 1;
 
         if (n_lines >= MaxLines) {
-            // Flush batch.
             const r = col.insertBatch(key_buf[0..n_lines], val_buf[0..n_lines]);
             inserted += r.inserted;
             errors += r.errors;
