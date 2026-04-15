@@ -19,7 +19,7 @@ const Database = collection.Database;
 const MAX_REQ  = 65536;  // 64 KiB (initial read)
 const MAX_RESP = 65536; // 64 KiB
 const MAX_BODY = 65536;  // 64 KiB
-const MAX_BULK = 16 * 1024 * 1024; // 16 MiB for bulk inserts
+const MAX_BULK = 256 * 1024 * 1024; // 256 MiB for bulk inserts
 
 // Heap-allocated per-connection buffers (threadlocal pointers set in handleConn).
 // This avoids large threadlocal TLS segments that break in Release mode on macOS.
@@ -517,20 +517,14 @@ fn simdFindNewline(data: []const u8, start: usize) ?usize {
     return null;
 }
 
-/// POST /db/:col/bulk — NDJSON batch insert with SIMD line scanning.
-fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
-    _ = alloc;
-    const start_ns = std.time.nanoTimestamp();
-    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
-    srv.db.ensureTenantStorageAvailable(tenant_id, body.len) catch return err(429, "tenant storage quota exceeded");
-    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+/// Shared NDJSON parse + insertBatch logic used by both HTTP and WS paths.
+const NdjsonResult = struct { inserted: u32, errors: u32, total_bytes: u64 };
 
+fn parseAndInsertNdjson(col: *collection.Collection, body: []const u8) NdjsonResult {
     var inserted: u32 = 0;
     var errors: u32 = 0;
     var total_bytes: u64 = 0;
 
-    // Parse NDJSON into batch arrays, flush via insertBatch per chunk.
-    // Matches insertBatch's internal MaxBatch — one flush per HTTP batch.
     const MaxLines = 4096;
     var key_buf: [MaxLines][]const u8 = undefined;
     var val_buf: [MaxLines][]const u8 = undefined;
@@ -538,7 +532,6 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
 
     var pos: usize = 0;
     while (pos < body.len) {
-        // SIMD-accelerated newline scan (16-byte vector comparison)
         const line_end = simdFindNewline(body, pos) orelse body.len;
         const line = std.mem.trim(u8, body[pos..line_end], " \t\r");
         pos = line_end + 1;
@@ -560,14 +553,25 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
             n_lines = 0;
         }
     }
-    // Flush remaining.
     if (n_lines > 0) {
         const r = col.insertBatch(key_buf[0..n_lines], val_buf[0..n_lines]);
         inserted += r.inserted;
         errors += r.errors;
     }
+    return .{ .inserted = inserted, .errors = errors, .total_bytes = total_bytes };
+}
 
-    srv.recordQueryCost(tenant_id, "bulk_insert", inserted, total_bytes, start_ns);
+/// POST /db/:col/bulk — NDJSON batch insert with SIMD line scanning.
+fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
+    _ = alloc;
+    const start_ns = std.time.nanoTimestamp();
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    srv.db.ensureTenantStorageAvailable(tenant_id, body.len) catch return err(429, "tenant storage quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+
+    const r = parseAndInsertNdjson(col, body);
+
+    srv.recordQueryCost(tenant_id, "bulk_insert", r.inserted, r.total_bytes, start_ns);
 
     var esc_col_buf: [1024]u8 = undefined;
     var esc_tid_buf: [1024]u8 = undefined;
@@ -576,7 +580,7 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
     var fbs = std.io.fixedBufferStream(getBodyBuf());
     std.fmt.format(fbs.writer(),
         "{{\"inserted\":{d},\"errors\":{d},\"collection\":\"{s}\",\"tenant\":\"{s}\"}}",
-        .{ inserted, errors, esc_col, esc_tid }) catch {};
+        .{ r.inserted, r.errors, esc_col, esc_tid }) catch {};
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, as_of: ?i64) usize {
@@ -1456,17 +1460,157 @@ fn handleWebSocket(srv: *Server, conn: std.net.Server.Connection, initial: []con
 
         _ = fin; // TODO: handle fragmented messages
 
-        if (opcode == 0x1) { // text frame — dispatch as request
+        if (opcode == 0x1) { // text frame
             _ = srv.req_count.fetchAdd(1, .monotonic);
 
-            // Build a synthetic HTTP request from the WS message.
-            // Expected format: {"op":"insert","col":"name","key":"k","value":{...}}
-            // Or direct HTTP path: "POST /db/mycol\n{...body...}"
+            // STREAM mode: fire-and-forget bulk insert (no per-frame response).
+            if (payload.len >= 7 and std.mem.startsWith(u8, payload, "STREAM ")) {
+                handleWsStream(srv, conn, payload, frame_buf) catch return;
+                return; // stream handler owns the connection
+            }
+
+            // Normal WS dispatch (request-response).
             const resp_body = wsDispatch(srv, payload);
             wsWriteText(conn, resp_body) catch return;
         }
     }
 }
+
+/// Extract a `name=value` parameter from a space-separated string.
+fn extractParam(msg: []const u8, name: []const u8) ?[]const u8 {
+    const pos = std.mem.indexOf(u8, msg, name) orelse return null;
+    const start = pos + name.len;
+    const end = std.mem.indexOfScalarPos(u8, msg, start, ' ') orelse msg.len;
+    if (start >= end) return null;
+    return msg[start..end];
+}
+
+/// WebSocket streaming bulk insert — fire-and-forget NDJSON frames.
+/// Init frame: "STREAM /db/:col/bulk [tenant=X]"
+/// Data frames: NDJSON text (no per-frame response sent).
+/// Close frame: triggers final summary response.
+fn handleWsStream(srv: *Server, conn: std.net.Server.Connection, init_msg: []const u8, frame_buf: []u8) !void {
+    // Parse collection and tenant from init message.
+    const after_prefix = init_msg[7..]; // skip "STREAM "
+    const path_end = std.mem.indexOfScalar(u8, after_prefix, ' ') orelse after_prefix.len;
+    const path = after_prefix[0..path_end];
+    const params = if (path_end < after_prefix.len) after_prefix[path_end + 1 ..] else "";
+
+    // Extract collection name from /db/:col/bulk (or /db/:col).
+    if (!std.mem.startsWith(u8, path, "/db/")) {
+        wsWriteText(conn, "{\"error\":\"invalid stream path\"}") catch {};
+        wsWriteClose(conn, 1008);
+        return;
+    }
+    const after_db = path[4..];
+    const col_end = std.mem.indexOfScalar(u8, after_db, '/') orelse after_db.len;
+    const col_name = after_db[0..col_end];
+    if (col_name.len == 0) {
+        wsWriteText(conn, "{\"error\":\"missing collection name\"}") catch {};
+        wsWriteClose(conn, 1008);
+        return;
+    }
+
+    const tenant_id = extractParam(params, "tenant=") orelse collection.DEFAULT_TENANT;
+
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch {
+        wsWriteText(conn, "{\"error\":\"open collection failed\"}") catch {};
+        wsWriteClose(conn, 1011);
+        return;
+    };
+
+    // ACK — client waits for this before streaming.
+    wsWriteText(conn, "{\"status\":\"streaming\"}") catch return error.WriteFailed;
+
+    var total_inserted: u64 = 0;
+    var total_errors: u64 = 0;
+    var total_bytes: u64 = 0;
+    var frame_count: u64 = 0;
+    const start_ns = std.time.nanoTimestamp();
+
+    // Ensure billing is recorded even on connection drop.
+    defer srv.recordQueryCost(tenant_id, "ws_stream", @intCast(total_inserted), @intCast(total_bytes), start_ns);
+
+    // Frame loop — same structure as handleWebSocket but no per-frame response.
+    while (true) {
+        var hdr: [14]u8 = undefined;
+        wsReadExact(conn, hdr[0..2]) catch break;
+        const opcode = hdr[0] & 0x0F;
+        const masked = hdr[1] & 0x80 != 0;
+        var payload_len: u64 = hdr[1] & 0x7F;
+
+        if (opcode == 0x8) break; // close — end of stream
+        if (opcode == 0x9) { // ping → pong
+            var ping_len: u64 = payload_len;
+            if (ping_len == 126) {
+                wsReadExact(conn, hdr[2..4]) catch break;
+                ping_len = std.mem.readInt(u16, hdr[2..4], .big);
+            } else if (ping_len == 127) {
+                wsReadExact(conn, hdr[2..10]) catch break;
+                ping_len = std.mem.readInt(u64, hdr[2..10], .big);
+            }
+            var ping_mask: [4]u8 = .{ 0, 0, 0, 0 };
+            if (masked) wsReadExact(conn, &ping_mask) catch break;
+            const pl: usize = @intCast(ping_len);
+            if (pl > 0 and pl <= frame_buf.len) {
+                wsReadExact(conn, frame_buf[0..pl]) catch break;
+                if (masked) {
+                    for (frame_buf[0..pl], 0..) |*b, j| b.* ^= ping_mask[j % 4];
+                }
+            }
+            var pong_hdr: [2]u8 = .{ 0x8A, @intCast(ping_len & 0x7F) };
+            conn.stream.writeAll(&pong_hdr) catch break;
+            if (pl > 0 and pl <= frame_buf.len) {
+                conn.stream.writeAll(frame_buf[0..pl]) catch break;
+            }
+            continue;
+        }
+
+        // Extended payload length.
+        if (payload_len == 126) {
+            wsReadExact(conn, hdr[2..4]) catch break;
+            payload_len = std.mem.readInt(u16, hdr[2..4], .big);
+        } else if (payload_len == 127) {
+            wsReadExact(conn, hdr[2..10]) catch break;
+            payload_len = std.mem.readInt(u64, hdr[2..10], .big);
+        }
+
+        if (payload_len > MAX_BULK) {
+            wsWriteClose(conn, 1009);
+            break;
+        }
+
+        var mask: [4]u8 = .{ 0, 0, 0, 0 };
+        if (masked) wsReadExact(conn, &mask) catch break;
+
+        const plen: usize = @intCast(payload_len);
+        const payload = frame_buf[0..plen];
+        wsReadExact(conn, payload) catch break;
+
+        if (masked) {
+            for (payload, 0..) |*b, j| b.* ^= mask[j % 4];
+        }
+
+        // Process NDJSON frame (text or binary).
+        if (opcode == 0x1 or opcode == 0x2) {
+            srv.db.recordTenantOperation(tenant_id) catch break;
+            const r = parseAndInsertNdjson(col, payload);
+            total_inserted += r.inserted;
+            total_errors += r.errors;
+            total_bytes += r.total_bytes;
+            frame_count += 1;
+        }
+    }
+
+    // Send final summary before closing.
+    var summary_buf: [256]u8 = undefined;
+    const summary = std.fmt.bufPrint(&summary_buf,
+        "{{\"inserted\":{d},\"errors\":{d},\"frames\":{d}}}",
+        .{ total_inserted, total_errors, frame_count }) catch "{\"error\":\"format\"}";
+    wsWriteText(conn, summary) catch {};
+    wsWriteClose(conn, 1000);
+}
+
 
 /// Dispatch a WebSocket text message. Supports two formats:
 ///   1. Raw HTTP: "METHOD /path\n{body}" — reuses dispatch()
