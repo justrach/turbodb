@@ -579,29 +579,45 @@ pub const Collection = struct {
         values: []const []const u8,
         key_offset: usize,
     ) void {
-        // Pre-grow HashMaps to avoid rehash under lock.
-        const needed = entries.len + self.hash_idx.count();
-        self.hash_idx.ensureTotalCapacity(@intCast(needed)) catch {};
-        self.key_doc_ids.ensureTotalCapacity(@intCast(needed)) catch {};
-        self.key_epochs.ensureTotalCapacity(@intCast(needed)) catch {};
-
-        self.shared_mu.lock();
-        var last_epoch: u64 = 0;
-        for (entries, 0..) |entry, j| {
-            self.idx.insert(entry) catch continue;
-            self.hash_idx.put(entry.key_hash, entry) catch {};
-            const epoch = self.epochs.advance();
-            self.versions.appendVersion(self.alloc, doc_ids[j], entry.page_no, entry.page_off, epoch) catch {};
-            last_epoch = epoch;
-            self.key_doc_ids.put(hashes[j], doc_ids[j]) catch {};
-            self.key_epochs.put(hashes[j], doc_ids[j]) catch {};
-            _ = self.gc_counter.fetchAdd(1, .monotonic);
+        // Pre-grow HashMaps under lock to avoid data race on internal arrays.
+        // (Previously this was outside the lock — concurrent resizes corrupted the map.)
+        {
+            self.shared_mu.lock();
+            const needed = entries.len + self.hash_idx.count();
+            self.hash_idx.ensureTotalCapacity(@intCast(needed)) catch {};
+            self.key_doc_ids.ensureTotalCapacity(@intCast(needed)) catch {};
+            self.key_epochs.ensureTotalCapacity(@intCast(needed)) catch {};
+            self.shared_mu.unlock();
         }
-        if (last_epoch > 0) self.versions.current_epoch.store(last_epoch, .release);
-        const gc_val = self.gc_counter.load(.monotonic);
-        self.shared_mu.unlock();
+
+        // PostgreSQL pattern: small critical sections with frequent yields.
+        // Instead of holding shared_mu for the entire batch (4096 docs × 7 ops),
+        // chunk into sub-batches of 64 so parallel writers can interleave.
+        const ChunkSize = 64;
+        var last_epoch: u64 = 0;
+        var chunk_start: usize = 0;
+        while (chunk_start < entries.len) {
+            const chunk_end = @min(chunk_start + ChunkSize, entries.len);
+
+            self.shared_mu.lock();
+            for (chunk_start..chunk_end) |j| {
+                const entry = entries[j];
+                self.idx.insert(entry) catch continue;
+                self.hash_idx.put(entry.key_hash, entry) catch {};
+                const epoch = self.epochs.advance();
+                self.versions.appendVersion(self.alloc, doc_ids[j], entry.page_no, entry.page_off, epoch) catch {};
+                last_epoch = epoch;
+                self.key_doc_ids.put(hashes[j], doc_ids[j]) catch {};
+                self.key_epochs.put(hashes[j], doc_ids[j]) catch {};
+            }
+            if (last_epoch > 0) self.versions.current_epoch.store(last_epoch, .release);
+            self.shared_mu.unlock();
+
+            chunk_start = chunk_end;
+        }
 
         // GC if needed (outside lock).
+        const gc_val = self.gc_counter.fetchAdd(@intCast(entries.len), .monotonic);
         if (gc_val >= GC_INTERVAL and gc_val % GC_INTERVAL < entries.len) {
             self.shared_mu.lock();
             _ = self.versions.gc(self.alloc);
@@ -619,8 +635,6 @@ pub const Collection = struct {
             const owned_val = self.alloc.dupe(u8, value) catch { self.alloc.free(owned_key); continue; };
             const q = if (self.queue_toggle.fetchAdd(1, .monotonic) % 2 == 0) &self.index_queue else &self.index_queue2;
             if (!q.push(owned_key, owned_val)) {
-                // Queue full — just skip async indexing for this doc.
-                // The data is still in the page store and searchable via scan.
                 self.alloc.free(owned_key);
                 self.alloc.free(owned_val);
             }
