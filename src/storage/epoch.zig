@@ -68,6 +68,14 @@ pub const EpochManager = struct {
         self.timeline_mu.lock();
         defer self.timeline_mu.unlock();
         self.timeline.append(self.allocator, .{ .epoch = epoch, .ts_ms = ts_ms }) catch {};
+        // Prune old timeline entries to prevent unbounded memory growth.
+        // Keep at most 100K entries (~1.6 MiB); drop the oldest half when full.
+        const TIMELINE_CAP = 100_000;
+        if (self.timeline.items.len > TIMELINE_CAP) {
+            const drop = self.timeline.items.len / 2;
+            std.mem.copyForwards(EpochPoint, self.timeline.items[0..self.timeline.items.len - drop], self.timeline.items[drop..]);
+            self.timeline.items.len -= drop;
+        }
         return epoch;
     }
 
@@ -96,7 +104,8 @@ pub const EpochManager = struct {
 
     /// Pin the current epoch.  Returns (reader_slot, snapshot_ts).
     /// The caller must call unpin(slot) when done.
-    pub fn pin(self: *EpochManager) struct { slot: usize, ts: u64 } {
+    /// Returns error.ReadersExhausted when all slots are occupied.
+    pub fn pin(self: *EpochManager) error{ReadersExhausted}!struct { slot: usize, ts: u64 } {
         const ts = self.global_ts.load(.acquire);
         // Find a free slot
         for (self.slots, 0..) |*s, i| {
@@ -106,8 +115,8 @@ pub const EpochManager = struct {
                     return .{ .slot = i, .ts = ts };
             }
         }
-        // Fallback: return slot 0 (reader count exceeded MAX_READERS — very rare)
-        return .{ .slot = 0, .ts = ts };
+        // All slots occupied — cannot safely pin
+        return error.ReadersExhausted;
     }
 
     pub fn unpin(self: *EpochManager, slot: usize) void {

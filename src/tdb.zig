@@ -101,7 +101,7 @@ pub fn main() !void {
             std.debug.print("Usage: tdb word <identifier>\n", .{});
             return;
         }
-        try cmdWord(db, col_name, cmd_args[0]);
+        try cmdWord(db, col_name, cmd_args[0], alloc);
     } else if (std.mem.eql(u8, command, "insert")) {
         if (cmd_argc < 2) {
             std.debug.print("Usage: tdb insert <key> <value>\n", .{});
@@ -214,9 +214,10 @@ fn cmdSearch(db: *Database, col_name: []const u8, query: []const u8, alloc: std.
     }
 }
 
-fn cmdWord(db: *Database, col_name: []const u8, word: []const u8) !void {
+fn cmdWord(db: *Database, col_name: []const u8, word: []const u8, alloc: std.mem.Allocator) !void {
     const col = try db.collection(col_name);
-    const hits = col.searchWord(word);
+    const hits = try col.searchWord(word, alloc);
+    defer if (hits.len > 0) alloc.free(hits);
     if (hits.len == 0) {
         std.debug.print("  No hits for \"{s}\"\n", .{word});
         return;

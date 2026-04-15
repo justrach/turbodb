@@ -205,7 +205,7 @@ pub fn extractField(json: []const u8, field: []const u8) ?[]const u8 {
 /// Handles strings, numbers, booleans, null, objects, and arrays.
 fn extractRawValue(json: []const u8, key: []const u8) ?[]const u8 {
     // Build needle: "key"
-    var needle_buf: [256]u8 = undefined;
+    var needle_buf: [1024]u8 = undefined;
     const needle = std.fmt.bufPrint(&needle_buf, "\"{s}\"", .{key}) catch return null;
 
     var pos: usize = 0;

@@ -226,8 +226,33 @@ pub const TurboQuant = struct {
             rotated[j] = self.codebook[idx];
         }
 
-        // Step 2: Inverse rotate — x̃ = Π^T · ỹ
-        matvecMulTranspose(self.rotation, rotated, out, d);
+        // Step 2: Inverse rotate — x~ = inverse(rotation) * y~
+        if (self.use_fwht) {
+            // Inverse SRHT: apply 3 rounds in reverse order (FWHT then sign-flip)
+            const pd: usize = @intCast(self.padded_dims);
+            var pad_buf: [1024]f32 = undefined;
+            const buf = if (pd <= 1024) pad_buf[0..pd] else blk: {
+                break :blk self.allocator.alloc(f32, pd) catch return;
+            };
+            defer if (pd > 1024) self.allocator.free(buf);
+
+            @memcpy(buf[0..d], rotated);
+            @memset(buf[d..pd], 0);
+
+            // Reverse order: round 2, 1, 0
+            var round: usize = 3;
+            while (round > 0) {
+                round -= 1;
+                fwht(buf, pd);
+                const signs = self.sign_flips[round * pd ..][0..pd];
+                for (0..pd) |i| {
+                    buf[i] *= @as(f32, @floatFromInt(signs[i]));
+                }
+            }
+            @memcpy(out[0..d], buf[0..d]);
+        } else {
+            matvecMulTranspose(self.rotation, rotated, out, d);
+        }
     }
 
     /// Asymmetric L2 distance: FP32 query vs quantized database vector.

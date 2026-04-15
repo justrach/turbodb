@@ -106,9 +106,16 @@ pub fn jsonError(buf: []u8, code: ErrorCode) []const u8 {
 pub fn jsonErrorDetail(buf: []u8, code: ErrorCode, detail: []const u8) []const u8 {
     var fbs = std.io.fixedBufferStream(buf);
     const w = fbs.writer();
-    w.print("{{\"error\":{{\"code\":{d},\"message\":\"{s}\",\"detail\":\"{s}\"}}}}", .{
-        @intFromEnum(code), code.message(), detail,
+    w.print("{{\"error\":{{\"code\":{d},\"message\":\"{s}\",\"detail\":\"", .{
+        @intFromEnum(code), code.message(),
     }) catch return "{}";
+    // Escape detail to prevent JSON injection
+    for (detail) |ch| {
+        if (ch == '"' or ch == '\\') w.writeByte('\\') catch {};
+        if (ch == '\n') { w.writeAll("\\n") catch {}; continue; }
+        w.writeByte(ch) catch {};
+    }
+    w.writeAll("\"}}}}") catch return "{}";
     return buf[0..fbs.pos];
 }
 

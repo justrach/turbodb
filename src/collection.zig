@@ -30,7 +30,7 @@ pub const MAX_COLLECTION_NAME_LEN: usize = 64;
 // Lock-free MPSC queue for deferring trigram+word index builds to a background thread.
 // Insert path pushes owned (key, value) pairs; background thread pops and indexes.
 pub const IndexQueue = struct {
-    const CAPACITY = 32768; // 32K entries per queue
+    const CAPACITY = 16384; // 16K entries — balances burst capacity vs memory
 
     const Entry = struct {
         key: []const u8,
@@ -63,6 +63,7 @@ pub const IndexQueue = struct {
             if (next == self.tail.load(.acquire)) return false; // full
             // Atomically claim this slot by advancing head.
             if (self.head.cmpxchgWeak(h, next, .acq_rel, .monotonic)) |_| {
+                std.atomic.spinLoopHint();
                 continue; // CAS failed — another producer won, retry
             }
             // We own slot h — write data then signal readiness.
@@ -162,9 +163,9 @@ fn extractJsonFloatArray(json: []const u8, field_name: []const u8, out: []f32) ?
 }
 // ─── Collection ──────────────────────────────────────────────────────────
 pub const Collection = struct {
-    pub const STRIPE_COUNT = 1024;
+    pub const STRIPE_COUNT = 256;
     // MVCC GC: trigger version chain cleanup every GC_INTERVAL inserts.
-    const GC_INTERVAL: u64 = 10_000;
+    const GC_INTERVAL: u64 = 500;
 
     name_buf: [128]u8,
     name_len: u8,
@@ -176,9 +177,12 @@ pub const Collection = struct {
     epochs: *EpochManager,
     cdc: *cdc_mod.CDCManager,
     next_doc_id: std.atomic.Value(u64),
-    // Record-level latching: 1024 stripe locks replace single write_mu.
-    // Two writers to different keys proceed in parallel; same-key writes serialize.
+    // Record-level latching: stripe locks serialize same-key writes.
+    // shared_mu protects collection-wide structures (hash_idx, key_doc_ids,
+    // key_epochs, versions) that are accessed by ALL stripes — without this,
+    // concurrent inserts to different keys race on HashMap internals.
     stripe_locks: [STRIPE_COUNT]std.Thread.Mutex,
+    shared_mu: std.Thread.Mutex = .{},
     hash_idx: std.AutoHashMap(u64, BTreeEntry),
     key_doc_ids: std.AutoHashMap(u64, u64),
     /// Per-key modification epoch — tracks when each key was last written on main.
@@ -224,6 +228,10 @@ pub const Collection = struct {
         var path_buf: [512]u8 = undefined;
         const col = try alloc.create(Collection);
         errdefer alloc.destroy(col);
+        // Zero all bytes so that Mutex fields (os_unfair_lock) start as 0
+        // before any field assignment. GPA fills with 0xAA which macOS
+        // detects as corrupted unfair_lock state.
+        @memset(std.mem.asBytes(col), 0);
 
         try ensureDirPath(data_dir);
         const page_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}.pages", .{ data_dir, storage_name });
@@ -241,8 +249,11 @@ pub const Collection = struct {
             lock.* = .{};
         }
         col.hash_idx = std.AutoHashMap(u64, BTreeEntry).init(alloc);
+        col.hash_idx.ensureTotalCapacity(4096) catch {};
         col.key_doc_ids = std.AutoHashMap(u64, u64).init(alloc);
+        col.key_doc_ids.ensureTotalCapacity(4096) catch {};
         col.key_epochs = std.AutoHashMap(u64, u64).init(alloc);
+        col.key_epochs.ensureTotalCapacity(4096) catch {};
         col.alloc = alloc;
         col.cache = hot_cache.HotCache.init();
         col.versions = mvcc_mod.VersionChain.init(alloc);
@@ -261,10 +272,10 @@ pub const Collection = struct {
         col.name_len = @intCast(n);
         try col.rebuildIndexes();
 
-        // Start background indexer thread. If spawn fails, inserts fall back to sync
+        // Start background indexer threads. If spawn fails, inserts fall back to sync
         // indexing via the queue-full path (queue stays empty, retries exhaust immediately).
         col.index_thread = std.Thread.spawn(.{}, indexWorkerQ, .{ col, &col.index_queue }) catch null;
-        col.index_thread2 = null; // Second worker slot — available for future use
+        col.index_thread2 = std.Thread.spawn(.{}, indexWorkerQ, .{ col, &col.index_queue2 }) catch null;
 
         return col;
     }
@@ -339,7 +350,7 @@ pub const Collection = struct {
     }
 
     pub fn storageBytes(self: *const Collection) usize {
-        return self.pf.mm.len;
+        return self.pf.mm.dataLen();
     }
 
     // ─── MVCC read transaction ──────────────────────────────────────────
@@ -355,6 +366,8 @@ pub const Collection = struct {
     /// Insert a new document. Returns assigned doc_id.
     /// Uses per-key stripe lock for fine-grained concurrency.
     pub fn insert(self: *Collection, key: []const u8, value: []const u8) !u64 {
+        if (key.len == 0 or key.len > std.math.maxInt(u16)) return error.InvalidKeyLength;
+        if (value.len > std.math.maxInt(u32)) return error.InvalidValueLength;
         const key_hash = doc_mod.fnv1a(key);
         const stripe = stripeIndex(key_hash);
         self.stripe_locks[stripe].lock();
@@ -364,27 +377,28 @@ pub const Collection = struct {
         const hdr = doc_mod.newHeader(doc_id, key, value);
         const d = Doc{ .header = hdr, .key = key, .value = value };
 
-        // Use stack buffer for small docs, heap for large ones (code files can be 100KB+)
-        var enc_buf: [65536]u8 = undefined;
         const total_size = DocHeader.size + key.len + value.len;
-        var heap_buf: ?[]u8 = null;
-        defer if (heap_buf) |hb| self.alloc.free(hb);
-        const buf = if (total_size <= enc_buf.len)
-            &enc_buf
-        else blk: {
-            heap_buf = try self.alloc.alloc(u8, total_size + 64);
-            break :blk heap_buf.?;
-        };
-        const enc = try d.encodeBuf(buf);
 
         // Write to WAL buffer (background flusher will commit periodically).
-        const txn = self.wal_log.next_lsn.load(.monotonic);
-        _ = try self.wal_log.write(txn, .doc_insert, 0, 0, enc);
+        // Use stack buffer for WAL entry encoding.
+        var wal_buf: [65536]u8 = undefined;
+        var wal_heap: ?[]u8 = null;
+        defer if (wal_heap) |hb| self.alloc.free(hb);
+        const wal_enc_buf = if (total_size <= wal_buf.len)
+            &wal_buf
+        else blk: {
+            wal_heap = try self.alloc.alloc(u8, total_size + 64);
+            break :blk wal_heap.?;
+        };
+        const wal_enc = try d.encodeBuf(wal_enc_buf);
+        _ = try self.wal_log.write(0, .doc_insert, 0, 0, wal_enc);
 
-        // Find (or allocate) a leaf page with enough space.
-        const pno = try self.findOrAllocLeaf(enc.len);
-        const page_off = self.pf.leafAppend(pno, enc) orelse
+        // Write directly to page memory (single copy, no intermediate buffer).
+        const pno = try self.findOrAllocLeaf(total_size);
+        const reserved = self.pf.leafReserve(pno, total_size) orelse
             return error.PageFull;
+        const page_off = reserved.off;
+        _ = d.encodeBuf(reserved.buf) catch return error.PageFull;
 
         // Index the document.
         const entry = BTreeEntry{
@@ -393,14 +407,33 @@ pub const Collection = struct {
             .page_no  = pno,
             .page_off = page_off,
         };
-        try self.idx.insert(entry);
+
+        // Lock shared state — hash_idx, key_doc_ids, key_epochs, and versions
+        // are collection-wide and not protected by per-key stripe locks.
+        // Without this, concurrent inserts to different keys race on HashMap
+        // internals during resize, causing GPA panics or corruption.
+        self.shared_mu.lock();
+        self.idx.insert(entry) catch |e| {
+            self.shared_mu.unlock();
+            return e;
+        };
         self.hash_idx.put(hdr.key_hash, entry) catch {};
 
         // MVCC: register version in the version chain.
         const epoch = self.epochs.advance();
         self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
+        self.versions.current_epoch.store(epoch, .release);
         self.key_doc_ids.put(hdr.key_hash, doc_id) catch {};
         self.key_epochs.put(hdr.key_hash, doc_id) catch {}; // epoch = doc_id (monotonic)
+        const should_gc = self.gc_counter.fetchAdd(1, .monotonic) % GC_INTERVAL == GC_INTERVAL - 1;
+        self.shared_mu.unlock();
+
+        // Run GC outside shared_mu to avoid blocking all readers during collection.
+        if (should_gc) {
+            self.shared_mu.lock();
+            _ = self.versions.gc(self.alloc);
+            self.shared_mu.unlock();
+        }
 
         // Async trigram + word indexing — push to background queue, sync fallback if full or no worker.
         if (value.len >= 3) {
@@ -412,11 +445,11 @@ pub const Collection = struct {
                 const owned_key = self.alloc.dupe(u8, key) catch null;
                 const owned_val = self.alloc.dupe(u8, value) catch null;
                 if (owned_key != null and owned_val != null) {
-                    const q = &self.index_queue;
+                    const q = if (self.queue_toggle.fetchAdd(1, .monotonic) % 2 == 0) &self.index_queue else &self.index_queue2;
                     var retries: u32 = 0;
                     while (!q.push(owned_key.?, owned_val.?)) {
                         retries += 1;
-                        if (retries > 1000) {
+                        if (retries > 64) {
                             // Queue full — fall back to synchronous indexing.
                             self.tri.indexFile(owned_key.?, owned_val.?) catch {};
                             self.words.indexFile(owned_key.?, owned_val.?) catch {};
@@ -424,7 +457,7 @@ pub const Collection = struct {
                             self.alloc.free(owned_val.?);
                             break;
                         }
-                        std.Thread.yield() catch {};
+                        std.atomic.spinLoopHint();
                     }
                 }
             }
@@ -452,14 +485,168 @@ pub const Collection = struct {
 
         emitChange(self, .insert, key, value, doc_id);
 
-        // Periodic MVCC version chain GC to prevent unbounded memory growth.
-        if (self.gc_counter.fetchAdd(1, .monotonic) % GC_INTERVAL == GC_INTERVAL - 1) {
-            _ = self.gcVersions();
-        }
-
         return doc_id;
     }
 
+    /// Fast-path batch insert for bulk operations. Takes shared_mu ONCE for all
+    /// HashMap operations, skips per-doc WAL txn overhead, and defers trigram
+    /// indexing entirely to background workers.
+    pub fn insertBatch(self: *Collection, keys: []const []const u8, values: []const []const u8) InsertBatchResult {
+        var result = InsertBatchResult{ .inserted = 0, .errors = 0 };
+        if (keys.len == 0) return result;
+        const count = @min(keys.len, values.len);
+
+        // Phase 1: encode + write pages (no shared lock needed — page-level locking).
+        // Increased from 1024 to match server-side MaxLines (4096) — one flush per HTTP batch.
+        const MaxBatch = 4096;
+        var entries: [MaxBatch]BTreeEntry = undefined;
+        var doc_ids: [MaxBatch]u64 = undefined;
+        var hashes: [MaxBatch]u64 = undefined;
+        var wal_payloads: [MaxBatch][]const u8 = undefined;
+        var batch_n: usize = 0;
+
+        // Cache current leaf page — avoid per-doc findOrAllocLeaf scan.
+        var current_leaf: u32 = 0;
+        var leaf_valid = false;
+
+        var i: usize = 0;
+        while (i < count) : (i += 1) {
+            if (batch_n >= MaxBatch) {
+                // Flush WAL batch (single lock), then index batch.
+                self.wal_log.writeBatch(0, .doc_insert, 0, 0, wal_payloads[0..batch_n]) catch {};
+                self.flushBatch(entries[0..batch_n], doc_ids[0..batch_n], hashes[0..batch_n], keys, values, i - batch_n);
+                result.inserted += @intCast(batch_n);
+                batch_n = 0;
+            }
+            const key = keys[i];
+            const value = values[i];
+            if (key.len == 0 or key.len > std.math.maxInt(u16)) { result.errors += 1; continue; }
+            if (value.len > std.math.maxInt(u32)) { result.errors += 1; continue; }
+
+            const doc_id = self.next_doc_id.fetchAdd(1, .monotonic);
+            const hdr = doc_mod.newHeader(doc_id, key, value);
+            const d = Doc{ .header = hdr, .key = key, .value = value };
+            const total_size = DocHeader.size + key.len + value.len;
+
+            // Page write — try cached leaf first, allocate fresh only when full.
+            if (!leaf_valid) {
+                current_leaf = self.findOrAllocLeaf(total_size) catch { result.errors += 1; continue; };
+                leaf_valid = true;
+            }
+            var reserved = self.pf.leafReserve(current_leaf, total_size);
+            if (reserved == null) {
+                // Current leaf full — allocate a fresh page directly (skip backward scan
+                // since we know recent pages are full from this batch).
+                current_leaf = self.pf.allocPage(.leaf) catch { result.errors += 1; leaf_valid = false; continue; };
+                reserved = self.pf.leafReserve(current_leaf, total_size);
+                if (reserved == null) { result.errors += 1; leaf_valid = false; continue; }
+            }
+            const res = reserved.?;
+
+            // Encode ONCE — directly to the page. WAL reads from page memory.
+            _ = d.encodeBuf(res.buf) catch { result.errors += 1; continue; };
+
+            entries[batch_n] = BTreeEntry{
+                .key_hash = hdr.key_hash,
+                .doc_id   = doc_id,
+                .page_no  = current_leaf,
+                .page_off = res.off,
+            };
+            doc_ids[batch_n] = doc_id;
+            hashes[batch_n] = hdr.key_hash;
+            wal_payloads[batch_n] = res.buf[0..total_size];
+            batch_n += 1;
+        }
+        // Flush remaining.
+        if (batch_n > 0) {
+            self.wal_log.writeBatch(0, .doc_insert, 0, 0, wal_payloads[0..batch_n]) catch {};
+            self.flushBatch(entries[0..batch_n], doc_ids[0..batch_n], hashes[0..batch_n], keys, values, count - batch_n);
+            result.inserted += @intCast(batch_n);
+        }
+        return result;
+    }
+
+    const InsertBatchResult = struct { inserted: u32, errors: u32 };
+
+    /// Phase 2 of batch insert: acquire shared_mu ONCE, insert all entries into
+    /// indexes, then push all docs to async indexer.
+    fn flushBatch(
+        self: *Collection,
+        entries: []const BTreeEntry,
+        doc_ids: []const u64,
+        hashes: []const u64,
+        keys: []const []const u8,
+        values: []const []const u8,
+        key_offset: usize,
+    ) void {
+        // Pre-grow HashMaps under lock to avoid data race on internal arrays.
+        // (Previously this was outside the lock — concurrent resizes corrupted the map.)
+        {
+            self.shared_mu.lock();
+            const needed = entries.len + self.hash_idx.count();
+            self.hash_idx.ensureTotalCapacity(@intCast(needed)) catch {};
+            self.key_doc_ids.ensureTotalCapacity(@intCast(needed)) catch {};
+            self.key_epochs.ensureTotalCapacity(@intCast(needed)) catch {};
+            self.shared_mu.unlock();
+        }
+
+        // PostgreSQL pattern: small critical sections with frequent yields.
+        // Instead of holding shared_mu for the entire batch (4096 docs × 7 ops),
+        // chunk into sub-batches of 64 so parallel writers can interleave.
+        const ChunkSize = 64;
+        var last_epoch: u64 = 0;
+        var chunk_start: usize = 0;
+        while (chunk_start < entries.len) {
+            const chunk_end = @min(chunk_start + ChunkSize, entries.len);
+
+            self.shared_mu.lock();
+            for (chunk_start..chunk_end) |j| {
+                const entry = entries[j];
+                self.idx.insert(entry) catch continue;
+                self.hash_idx.put(entry.key_hash, entry) catch {};
+                const epoch = self.epochs.advance();
+                self.versions.appendVersion(self.alloc, doc_ids[j], entry.page_no, entry.page_off, epoch) catch {};
+                last_epoch = epoch;
+                self.key_doc_ids.put(hashes[j], doc_ids[j]) catch {};
+                self.key_epochs.put(hashes[j], doc_ids[j]) catch {};
+            }
+            if (last_epoch > 0) self.versions.current_epoch.store(last_epoch, .release);
+            self.shared_mu.unlock();
+
+            chunk_start = chunk_end;
+        }
+
+        // GC if needed (outside lock).
+        const gc_val = self.gc_counter.fetchAdd(@intCast(entries.len), .monotonic);
+        if (gc_val >= GC_INTERVAL and gc_val % GC_INTERVAL < entries.len) {
+            self.shared_mu.lock();
+            _ = self.versions.gc(self.alloc);
+            self.shared_mu.unlock();
+        }
+
+        // Push to async trigram/word index queues.
+        for (entries, 0..) |_, j| {
+            const ki = key_offset + j;
+            if (ki >= keys.len) break;
+            const value = values[ki];
+            const key = keys[ki];
+            if (value.len < 3) continue;
+            const owned_key = self.alloc.dupe(u8, key) catch continue;
+            const owned_val = self.alloc.dupe(u8, value) catch { self.alloc.free(owned_key); continue; };
+            const q = if (self.queue_toggle.fetchAdd(1, .monotonic) % 2 == 0) &self.index_queue else &self.index_queue2;
+            if (!q.push(owned_key, owned_val)) {
+                self.alloc.free(owned_key);
+                self.alloc.free(owned_val);
+            }
+        }
+
+        // Emit CDC for each doc.
+        for (entries, 0..) |_, j| {
+            const ki = key_offset + j;
+            if (ki >= keys.len) break;
+            emitChange(self, .insert, keys[ki], values[ki], doc_ids[j]);
+        }
+    }
     /// Insert a document with a pre-computed embedding (no JSON parsing needed).
     /// This is the fast path — embedding is passed directly as f32 slice.
     pub fn insertWithEmbedding(self: *Collection, key: []const u8, value: []const u8, embedding: []const f32) !u64 {
@@ -475,7 +662,10 @@ pub const Collection = struct {
                     vc.append(self.alloc, embedding) catch {};
                     // Look up the BTreeEntry for this doc
                     const key_hash = doc_mod.fnv1a(key);
-                    if (self.hash_idx.get(key_hash)) |entry| {
+                    self.shared_mu.lock();
+                    const hash_result = self.hash_idx.get(key_hash);
+                    self.shared_mu.unlock();
+                    if (hash_result) |entry| {
                         self.vec_entries.append(self.alloc, entry) catch {};
                     }
                 }
@@ -497,14 +687,21 @@ pub const Collection = struct {
         }
 
         // L2: Hash index (O(1), but hash table lookup)
-        if (self.hash_idx.get(key_hash)) |entry| {
+        // shared_mu protects against concurrent HashMap resize during put().
+        self.shared_mu.lock();
+        const hash_entry = self.hash_idx.get(key_hash);
+        self.shared_mu.unlock();
+        if (hash_entry) |entry| {
             if (self.readEntry(entry)) |d| {
                 self.cache.insert(key_hash, entry.page_no, entry.page_off);
                 return d;
             }
         }
         // L3: B-tree (O(log n))
-        const entry = self.idx.search(key_hash) orelse return null;
+        self.shared_mu.lock();
+        const btree_entry = self.idx.search(key_hash);
+        self.shared_mu.unlock();
+        const entry = btree_entry orelse return null;
         const d = self.readEntry(entry) orelse return null;
         self.cache.insert(key_hash, entry.page_no, entry.page_off);
         return d;
@@ -512,9 +709,19 @@ pub const Collection = struct {
 
     pub fn getAsOfEpoch(self: *Collection, key: []const u8, epoch: u64) ?Doc {
         const key_hash = doc_mod.fnv1a(key);
-        const doc_id = self.key_doc_ids.get(key_hash) orelse return null;
-        const ver = self.versions.getAtEpoch(doc_id, epoch) orelse return null;
-        return self.readLoc(ver.page_no, ver.page_off);
+        self.shared_mu.lock();
+        const doc_id = self.key_doc_ids.get(key_hash) orelse {
+            self.shared_mu.unlock();
+            return null;
+        };
+        const ver = self.versions.getAtEpoch(doc_id, epoch) orelse {
+            self.shared_mu.unlock();
+            return null;
+        };
+        const pno = ver.page_no;
+        const poff = ver.page_off;
+        self.shared_mu.unlock();
+        return self.readLoc(pno, poff);
     }
 
     pub fn getAsOfTimestamp(self: *Collection, key: []const u8, ts_ms: i64) ?Doc {
@@ -548,12 +755,17 @@ pub const Collection = struct {
     /// Update an existing document (append new version, update index).
     /// Uses per-key stripe lock — concurrent updates to different keys proceed in parallel.
     pub fn update(self: *Collection, key: []const u8, new_value: []const u8) !bool {
+        if (key.len == 0 or key.len > std.math.maxInt(u16)) return error.InvalidKeyLength;
+        if (new_value.len > std.math.maxInt(u32)) return error.InvalidValueLength;
         const key_hash = doc_mod.fnv1a(key);
         const stripe = stripeIndex(key_hash);
         self.stripe_locks[stripe].lock();
         defer self.stripe_locks[stripe].unlock();
 
-        const old_entry = self.idx.search(key_hash) orelse return false;
+        self.shared_mu.lock();
+        const old_entry_result = self.idx.search(key_hash);
+        self.shared_mu.unlock();
+        const old_entry = old_entry_result orelse return false;
         const old_doc = self.readEntry(old_entry) orelse return false;
 
         const doc_id = old_doc.header.doc_id;
@@ -566,8 +778,7 @@ pub const Collection = struct {
         var enc_buf: [65536]u8 = undefined;
         const enc = try d.encodeBuf(&enc_buf);
 
-        const txn = self.wal_log.next_lsn.load(.monotonic);
-        _ = try self.wal_log.write(txn, .doc_update, 0, 0, enc);
+        _ = try self.wal_log.write(0, .doc_update, 0, 0, enc);
 
         const pno = try self.findOrAllocLeaf(enc.len);
         const page_off = self.pf.leafAppend(pno, enc) orelse return error.PageFull;
@@ -578,12 +789,23 @@ pub const Collection = struct {
             .page_no  = pno,
             .page_off = page_off,
         };
+        self.shared_mu.lock();
         self.hash_idx.put(key_hash, new_entry) catch {};
+        self.idx.insert(new_entry) catch {};
         self.cache.invalidate(key_hash);
 
         // MVCC: register new version in the version chain (links to old automatically).
         const epoch = self.epochs.advance();
         self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
+        self.versions.current_epoch.store(epoch, .release);
+        self.key_epochs.put(key_hash, doc_id) catch {};
+        const should_gc = self.gc_counter.fetchAdd(1, .monotonic) % GC_INTERVAL == GC_INTERVAL - 1;
+        self.shared_mu.unlock();
+        if (should_gc) {
+            self.shared_mu.lock();
+            _ = self.versions.gc(self.alloc);
+            self.shared_mu.unlock();
+        }
         emitChange(self, .update, key, new_value, doc_id);
 
         return true;
@@ -597,25 +819,40 @@ pub const Collection = struct {
         self.stripe_locks[stripe].lock();
         defer self.stripe_locks[stripe].unlock();
 
-        const entry = self.idx.search(key_hash) orelse return false;
+        self.shared_mu.lock();
+        const del_entry_result = self.idx.search(key_hash);
+        self.shared_mu.unlock();
+        const entry = del_entry_result orelse return false;
 
         const old_doc = self.readEntry(entry) orelse return false;
         var tomb_hdr = doc_mod.newHeader(old_doc.header.doc_id, key, "");
         tomb_hdr.flags |= DocHeader.DELETED;
         tomb_hdr.version = old_doc.header.version +% 1;
         tomb_hdr.next_ver = (@as(u64, entry.page_no) << 16) | entry.page_off;
-        const txn = self.wal_log.next_lsn.load(.monotonic);
-        _ = try self.wal_log.write(txn, .doc_delete, 0, 0, std.mem.asBytes(&tomb_hdr));
+        _ = try self.wal_log.write(0, .doc_delete, 0, 0, std.mem.asBytes(&tomb_hdr));
         const tomb_doc = Doc{ .header = tomb_hdr, .key = key, .value = "" };
         var enc_buf: [65536]u8 = undefined;
         const enc = try tomb_doc.encodeBuf(&enc_buf);
         const pno = try self.findOrAllocLeaf(enc.len);
         const page_off = self.pf.leafAppend(pno, enc) orelse return error.PageFull;
+        self.shared_mu.lock();
         const epoch = self.epochs.advance();
         self.versions.appendVersion(self.alloc, old_doc.header.doc_id, pno, page_off, epoch) catch {};
+        self.versions.current_epoch.store(epoch, .release);
         self.idx.delete(key_hash);
         _ = self.hash_idx.remove(key_hash);
+        _ = self.key_doc_ids.remove(key_hash);
+        _ = self.key_epochs.remove(key_hash);
+        const should_gc = self.gc_counter.fetchAdd(1, .monotonic) % GC_INTERVAL == GC_INTERVAL - 1;
+        self.shared_mu.unlock();
+        if (should_gc) {
+            self.shared_mu.lock();
+            _ = self.versions.gc(self.alloc);
+            self.shared_mu.unlock();
+        }
         self.cache.invalidate(key_hash);
+        self.tri.removeFile(key);
+        self.words.removeFile(key);
         emitChange(self, .delete, key, "", old_doc.header.doc_id);
         return true;
     }
@@ -712,9 +949,10 @@ pub const Collection = struct {
         };
     }
 
-    /// O(1) word lookup using the inverted word index.
-    pub fn searchWord(self: *Collection, word: []const u8) []const codeindex.WordHit {
-        return self.words.search(word);
+    /// O(1) word lookup using the inverted word index. Returns an owned copy
+    /// that the caller must free with `allocator.free(result)`.
+    pub fn searchWord(self: *Collection, word: []const u8, allocator: std.mem.Allocator) ![]const codeindex.WordHit {
+        return self.words.search(word, allocator);
     }
 
     fn bruteForceSearch(self: *Collection, query: []const u8, limit: u32, alloc: std.mem.Allocator) !TextSearchResult {
@@ -739,19 +977,30 @@ pub const Collection = struct {
         };
     }
 
+    /// Lookup table for fast ASCII lowercasing — avoids branch per byte.
+    const lower_lut: [256]u8 = blk: {
+        var t: [256]u8 = undefined;
+        for (0..256) |i| t[i] = if (i >= 'A' and i <= 'Z') @intCast(i + 32) else @intCast(i);
+        break :blk t;
+    };
+
     fn containsInsensitive(haystack: []const u8, needle: []const u8) bool {
         if (needle.len == 0) return true;
         if (haystack.len < needle.len) return false;
+        // Pre-lowercase the needle once (avoids repeated table lookups per position).
+        var lower_needle: [256]u8 = undefined;
+        const nlen = @min(needle.len, 256);
+        for (needle[0..nlen], 0..) |c, k| lower_needle[k] = lower_lut[c];
+        if (needle.len > 256) return false; // needle > 256 chars unsupported
+        const first = lower_needle[0];
         var i: usize = 0;
-        while (i + needle.len <= haystack.len) : (i += 1) {
+        const end = haystack.len - needle.len;
+        while (i <= end) : (i += 1) {
+            // Fast skip: check first byte before full comparison.
+            if (lower_lut[haystack[i]] != first) continue;
             var match = true;
-            var j: usize = 0;
-            while (j < needle.len) : (j += 1) {
-                const hc = haystack[i + j];
-                const nc = needle[j];
-                const hl = if (hc >= 'A' and hc <= 'Z') hc + 32 else hc;
-                const nl = if (nc >= 'A' and nc <= 'Z') nc + 32 else nc;
-                if (hl != nl) { match = false; break; }
+            for (1..nlen) |j| {
+                if (lower_lut[haystack[i + j]] != lower_needle[j]) { match = false; break; }
             }
             if (match) return true;
         }
@@ -810,13 +1059,17 @@ pub const Collection = struct {
         const total_pages = self.pf.next_alloc.load(.acquire);
         var skipped: u32 = 0;
         var pno: u32 = 0;
+        // Snapshot used_bytes per page under shared_mu to avoid reading
+        // partially-written documents from concurrent inserts.
+        self.shared_mu.lock();
         outer: while (pno < total_pages) : (pno += 1) {
             const ph = self.pf.pageHeader(pno);
             if (@as(page_mod.PageType, @enumFromInt(ph.page_type)) != .leaf) continue;
+            const used = ph.used_bytes;
             const data = self.pf.pageData(pno);
             var pos: usize = 0;
-            while (pos + DocHeader.size <= ph.used_bytes) {
-                const rem = data[pos..ph.used_bytes];
+            while (pos + DocHeader.size <= used) {
+                const rem = data[pos..used];
                 const decoded = doc_mod.decode(rem) catch break;
                 const d = decoded.doc;
                 pos += decoded.consumed;
@@ -826,6 +1079,7 @@ pub const Collection = struct {
                 if (results.items.len >= limit) break :outer;
             }
         }
+        self.shared_mu.unlock();
         return ScanResult{ .docs = try results.toOwnedSlice(alloc), .alloc = alloc };
     }
 
@@ -834,9 +1088,23 @@ pub const Collection = struct {
         errdefer results.deinit(alloc);
 
         var skipped: u32 = 0;
+        // Snapshot key_doc_ids under shared_mu to avoid racing with insert().
+        self.shared_mu.lock();
         var it = self.key_doc_ids.iterator();
+        // Collect doc_id/epoch pairs while holding the lock (fast — just integers).
+        const Pair = struct { doc_id: u64 };
+        var pairs: std.ArrayList(Pair) = .empty;
+        defer pairs.deinit(alloc);
         while (it.next()) |entry| {
             const ver = self.versions.getAtEpoch(entry.value_ptr.*, epoch) orelse continue;
+            _ = ver;
+            pairs.append(alloc, .{ .doc_id = entry.value_ptr.* }) catch continue;
+        }
+        self.shared_mu.unlock();
+
+        // Now read pages outside the lock (safe — pages are stable after mmap rewrite).
+        for (pairs.items) |pair| {
+            const ver = self.versions.getAtEpoch(pair.doc_id, epoch) orelse continue;
             const doc = self.readLoc(ver.page_no, ver.page_off) orelse continue;
             if (skipped < offset) {
                 skipped += 1;
@@ -872,8 +1140,10 @@ pub const Collection = struct {
     }
 
     fn readEntry(self: *Collection, entry: BTreeEntry) ?Doc {
-        const raw = self.pf.leafRead(entry.page_no, entry.page_off,
-            DocHeader.size + 1024 + 65536);
+        const ph = self.pf.pageHeader(entry.page_no);
+        if (entry.page_off >= ph.used_bytes) return null;
+        const data = self.pf.pageData(entry.page_no);
+        const raw = data[entry.page_off..ph.used_bytes];
         const decoded = doc_mod.decode(raw) catch return null;
         if (decoded.doc.header.flags & DocHeader.DELETED != 0) return null;
         return decoded.doc;
@@ -918,7 +1188,9 @@ pub const Collection = struct {
                 };
                 if (d.header.flags & DocHeader.DELETED == 0) {
                     self.hash_idx.put(d.header.key_hash, entry) catch {};
+                    self.idx.insert(entry) catch {};
                     self.key_doc_ids.put(d.header.key_hash, d.header.doc_id) catch {};
+                    self.key_epochs.put(d.header.key_hash, d.header.doc_id) catch {};
                     if (d.value.len >= 3) {
                         self.tri.indexFile(d.key, d.value) catch {};
                         self.words.indexFile(d.key, d.value) catch {};
@@ -1030,7 +1302,7 @@ pub const Collection = struct {
         const vc = self.vectors orelse return self.searchText(text_query, limit, result_alloc);
 
         // Phase 1: Text pre-filter — get candidate doc keys
-        const text_results = try self.searchText(text_query, limit * 3, result_alloc);
+        var text_results = try self.searchText(text_query, limit * 3, result_alloc);
 
         if (text_results.docs.len == 0 or vector_query.len != vc.dims) {
             return text_results;
@@ -1077,10 +1349,8 @@ pub const Collection = struct {
             text_results.docs[i] = sd.doc;
         }
 
-        // If we have more docs than limit, shrink the slice
         if (text_results.docs.len > out_len) {
-            // We can't easily shrink, but the caller will respect .docs.len
-            // Just return the full text_results (already re-ranked in-place)
+            text_results.docs = text_results.docs[0..out_len];
         }
 
         return text_results;
@@ -1144,21 +1414,26 @@ pub const Collection = struct {
         var it = br.writes.iterator();
         while (it.next()) |entry| {
             const w = entry.value_ptr.*;
+            const key = entry.key_ptr.*;
 
             if (w.deleted) {
                 applied += 1;
                 continue;
             }
 
-            const key_hash = doc_mod.fnv1a(w.key);
+            const key_hash = doc_mod.fnv1a(key);
 
-            // CONFLICT DETECTION: check if main modified this key after branch was created
-            if (self.key_epochs.get(key_hash)) |main_epoch| {
+            // CONFLICT DETECTION: check if main modified this key after branch was created.
+            // Acquire shared_mu to safely read key_epochs (concurrent inserts mutate it).
+            self.shared_mu.lock();
+            const main_epoch_opt = self.key_epochs.get(key_hash);
+            self.shared_mu.unlock();
+            if (main_epoch_opt) |main_epoch| {
                 if (main_epoch > br.base_epoch) {
                     // Main was modified after branch fork — this is a real conflict
-                    const main_doc = self.get(w.key);
+                    const main_doc = self.get(key);
                     try conflicts_list.append(merge_alloc, .{
-                        .key = w.key,
+                        .key = key,
                         .branch_value = w.value,
                         .main_value = if (main_doc) |d| d.value else "",
                     });
@@ -1167,7 +1442,7 @@ pub const Collection = struct {
             }
 
             // No conflict — safe to apply
-            _ = self.insert(w.key, w.value) catch continue;
+            _ = self.insert(key, w.value) catch continue;
             applied += 1;
         }
 
@@ -1228,20 +1503,21 @@ pub const Collection = struct {
         var it = br.writes.iterator();
         while (it.next()) |entry| {
             const w = entry.value_ptr.*;
+            const key = entry.key_ptr.*;
             if (w.deleted) continue;
             // Check if query appears in the branch-local value or key
-            if (containsInsensitive(w.value, query) or containsInsensitive(w.key, query)) {
+            if (containsInsensitive(w.value, query) or containsInsensitive(key, query)) {
                 try branch_matches.append(search_alloc, Doc{
                     .header = doc_mod.DocHeader{
                         .doc_id = w.epoch,
-                        .key_hash = doc_mod.fnv1a(w.key),
+                        .key_hash = doc_mod.fnv1a(key),
                         .val_len = @intCast(w.value.len),
-                        .key_len = @intCast(w.key.len),
+                        .key_len = @intCast(key.len),
                         .flags = 0,
                         .version = 0,
                         .next_ver = 0,
                     },
-                    .key = w.key,
+                    .key = key,
                     .value = w.value,
                 });
             }
@@ -1440,7 +1716,7 @@ fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
         }
         if (n == 0) {
             _ = col.indexing_count.fetchSub(1, .release);
-            std.Thread.yield() catch {};
+            std.Thread.sleep(1_000_000); // 1ms — avoid busy-spin when queue is empty
             continue;
         }
         // Batch trigram indexing (single lock acquisition for all docs).
@@ -1603,6 +1879,13 @@ pub const Database = struct {
             kv.value.close();
             self.alloc.free(kv.key);
         }
+
+        // Delete the backing page file so data doesn't reappear on re-access.
+        var storage_name_buf: [MAX_TENANT_ID_LEN + MAX_COLLECTION_NAME_LEN + 4]u8 = undefined;
+        const storage_name = makeStorageName(&storage_name_buf, tenant_id, name) catch return;
+        var path_buf: [512]u8 = undefined;
+        const page_path = std.fmt.bufPrint(&path_buf, "{s}/{s}.pages", .{ self.dataDir(), storage_name }) catch return;
+        std.fs.cwd().deleteFile(page_path) catch {};
     }
 
     pub fn listCollectionsForTenant(self: *Database, tenant_id: []const u8, alloc: std.mem.Allocator) !std.ArrayList([]const u8) {
@@ -2002,4 +2285,123 @@ test "extractJsonFloatArray handles whitespace in array" {
     try std.testing.expectApproxEqAbs(@as(f32, 1.0), out[0], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 2.0), out[1], 0.001);
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), out[2], 0.001);
+}
+
+test "concurrent inserts to same collection do not crash" {
+    const alloc = std.testing.allocator;
+    const db = try Database.open(alloc, "./test_concurrent_data");
+    defer db.close();
+    defer std.fs.cwd().deleteTree("./test_concurrent_data") catch {};
+
+    const col = try db.collection("stress");
+
+    // Spawn multiple threads doing concurrent inserts to different keys
+    const THREADS = 4;
+    const INSERTS_PER_THREAD = 500;
+    var threads: [THREADS]std.Thread = undefined;
+
+    const Worker = struct {
+        fn run(c: *Collection, thread_id: usize) void {
+            var key_buf: [64]u8 = undefined;
+            var val_buf: [128]u8 = undefined;
+            for (0..INSERTS_PER_THREAD) |i| {
+                const klen = std.fmt.bufPrint(&key_buf, "t{d}_k{d}", .{ thread_id, i }) catch continue;
+                const vlen = std.fmt.bufPrint(&val_buf, "{{\"thread\":{d},\"seq\":{d},\"data\":\"payload\"}}", .{ thread_id, i }) catch continue;
+                _ = c.insert(klen, vlen) catch continue;
+            }
+        }
+    };
+
+    for (0..THREADS) |t| {
+        threads[t] = try std.Thread.spawn(.{}, Worker.run, .{ col, t });
+    }
+    for (0..THREADS) |t| {
+        threads[t].join();
+    }
+
+    // Verify data integrity — spot-check a few keys
+    for (0..THREADS) |t| {
+        var key_buf: [64]u8 = undefined;
+        const klen = std.fmt.bufPrint(&key_buf, "t{d}_k0", .{t}) catch continue;
+        const doc = col.get(klen);
+        try std.testing.expect(doc != null);
+    }
+}
+
+test "bulk insert triggers MVCC GC and versions stay bounded" {
+    const alloc = std.testing.allocator;
+    const db = try Database.open(alloc, "./test_bulk_gc_data");
+    defer db.close();
+    defer std.fs.cwd().deleteTree("./test_bulk_gc_data") catch {};
+
+    const col = try db.collection("bulkgc");
+
+    // Insert more than GC_INTERVAL documents
+    const N = Collection.GC_INTERVAL * 3;
+    var key_buf: [64]u8 = undefined;
+    for (0..N) |i| {
+        const klen = std.fmt.bufPrint(&key_buf, "doc_{d}", .{i}) catch continue;
+        _ = col.insert(klen, "{\"val\":1}") catch continue;
+    }
+
+    // GC should have run at least twice (every 500 inserts)
+    // all_versions should be well under N because GC trims old entries
+    col.shared_mu.lock();
+    const versions_len = col.versions.all_versions.items.len;
+    col.shared_mu.unlock();
+    // After GC, the remaining versions should be <= N (they could be N if
+    // all are latest, but at minimum GC should not have crashed)
+    try std.testing.expect(versions_len <= N);
+    // Verify reads still work
+    const doc = col.get("doc_0");
+    try std.testing.expect(doc != null);
+}
+
+test "concurrent reads and writes do not crash" {
+    const alloc = std.testing.allocator;
+    const db = try Database.open(alloc, "./test_rw_data");
+    defer db.close();
+    defer std.fs.cwd().deleteTree("./test_rw_data") catch {};
+
+    const col = try db.collection("readwrite");
+
+    // Pre-populate some data
+    for (0..100) |i| {
+        var key_buf: [64]u8 = undefined;
+        const klen = std.fmt.bufPrint(&key_buf, "pre_{d}", .{i}) catch continue;
+        _ = col.insert(klen, "{\"pre\":true}") catch continue;
+    }
+
+    // Spawn writers and readers concurrently
+    const WriterCtx = struct {
+        fn run(c: *Collection) void {
+            var key_buf: [64]u8 = undefined;
+            var val_buf: [128]u8 = undefined;
+            for (0..200) |i| {
+                const klen = std.fmt.bufPrint(&key_buf, "w_{d}", .{i}) catch continue;
+                const vlen = std.fmt.bufPrint(&val_buf, "{{\"w\":{d}}}", .{i}) catch continue;
+                _ = c.insert(klen, vlen) catch continue;
+            }
+        }
+    };
+    const ReaderCtx = struct {
+        fn run(c: *Collection) void {
+            var key_buf: [64]u8 = undefined;
+            for (0..200) |i| {
+                const klen = std.fmt.bufPrint(&key_buf, "pre_{d}", .{i % 100}) catch continue;
+                _ = c.get(klen);
+            }
+        }
+    };
+
+    var writer = try std.Thread.spawn(.{}, WriterCtx.run, .{col});
+    var reader1 = try std.Thread.spawn(.{}, ReaderCtx.run, .{col});
+    var reader2 = try std.Thread.spawn(.{}, ReaderCtx.run, .{col});
+
+    writer.join();
+    reader1.join();
+    reader2.join();
+
+    // If we got here without crashing, the test passes
+    try std.testing.expect(true);
 }

@@ -13,12 +13,13 @@ pub const Event = struct {
     tenant_id_len: u8,
     collection: [64]u8,
     collection_len: u8,
-    key: [128]u8,
-    key_len: u8,
-    value: [512]u8,
+    key: [256]u8,
+    key_len: u16,
+    value: [4096]u8,
     value_len: u16,
     doc_id: u64,
     op: Op,
+    truncated: bool,
 
     pub fn tenant(self: *const Event) []const u8 {
         return self.tenant_id[0..self.tenant_id_len];
@@ -75,7 +76,7 @@ pub const Delivery = struct {
     webhook_url: [256]u8,
     webhook_url_len: u16,
     signature_hex: [64]u8,
-    payload: [1024]u8,
+    payload: [8192]u8,
     payload_len: u16,
 
     pub fn tenant(self: *const Delivery) []const u8 {
@@ -102,6 +103,7 @@ pub const CDCManager = struct {
     deliveries: std.ArrayList(Delivery),
     next_subscription_id: std.atomic.Value(u64),
     next_seq: std.atomic.Value(u64),
+    events_dropped: std.atomic.Value(u64),
     mu: std.Thread.Mutex,
     cond: std.Thread.Condition,
     running: std.atomic.Value(bool),
@@ -115,6 +117,7 @@ pub const CDCManager = struct {
             .deliveries = .empty,
             .next_subscription_id = std.atomic.Value(u64).init(1),
             .next_seq = std.atomic.Value(u64).init(1),
+            .events_dropped = std.atomic.Value(u64).init(0),
             .mu = .{},
             .cond = .{},
             .running = std.atomic.Value(bool).init(false),
@@ -143,6 +146,8 @@ pub const CDCManager = struct {
         self.worker = null;
     }
 
+    const MAX_SUBSCRIPTIONS: usize = 1024;
+
     pub fn registerWebhook(self: *CDCManager, tenant_id: []const u8, collection: []const u8, webhook_url: []const u8, secret: []const u8) !u64 {
         var sub = std.mem.zeroes(Subscription);
         sub.id = self.next_subscription_id.fetchAdd(1, .monotonic);
@@ -153,8 +158,21 @@ pub const CDCManager = struct {
 
         self.mu.lock();
         defer self.mu.unlock();
+        if (self.subscriptions.items.len >= MAX_SUBSCRIPTIONS) return error.TooManySubscriptions;
         try self.subscriptions.append(self.allocator, sub);
         return sub.id;
+    }
+
+    pub fn removeWebhook(self: *CDCManager, sub_id: u64) bool {
+        self.mu.lock();
+        defer self.mu.unlock();
+        for (self.subscriptions.items, 0..) |sub, i| {
+            if (sub.id == sub_id) {
+                _ = self.subscriptions.swapRemove(i);
+                return true;
+            }
+        }
+        return false;
     }
 
     pub fn emit(self: *CDCManager, tenant_id: []const u8, collection: []const u8, key: []const u8, value: []const u8, doc_id: u64, op: Op) void {
@@ -162,14 +180,19 @@ pub const CDCManager = struct {
         ev.seq = self.next_seq.fetchAdd(1, .monotonic);
         ev.doc_id = doc_id;
         ev.op = op;
+        ev.truncated = false;
+        const key_trunc = fillTracked(&ev.key, &ev.key_len, key);
+        const val_trunc = fillU16Tracked(&ev.value, &ev.value_len, value);
+        if (key_trunc or val_trunc) ev.truncated = true;
         fill(&ev.tenant_id, &ev.tenant_id_len, tenant_id);
         fill(&ev.collection, &ev.collection_len, collection);
-        fill(&ev.key, &ev.key_len, key);
-        fillU16(&ev.value, &ev.value_len, value);
 
         self.mu.lock();
         defer self.mu.unlock();
-        self.pending.append(self.allocator, ev) catch return;
+        self.pending.append(self.allocator, ev) catch {
+            _ = self.events_dropped.fetchAdd(1, .monotonic);
+            return;
+        };
         self.cond.signal();
     }
 
@@ -197,20 +220,34 @@ pub const CDCManager = struct {
                 self.mu.unlock();
                 return;
             }
-            const ev = self.pending.orderedRemove(0);
-            const subs = self.subscriptions.items;
+            // Drain all pending events in one batch to avoid O(n) orderedRemove(0) per event.
+            var batch = self.pending;
+            self.pending = .empty;
+            const sub_count = self.subscriptions.items.len;
             self.mu.unlock();
 
-            for (subs) |sub| {
-                if (!matches(sub, ev)) continue;
-                const delivery = makeDelivery(sub, ev);
-                self.mu.lock();
-                self.deliveries.append(self.allocator, delivery) catch {};
-                if (self.deliveries.items.len > 4096) {
-                    _ = self.deliveries.orderedRemove(0);
+            for (batch.items) |ev| {
+                var si: usize = 0;
+                while (si < sub_count) : (si += 1) {
+                    self.mu.lock();
+                    if (si >= self.subscriptions.items.len) {
+                        self.mu.unlock();
+                        break;
+                    }
+                    const sub = self.subscriptions.items[si];
+                    self.mu.unlock();
+
+                    if (!matches(sub, ev)) continue;
+                    const delivery = makeDelivery(sub, ev);
+                    self.mu.lock();
+                    self.deliveries.append(self.allocator, delivery) catch {};
+                    if (self.deliveries.items.len > 4096) {
+                        _ = self.deliveries.orderedRemove(0);
+                    }
+                    self.mu.unlock();
                 }
-                self.mu.unlock();
             }
+            batch.deinit(self.allocator);
         }
     }
 };
@@ -228,11 +265,24 @@ fn makeDelivery(sub: Subscription, ev: Event) Delivery {
         .update => "update",
         .delete => "delete",
     };
+
+    // Escape user-controlled fields to prevent JSON injection
+    var esc_tenant_buf: [256]u8 = undefined;
+    var esc_col_buf: [256]u8 = undefined;
+    var esc_key_buf: [1024]u8 = undefined;
+    const esc_tenant = cdcJsonEscape(ev.tenant(), &esc_tenant_buf);
+    const esc_col = cdcJsonEscape(ev.collectionName(), &esc_col_buf);
+    const esc_key = cdcJsonEscape(ev.keySlice(), &esc_key_buf);
+
     const payload = std.fmt.bufPrint(
         &delivery.payload,
         "{{\"seq\":{d},\"tenant\":\"{s}\",\"collection\":\"{s}\",\"op\":\"{s}\",\"key\":\"{s}\",\"doc_id\":{d},\"value\":{s}}}",
-        .{ ev.seq, ev.tenant(), ev.collectionName(), op_str, ev.keySlice(), ev.doc_id, if (ev.value_len > 0) ev.valueSlice() else "null" },
-    ) catch "{}";
+        .{ ev.seq, esc_tenant, esc_col, op_str, esc_key, ev.doc_id, if (ev.value_len > 0) ev.valueSlice() else "null" },
+    ) catch std.fmt.bufPrint(
+        &delivery.payload,
+        "{{\"seq\":{d},\"tenant\":\"{s}\",\"collection\":\"{s}\",\"op\":\"{s}\",\"key\":\"{s}\",\"doc_id\":{d},\"value\":null,\"truncated\":true}}",
+        .{ ev.seq, esc_tenant, esc_col, op_str, esc_key, ev.doc_id },
+    ) catch return delivery;
     delivery.payload_len = @intCast(payload.len);
     delivery.signature_hex = crypto.hmacSha256Hex(sub.secretSlice(), payload);
     return delivery;
@@ -254,6 +304,44 @@ fn fillU16(dest: anytype, len_ptr: *u16, src: []const u8) void {
     const n = @min(dest.len, src.len);
     @memcpy(dest[0..n], src[0..n]);
     len_ptr.* = @intCast(n);
+}
+
+/// Like fill, but returns true if src was truncated to fit dest.
+fn fillTracked(dest: anytype, len_ptr: anytype, src: []const u8) bool {
+    const n = @min(dest.len, src.len);
+    @memcpy(dest[0..n], src[0..n]);
+    len_ptr.* = @intCast(n);
+    return src.len > dest.len;
+}
+
+/// Like fillU16, but returns true if src was truncated to fit dest.
+fn fillU16Tracked(dest: anytype, len_ptr: *u16, src: []const u8) bool {
+    const n = @min(dest.len, src.len);
+    @memcpy(dest[0..n], src[0..n]);
+    len_ptr.* = @intCast(n);
+    return src.len > dest.len;
+}
+
+/// Escape a string for safe JSON interpolation (handles " and \).
+fn cdcJsonEscape(raw: []const u8, buf: []u8) []const u8 {
+    var needs_escape = false;
+    for (raw) |ch| {
+        if (ch == '"' or ch == '\\') { needs_escape = true; break; }
+    }
+    if (!needs_escape) return raw;
+    var pos: usize = 0;
+    for (raw) |ch| {
+        if (ch == '"' or ch == '\\') {
+            if (pos + 2 > buf.len) return raw;
+            buf[pos] = '\\';
+            pos += 1;
+        } else {
+            if (pos + 1 > buf.len) return raw;
+        }
+        buf[pos] = ch;
+        pos += 1;
+    }
+    return buf[0..pos];
 }
 
 test "cdc filters by tenant and collection and signs payload" {

@@ -45,6 +45,8 @@ npm install turbodatabase     # Node.js
 | io_uring / kqueue | ✅ Working | Async I/O, event-loop server |
 | Binary wire protocol | ✅ Working | TCP_NODELAY, pipelining, batch ops |
 | JSON REST API | ✅ Working | MongoDB-inspired routes on :27017 |
+| **Bulk insert (NDJSON + SIMD)** | ✅ Working | **Batch NDJSON with SIMD newline scanning, ~20K docs/s** |
+| **WebSocket streaming** | ✅ Working | **Fire-and-forget ingest for high-latency links** |
 | **Authentication** | ✅ Working | **API key + BLAKE3 hashing, per-key permissions** |
 | **Schema validation** | ✅ Working | **Required fields, type checking (string/number/bool/object/array)** |
 | **TTL / document expiry** | ✅ Working | **Per-doc TTL with background reaper** |
@@ -153,6 +155,37 @@ curl "http://localhost:27018/db/users?limit=20&filter={\"age\":{\"\$gt\":25}}"
 # Health check
 curl http://localhost:27018/health
 ```
+
+### Bulk Ingestion
+
+```bash
+# NDJSON bulk insert — one request, many documents
+curl -X POST http://localhost:27018/db/users/bulk --data-binary @- <<'EOF'
+{"key":"alice","value":{"name":"Alice","age":30}}
+{"key":"bob","value":{"name":"Bob","age":25}}
+{"key":"carol","value":{"name":"Carol","age":35}}
+EOF
+# → {"inserted":3,"errors":0,"collection":"users","tenant":"default"}
+```
+
+For high-latency connections (SSH tunnels, WAN), use **WebSocket streaming** to eliminate per-batch round-trips:
+
+```python
+# pip install websocket-client
+from turbodb.stream import StreamInserter
+
+with StreamInserter("ws://host:27018", "users") as s:
+    for doc in documents:
+        s.add(doc["key"], doc["value"])   # buffered, fire-and-forget
+print(s.result)  # {"inserted": 12000, "errors": 0, "frames": 6}
+```
+
+| Method | Best for | Throughput |
+|--------|----------|-----------|
+| HTTP single insert | Real-time writes | ~10K/s (localhost) |
+| HTTP bulk (NDJSON) | Batch imports | ~20K/s (localhost) |
+| HTTP bulk parallel | Bulk over WAN (high bandwidth) | ~1.2K/s (tunnel, 4 conns) |
+| WS streaming | Continuous ingest, low-latency fire-and-forget | ~18K/s (localhost) |
 
 ### Python (FFI — no network overhead)
 

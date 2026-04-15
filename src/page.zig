@@ -35,17 +35,19 @@ pub const PageFile = struct {
     free_head: std.atomic.Value(u32),  // head of free-list (0 = empty)
     next_alloc: std.atomic.Value(u32), // next never-allocated page
     mu: std.Thread.Mutex,
+    leaf_shards: [64]std.Thread.Mutex,  // per-page-shard locks for leafAppend
 
     pub fn open(path: []const u8) !PageFile {
         var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
         const path_z = try std.fmt.bufPrintZ(&path_buf, "{s}", .{path});
         const mm = try mmap.MmapFile.open(path_z, PAGE_SIZE * 16);
-        const page_count: u32 = @intCast(mm.len / PAGE_SIZE);
+        const page_count: u32 = @intCast(mm.dataLen() / PAGE_SIZE);
         return PageFile{
             .mm         = mm,
             .free_head  = std.atomic.Value(u32).init(0),
             .next_alloc = std.atomic.Value(u32).init(page_count),
             .mu         = .{},
+            .leaf_shards = [1]std.Thread.Mutex{.{}} ** 64,
         };
     }
 
@@ -76,7 +78,7 @@ pub const PageFile = struct {
         // Extend the file.
         const pno = self.next_alloc.fetchAdd(1, .seq_cst);
         const needed = (@as(usize, pno) + 1) * PAGE_SIZE;
-        if (needed > self.mm.capacity) try self.mm.grow(needed);
+        if (needed > self.mm.capacity.load(.acquire)) try self.mm.grow(needed);
 
         const ph = self.pageHeader(pno);
         ph.* = std.mem.zeroes(PageHeader);
@@ -111,6 +113,9 @@ pub const PageFile = struct {
     /// Append bytes to a leaf page. Returns offset within the usable area,
     /// or null if there isn't enough space.
     pub fn leafAppend(self: *PageFile, pno: u32, data: []const u8) ?u16 {
+        self.leaf_shards[pno % 64].lock();
+        defer self.leaf_shards[pno % 64].unlock();
+
         const ph = self.pageHeader(pno);
         const used = ph.used_bytes;
         if (@as(usize, used) + data.len > PAGE_USABLE) return null;
@@ -121,11 +126,27 @@ pub const PageFile = struct {
         return used;
     }
 
+    /// Reserve `len` bytes on a leaf page and return a writable slice + offset.
+    /// Caller writes directly into the page, avoiding a double copy.
+    pub fn leafReserve(self: *PageFile, pno: u32, len: usize) ?struct { buf: []u8, off: u16 } {
+        self.leaf_shards[pno % 64].lock();
+        defer self.leaf_shards[pno % 64].unlock();
+
+        const ph = self.pageHeader(pno);
+        const used = ph.used_bytes;
+        if (@as(usize, used) + len > PAGE_USABLE) return null;
+        const dest = self.pageData(pno);
+        ph.used_bytes += @intCast(len);
+        ph.doc_count += 1;
+        return .{ .buf = dest[used..][0..len], .off = used };
+    }
+
     /// Read `len` bytes from page `pno` at usable-area offset `off`.
-    pub fn leafRead(self: *PageFile, pno: u32, off: u16, len: usize) []const u8 {
+    /// Returns null if the read would extend past the page boundary.
+    pub fn leafRead(self: *PageFile, pno: u32, off: u16, len: usize) ?[]const u8 {
+        if (@as(usize, off) + len > PAGE_USABLE) return null;
         const data = self.pageData(pno);
-        const end = @min(@as(usize, off) + len, PAGE_USABLE);
-        return data[off..end];
+        return data[off..][0..len];
     }
 
     /// Iterate all documents on a leaf page, calling `cb` for each raw record slice.

@@ -8,8 +8,9 @@ pub const HotCache = struct {
     hand: u32,
     hits: std.atomic.Value(u64),
     misses: std.atomic.Value(u64),
+    mutex: std.Thread.Mutex,
 
-    const CACHE_SIZE: u32 = 16384; // power of 2 for fast modulo
+    const CACHE_SIZE: u32 = 4096; // power of 2 for fast modulo
     const MASK: u32 = CACHE_SIZE - 1;
     const PROBE_LIMIT: u32 = 4;
 
@@ -35,11 +36,14 @@ pub const HotCache = struct {
         self.hand = 0;
         self.hits = std.atomic.Value(u64).init(0);
         self.misses = std.atomic.Value(u64).init(0);
+        self.mutex = .{};
         return self;
     }
 
     pub fn lookup(self: *HotCache, key_hash: u64) ?struct { page_no: u32, page_off: u16 } {
         if (key_hash == 0) return null; // 0 is our sentinel
+        self.mutex.lock();
+        defer self.mutex.unlock();
         const base = @as(u32, @truncate(key_hash)) & MASK;
         var i: u32 = 0;
         while (i < PROBE_LIMIT) : (i += 1) {
@@ -58,6 +62,8 @@ pub const HotCache = struct {
 
     pub fn insert(self: *HotCache, key_hash: u64, page_no: u32, page_off: u16) void {
         if (key_hash == 0) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
         const base = @as(u32, @truncate(key_hash)) & MASK;
         // Try to find existing or empty slot within probe window
         var i: u32 = 0;
@@ -88,6 +94,8 @@ pub const HotCache = struct {
 
     pub fn invalidate(self: *HotCache, key_hash: u64) void {
         if (key_hash == 0) return;
+        self.mutex.lock();
+        defer self.mutex.unlock();
         const base = @as(u32, @truncate(key_hash)) & MASK;
         var i: u32 = 0;
         while (i < PROBE_LIMIT) : (i += 1) {

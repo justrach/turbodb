@@ -17,12 +17,15 @@ const collection = @import("collection.zig");
 const Database = collection.Database;
 
 const MAX_REQ  = 65536;  // 64 KiB (initial read)
-const MAX_RESP = 131072; // 128 KiB
+const MAX_RESP = 65536; // 64 KiB
 const MAX_BODY = 65536;  // 64 KiB
-const MAX_BULK = 16 * 1024 * 1024; // 16 MiB for bulk inserts
+const MAX_BULK = 256 * 1024 * 1024; // 256 MiB for bulk inserts
 
 // Heap-allocated per-connection buffers (threadlocal pointers set in handleConn).
 // This avoids large threadlocal TLS segments that break in Release mode on macOS.
+// Note: connection threads use 2 MiB stacks (up from 256 KiB) because the
+// Collection.open call chain is deep and Zig's debug-mode stack probes need
+// headroom on macOS ARM64.  Production builds should use -Doptimize=ReleaseFast.
 const ConnBufs = struct {
     req:  [MAX_REQ]u8,
     resp: [MAX_RESP]u8,
@@ -111,11 +114,14 @@ pub const Server = struct {
             };
             // Reject if at connection limit to prevent OOM from thread exhaustion.
             if (self.active_conns.load(.monotonic) >= MAX_CONNECTIONS) {
+                // Return HTTP 503 instead of silent RST so clients can retry.
+                const reject = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 31\r\nConnection: close\r\n\r\n{\"error\":\"too many connections\"}";
+                conn.stream.writeAll(reject) catch {};
                 conn.stream.close();
                 _ = self.err_count.fetchAdd(1, .monotonic);
                 continue;
             }
-            const t = std.Thread.spawn(.{}, handleConnWrapped, .{self, conn}) catch {
+            const t = std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, handleConnWrapped, .{self, conn}) catch {
                 conn.stream.close();
                 _ = self.err_count.fetchAdd(1, .monotonic);
                 continue;
@@ -149,11 +155,13 @@ pub const Server = struct {
             const stream = std.net.Stream{ .handle = client_fd };
             const conn = std.net.Server.Connection{ .stream = stream, .address = std.net.Address.initUnix(path) catch continue };
             if (self.active_conns.load(.monotonic) >= MAX_CONNECTIONS) {
+                const reject = "HTTP/1.1 503 Service Unavailable\r\nContent-Length: 31\r\nConnection: close\r\n\r\n{\"error\":\"too many connections\"}";
+                conn.stream.writeAll(reject) catch {};
                 conn.stream.close();
                 _ = self.err_count.fetchAdd(1, .monotonic);
                 continue;
             }
-            const t = std.Thread.spawn(.{}, handleConnWrapped, .{ self, conn }) catch {
+            const t = std.Thread.spawn(.{ .stack_size = 2 * 1024 * 1024 }, handleConnWrapped, .{ self, conn }) catch {
                 conn.stream.close();
                 continue;
             };
@@ -223,38 +231,57 @@ fn handleConn(srv: *Server, conn: std.net.Server.Connection) void {
         if (n == 0) return;
         _ = srv.req_count.fetchAdd(1, .monotonic);
 
-        // For bulk inserts: read the full body based on Content-Length.
-        // The initial read may only contain part of a large body.
         const initial = bufs.req[0..n];
+
+        // WebSocket upgrade: switch to persistent framed mode.
+        if (headerContains(initial, "upgrade", "websocket")) {
+            handleWebSocket(srv, conn, initial) catch {};
+            return; // WS handler owns the connection until close
+        }
+
+        // Read the full body based on Content-Length if we don't have it yet.
         const content_length = extractContentLength(initial);
-        if (content_length > MAX_REQ and content_length <= MAX_BULK) {
-            // Check this is actually a bulk request before allocating
-            const is_bulk = std.mem.indexOf(u8, initial[0..@min(n, 256)], "/bulk") != null;
-            if (is_bulk) {
-                // Find where headers end
-                const header_end = if (std.mem.indexOf(u8, initial, "\r\n\r\n")) |p| p + 4
-                    else if (std.mem.indexOf(u8, initial, "\n\n")) |p| p + 2
-                    else n;
-                const total_size = header_end + content_length;
-                if (total_size <= MAX_BULK) {
-                    const big_buf = std.heap.page_allocator.alloc(u8, total_size) catch {
-                        const resp_len = dispatch(srv, initial, std.heap.page_allocator);
-                        conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
-                        continue;
-                    };
-                    defer std.heap.page_allocator.free(big_buf);
-                    @memcpy(big_buf[0..n], initial);
-                    // Read remaining bytes
-                    while (n < total_size) {
-                        const r = conn.stream.read(big_buf[n..total_size]) catch break;
-                        if (r == 0) break;
-                        n += r;
-                    }
-                    const resp_len = dispatch(srv, big_buf[0..n], std.heap.page_allocator);
+        const is_bulk = std.mem.indexOf(u8, initial[0..@min(n, 256)], "/bulk") != null;
+
+        if (content_length > MAX_REQ and content_length <= MAX_BULK and is_bulk) {
+            // Large bulk: allocate a big buffer and read the full body.
+            const header_end = if (std.mem.indexOf(u8, initial, "\r\n\r\n")) |p| p + 4
+                else if (std.mem.indexOf(u8, initial, "\n\n")) |p| p + 2
+                else n;
+            const total_size = header_end + content_length;
+            if (total_size <= MAX_BULK) {
+                const big_buf = std.heap.page_allocator.alloc(u8, total_size) catch {
+                    const resp_len = dispatch(srv, initial, std.heap.page_allocator);
                     conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
                     continue;
+                };
+                defer std.heap.page_allocator.free(big_buf);
+                @memcpy(big_buf[0..n], initial);
+                // Read remaining bytes
+                while (n < total_size) {
+                    const r = conn.stream.read(big_buf[n..total_size]) catch break;
+                    if (r == 0) break;
+                    n += r;
                 }
+                const resp_len = dispatch(srv, big_buf[0..n], std.heap.page_allocator);
+                conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
+                continue;
             }
+        } else if (content_length > 0 and content_length <= MAX_REQ) {
+            // Body fits in the req buffer but the initial read may not have
+            // received it all.  Keep reading until we have the full body.
+            const header_end = if (std.mem.indexOf(u8, initial, "\r\n\r\n")) |p| p + 4
+                else if (std.mem.indexOf(u8, initial, "\n\n")) |p| p + 2
+                else n;
+            const total_size = @min(header_end + content_length, bufs.req.len);
+            while (n < total_size) {
+                const r = conn.stream.read(bufs.req[n..total_size]) catch break;
+                if (r == 0) break;
+                n += r;
+            }
+            const resp_len = dispatch(srv, bufs.req[0..n], std.heap.page_allocator);
+            conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
+            continue;
         }
 
         const resp_len = dispatch(srv, initial, std.heap.page_allocator);
@@ -336,7 +363,7 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
         const q_raw = qparam(query, "q") orelse return err(400, "missing q parameter");
         var decode_buf: [4096]u8 = undefined;
         const q = urlDecode(q_raw, &decode_buf) orelse q_raw;
-        const limit_val: u32 = qparamInt(query, "limit") orelse 50;
+        const limit_val: u32 = @min(qparamInt(query, "limit") orelse 50, 500);
         return handleSearch(srv, requestTenant(raw, query), col_name, q, limit_val, alloc);
     }
 
@@ -346,7 +373,7 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
         const q_raw = qparam(query, "q") orelse return err(400, "missing q parameter");
         var decode_buf: [4096]u8 = undefined;
         const q = urlDecode(q_raw, &decode_buf) orelse q_raw;
-        const limit_val: u32 = qparamInt(query, "limit") orelse 20;
+        const limit_val: u32 = @min(qparamInt(query, "limit") orelse 20, 100);
         return handleDiscoverContext(srv, requestTenant(raw, query), col_name, q, limit_val, alloc);
     }
 
@@ -453,55 +480,109 @@ fn doInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []co
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
     const doc_id = col.insert(key, value) catch return err(500, "insert failed");
     srv.recordQueryCost(tenant_id, "insert", 1, value.len, start_ns);
+    var esc_key_buf: [1024]u8 = undefined;
+    var esc_col_buf: [1024]u8 = undefined;
+    var esc_tid_buf: [1024]u8 = undefined;
+    const esc_key = jsonEscape(key, &esc_key_buf);
+    const esc_col = jsonEscape(col_name, &esc_col_buf);
+    const esc_tid = jsonEscape(tenant_id, &esc_tid_buf);
     var fbs = std.io.fixedBufferStream(getBodyBuf());
     std.fmt.format(fbs.writer(),
         "{{\"doc_id\":{d},\"key\":\"{s}\",\"collection\":\"{s}\",\"tenant\":\"{s}\"}}",
-        .{ doc_id, key, col_name, tenant_id }) catch {};
+        .{ doc_id, esc_key, esc_col, esc_tid }) catch {};
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 
-/// POST /db/:col/bulk — insert multiple documents in one request.
-/// Body: NDJSON — one {"key":"...","value":"..."} per line.
-/// Response: {"inserted":N,"errors":M,"collection":"...","tenant":"..."}
-fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
-    _ = alloc;
-    const start_ns = std.time.nanoTimestamp();
-    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
-    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+/// SIMD-accelerated scan for the next newline byte starting at `start`.
+/// Uses 16-byte vector comparison (SSE2 on x86_64, NEON on aarch64).
+fn simdFindNewline(data: []const u8, start: usize) ?usize {
+    const VEC_LEN = 16;
+    const Vec = @Vector(VEC_LEN, u8);
+    const nl_vec: Vec = @splat('\n');
 
+    var pos = start;
+
+    // Vector scan: compare VEC_LEN bytes per iteration.
+    while (pos + VEC_LEN <= data.len) {
+        const chunk: Vec = data[pos..][0..VEC_LEN].*;
+        const mask: u16 = @bitCast(chunk == nl_vec);
+        if (mask != 0) return pos + @ctz(mask);
+        pos += VEC_LEN;
+    }
+
+    // Scalar tail for remaining bytes.
+    while (pos < data.len) : (pos += 1) {
+        if (data[pos] == '\n') return pos;
+    }
+    return null;
+}
+
+/// Shared NDJSON parse + insertBatch logic used by both HTTP and WS paths.
+const NdjsonResult = struct { inserted: u32, errors: u32, total_bytes: u64 };
+
+fn parseAndInsertNdjson(col: *collection.Collection, body: []const u8) NdjsonResult {
     var inserted: u32 = 0;
     var errors: u32 = 0;
     var total_bytes: u64 = 0;
 
-    // Parse NDJSON: iterate lines, each is a {"key":"...","value":...} object
+    // Keep outer batch small (32KB stack vs 128KB at 4096) — insertBatch
+    // handles its own internal chunking so throughput is the same.
+    const MaxLines = 1024;
+    var key_buf: [MaxLines][]const u8 = undefined;
+    var val_buf: [MaxLines][]const u8 = undefined;
+    var n_lines: usize = 0;
+
     var pos: usize = 0;
     while (pos < body.len) {
-        // Find end of line
-        const line_end = std.mem.indexOfScalarPos(u8, body, pos, '\n') orelse body.len;
+        const line_end = simdFindNewline(body, pos) orelse body.len;
         const line = std.mem.trim(u8, body[pos..line_end], " \t\r");
         pos = line_end + 1;
 
-        if (line.len < 2) continue; // skip empty lines
+        if (line.len < 2) continue;
 
-        // Extract key from this JSON line
         const key = jsonStr(line, "key") orelse continue;
-        // Extract value field; fall back to full line for backwards compat.
         const value = jsonValue(line, "value") orelse line;
 
-        _ = col.insert(key, value) catch {
-            errors += 1;
-            continue;
-        };
-        inserted += 1;
+        key_buf[n_lines] = key;
+        val_buf[n_lines] = value;
         total_bytes += line.len;
+        n_lines += 1;
+
+        if (n_lines >= MaxLines) {
+            const r = col.insertBatch(key_buf[0..n_lines], val_buf[0..n_lines]);
+            inserted += r.inserted;
+            errors += r.errors;
+            n_lines = 0;
+        }
     }
+    if (n_lines > 0) {
+        const r = col.insertBatch(key_buf[0..n_lines], val_buf[0..n_lines]);
+        inserted += r.inserted;
+        errors += r.errors;
+    }
+    return .{ .inserted = inserted, .errors = errors, .total_bytes = total_bytes };
+}
 
-    srv.recordQueryCost(tenant_id, "bulk_insert", inserted, total_bytes, start_ns);
+/// POST /db/:col/bulk — NDJSON batch insert with SIMD line scanning.
+fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
+    _ = alloc;
+    const start_ns = std.time.nanoTimestamp();
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    srv.db.ensureTenantStorageAvailable(tenant_id, body.len) catch return err(429, "tenant storage quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
 
+    const r = parseAndInsertNdjson(col, body);
+
+    srv.recordQueryCost(tenant_id, "bulk_insert", r.inserted, r.total_bytes, start_ns);
+
+    var esc_col_buf: [1024]u8 = undefined;
+    var esc_tid_buf: [1024]u8 = undefined;
+    const esc_col = jsonEscape(col_name, &esc_col_buf);
+    const esc_tid = jsonEscape(tenant_id, &esc_tid_buf);
     var fbs = std.io.fixedBufferStream(getBodyBuf());
     std.fmt.format(fbs.writer(),
         "{{\"inserted\":{d},\"errors\":{d},\"collection\":\"{s}\",\"tenant\":\"{s}\"}}",
-        .{ inserted, errors, col_name, tenant_id }) catch {};
+        .{ r.inserted, r.errors, esc_col, esc_tid }) catch {};
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, as_of: ?i64) usize {
@@ -520,14 +601,19 @@ fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []c
         var fbs = std.io.fixedBufferStream(resp[HEADER_RESERVE..]);
         const val = if (d.value.len > 0) d.value else "{}";
         const is_json = val.len > 0 and (val[0] == '{' or val[0] == '[' or val[0] == '"');
+        var esc_key_buf: [1024]u8 = undefined;
+        const esc_key = jsonEscape(d.key, &esc_key_buf);
         const w = fbs.writer();
         if (is_json) {
-            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}", .{ d.header.doc_id, d.key, d.header.version, val }) catch {};
+            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}", .{ d.header.doc_id, esc_key, d.header.version, val }) catch {};
         } else {
-            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":\"", .{ d.header.doc_id, d.key, d.header.version }) catch {};
+            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":\"", .{ d.header.doc_id, esc_key, d.header.version }) catch {};
             for (val) |ch| {
-                if (ch == '"' or ch == '\\') w.writeByte('\\') catch {};
+                if (ch == '"' or ch == '\\') { w.writeByte('\\') catch {}; w.writeByte(ch) catch {}; continue; }
                 if (ch == '\n') { w.writeAll("\\n") catch {}; continue; }
+                if (ch == '\r') { w.writeAll("\\r") catch {}; continue; }
+                if (ch == '\t') { w.writeAll("\\t") catch {}; continue; }
+                if (ch < 0x20) continue;
                 w.writeByte(ch) catch {};
             }
             w.writeAll("\"}") catch {};
@@ -543,7 +629,7 @@ fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []c
 
         // Move body right after headers (memmove if needed)
         if (hdr_len < HEADER_RESERVE) {
-            std.mem.copyForwards(u8, resp[hdr_len .. hdr_len + body_len], resp[HEADER_RESERVE .. HEADER_RESERVE + body_len]);
+            std.mem.copyBackwards(u8, resp[hdr_len .. hdr_len + body_len], resp[HEADER_RESERVE .. HEADER_RESERVE + body_len]);
         }
         return hdr_len + body_len;
     }
@@ -572,7 +658,7 @@ fn handleDelete(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: 
 
 fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_str: []const u8, as_of: ?i64, alloc: std.mem.Allocator) usize {
     const start_ns = std.time.nanoTimestamp();
-    const limit: u32 = qparamInt(query_str, "limit") orelse 20;
+    const limit: u32 = @min(qparamInt(query_str, "limit") orelse 20, 1000);
     const offset: u32 = qparamInt(query_str, "offset") orelse 0;
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
@@ -585,30 +671,55 @@ fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_s
     for (result.docs) |d| bytes_read += d.key.len + d.value.len;
     srv.recordQueryCost(tenant_id, "scan", result.docs.len, bytes_read, start_ns);
 
+    var esc_tid_buf: [1024]u8 = undefined;
+    var esc_col_buf: [1024]u8 = undefined;
+    const esc_tid = jsonEscape(tenant_id, &esc_tid_buf);
+    const esc_col = jsonEscape(col_name, &esc_col_buf);
     var fbs = std.io.fixedBufferStream(getBodyBuf());
     const w = fbs.writer();
     std.fmt.format(w, "{{\"tenant\":\"{s}\",\"collection\":\"{s}\",\"count\":{d},\"docs\":[",
-        .{ tenant_id, col_name, result.docs.len }) catch {};
+        .{ esc_tid, esc_col, result.docs.len }) catch {};
+    var truncated = false;
     for (result.docs, 0..) |d, i| {
+        const saved_pos = fbs.pos;
         if (i > 0) w.writeByte(',') catch {};
+        var esc_dk_buf: [1024]u8 = undefined;
+        const esc_dk = jsonEscape(d.key, &esc_dk_buf);
         const val = if (d.value.len > 0) d.value else "{}";
         const is_json = val.len > 0 and (val[0] == '{' or val[0] == '[' or val[0] == '"');
         if (is_json) {
-            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}", .{ d.header.doc_id, d.key, d.header.version, val }) catch {};
+            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}", .{ d.header.doc_id, esc_dk, d.header.version, val }) catch {};
         } else {
-            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":\"", .{ d.header.doc_id, d.key, d.header.version }) catch {};
+            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":\"", .{ d.header.doc_id, esc_dk, d.header.version }) catch {};
             for (val) |ch| {
-                if (ch == '"' or ch == '\\') w.writeByte('\\') catch {};
+                if (ch == '"' or ch == '\\') { w.writeByte('\\') catch {}; w.writeByte(ch) catch {}; continue; }
                 if (ch == '\n') { w.writeAll("\\n") catch {}; continue; }
+                if (ch == '\r') { w.writeAll("\\r") catch {}; continue; }
+                if (ch == '\t') { w.writeAll("\\t") catch {}; continue; }
+                if (ch < 0x20) continue;
                 w.writeByte(ch) catch {};
             }
             w.writeAll("\"}") catch {};
         }
+        // If this doc pushed us near the buffer limit, rewind to discard the
+        // partial write and stop — this prevents broken JSON in the response.
+        if (fbs.pos + 64 >= MAX_BODY) {
+            fbs.pos = saved_pos;
+            truncated = true;
+            break;
+        }
     }
     w.writeAll("]}") catch {};
+    if (truncated) {
+        // Overwrite the trailing '}' with ',"truncated":true}'
+        if (fbs.pos >= 1) {
+            fbs.pos -= 1; // back over '}'
+            w.writeAll(",\"truncated\":true}") catch {};
+        }
+    }
     return ok(getBodyBuf()[0..fbs.pos]);
-}
 
+}
 fn handleDrop(srv: *Server, tenant_id: []const u8, col_name: []const u8) usize {
     const start_ns = std.time.nanoTimestamp();
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
@@ -638,25 +749,43 @@ fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query
     std.fmt.format(w,
         "\",\"hits\":{d},\"candidates\":{d},\"total_docs\":{d},\"total_files\":{d},\"results\":[",
         .{ result.docs.len, result.candidate_paths.len, col.docCount(), result.total_files }) catch {};
+    var truncated = false;
     for (result.docs, 0..) |d, i| {
+        const saved_pos = fbs.pos;
         if (i > 0) w.writeByte(',') catch {};
         // Output value as valid JSON — objects/arrays as-is, strings quoted
+        var esc_dk_buf: [1024]u8 = undefined;
+        const esc_dk = jsonEscape(d.key, &esc_dk_buf);
         const val = if (d.value.len > 0) d.value else "{}";
         const is_json = val.len > 0 and (val[0] == '{' or val[0] == '[' or val[0] == '"');
         if (is_json) {
-            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":{s}}}", .{ d.header.doc_id, d.key, val }) catch {};
+            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":{s}}}", .{ d.header.doc_id, esc_dk, val }) catch {};
         } else {
             w.writeAll("{\"doc_id\":") catch {};
-            std.fmt.format(w, "{d},\"key\":\"{s}\",\"value\":\"", .{ d.header.doc_id, d.key }) catch {};
+            std.fmt.format(w, "{d},\"key\":\"{s}\",\"value\":\"", .{ d.header.doc_id, esc_dk }) catch {};
             for (val) |ch| {
-                if (ch == '"' or ch == '\\') w.writeByte('\\') catch {};
+                if (ch == '"' or ch == '\\') { w.writeByte('\\') catch {}; w.writeByte(ch) catch {}; continue; }
                 if (ch == '\n') { w.writeAll("\\n") catch {}; continue; }
+                if (ch == '\r') { w.writeAll("\\r") catch {}; continue; }
+                if (ch == '\t') { w.writeAll("\\t") catch {}; continue; }
+                if (ch < 0x20) continue;
                 w.writeByte(ch) catch {};
             }
             w.writeAll("\"}") catch {};
         }
+        if (fbs.pos + 64 >= MAX_BODY) {
+            fbs.pos = saved_pos;
+            truncated = true;
+            break;
+        }
     }
     w.writeAll("]}") catch {};
+    if (truncated) {
+        if (fbs.pos >= 1) {
+            fbs.pos -= 1;
+            w.writeAll(",\"truncated\":true}") catch {};
+        }
+    }
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 
@@ -681,16 +810,19 @@ fn handleDiscoverContext(srv: *Server, tenant_id: []const u8, col_name: []const 
     }
     w.writeAll("\",\"matching_files\":[") catch {};
     for (result.matching_files, 0..) |d, i| {
+        if (fbs.pos + 128 >= MAX_BODY) break;
         if (i > 0) w.writeByte(',') catch {};
         std.fmt.format(w, "{{\"key\":\"{s}\",\"size\":{d}}}", .{ d.key, d.value.len }) catch {};
     }
     w.writeAll("],\"related_files\":[") catch {};
     for (result.related_files, 0..) |d, i| {
+        if (fbs.pos + 128 >= MAX_BODY) break;
         if (i > 0) w.writeByte(',') catch {};
         std.fmt.format(w, "{{\"key\":\"{s}\"}}", .{d.key}) catch {};
     }
     w.writeAll("],\"test_files\":[") catch {};
     for (result.test_files, 0..) |d, i| {
+        if (fbs.pos + 128 >= MAX_BODY) break;
         if (i > 0) w.writeByte(',') catch {};
         std.fmt.format(w, "{{\"key\":\"{s}\"}}", .{d.key}) catch {};
     }
@@ -946,13 +1078,28 @@ fn respond(code: u16, status: []const u8, body: []const u8) usize {
 // ─── mini parsers ────────────────────────────────────────────────────────
 
 fn extractContentLength(raw: []const u8) usize {
-    // Case-insensitive search for Content-Length header
+    // Fully case-insensitive search for Content-Length header.
     const headers = raw[0..@min(raw.len, 2048)]; // only scan headers
-    const needle = "ontent-length: "; // skip first char for case insensitivity
     var i: usize = 0;
-    while (i + needle.len < headers.len) : (i += 1) {
-        if ((headers[i] == 'C' or headers[i] == 'c') and std.mem.eql(u8, headers[i + 1 .. i + 1 + needle.len], needle)) {
-            const start = i + 1 + needle.len;
+    while (i + 16 < headers.len) : (i += 1) {
+        if ((headers[i] == 'C' or headers[i] == 'c') and
+            (headers[i + 1] == 'o' or headers[i + 1] == 'O') and
+            (headers[i + 2] == 'n' or headers[i + 2] == 'N') and
+            (headers[i + 3] == 't' or headers[i + 3] == 'T') and
+            (headers[i + 4] == 'e' or headers[i + 4] == 'E') and
+            (headers[i + 5] == 'n' or headers[i + 5] == 'N') and
+            (headers[i + 6] == 't' or headers[i + 6] == 'T') and
+            headers[i + 7] == '-' and
+            (headers[i + 8] == 'L' or headers[i + 8] == 'l') and
+            (headers[i + 9] == 'e' or headers[i + 9] == 'E') and
+            (headers[i + 10] == 'n' or headers[i + 10] == 'N') and
+            (headers[i + 11] == 'g' or headers[i + 11] == 'G') and
+            (headers[i + 12] == 't' or headers[i + 12] == 'T') and
+            (headers[i + 13] == 'h' or headers[i + 13] == 'H') and
+            headers[i + 14] == ':')
+        {
+            var start = i + 15;
+            while (start < headers.len and (headers[start] == ' ' or headers[start] == '\t')) start += 1;
             var end = start;
             while (end < headers.len and headers[end] >= '0' and headers[end] <= '9') : (end += 1) {}
             if (end > start) {
@@ -961,6 +1108,56 @@ fn extractContentLength(raw: []const u8) usize {
         }
     }
     return 0;
+}
+
+/// Escape a string for safe JSON interpolation: `"` → `\"`, `\` → `\\`.
+/// Writes into the provided stack buffer; returns the escaped slice or the
+/// original string unchanged when no escaping is needed.
+fn jsonEscape(raw: []const u8, buf: *[1024]u8) []const u8 {
+    var needs_escape = false;
+    for (raw) |ch| {
+        if (ch == '"' or ch == '\\' or ch < 0x20) { needs_escape = true; break; }
+    }
+    if (!needs_escape) return raw;
+    var pos: usize = 0;
+    for (raw) |ch| {
+        if (ch == '"' or ch == '\\') {
+            if (pos + 2 > buf.len) return buf[0..pos];
+            buf[pos] = '\\';
+            buf[pos + 1] = ch;
+            pos += 2;
+        } else if (ch == '\n') {
+            if (pos + 2 > buf.len) return buf[0..pos];
+            buf[pos] = '\\';
+            buf[pos + 1] = 'n';
+            pos += 2;
+        } else if (ch == '\r') {
+            if (pos + 2 > buf.len) return buf[0..pos];
+            buf[pos] = '\\';
+            buf[pos + 1] = 'r';
+            pos += 2;
+        } else if (ch == '\t') {
+            if (pos + 2 > buf.len) return buf[0..pos];
+            buf[pos] = '\\';
+            buf[pos + 1] = 't';
+            pos += 2;
+        } else if (ch < 0x20) {
+            if (pos + 6 > buf.len) return buf[0..pos];
+            const hex = "0123456789abcdef";
+            buf[pos] = '\\';
+            buf[pos + 1] = 'u';
+            buf[pos + 2] = '0';
+            buf[pos + 3] = '0';
+            buf[pos + 4] = hex[ch >> 4];
+            buf[pos + 5] = hex[ch & 0x0f];
+            pos += 6;
+        } else {
+            if (pos + 1 > buf.len) return buf[0..pos];
+            buf[pos] = ch;
+            pos += 1;
+        }
+    }
+    return buf[0..pos];
 }
 
 fn jsonStr(json: []const u8, key: []const u8) ?[]const u8 {
@@ -972,8 +1169,13 @@ fn jsonStr(json: []const u8, key: []const u8) ?[]const u8 {
     while (start < json.len and (json[start] == ' ' or json[start] == '\t')) start += 1;
     if (start >= json.len or json[start] != '"') return null;
     start += 1; // skip opening quote
-    const end = std.mem.indexOfScalarPos(u8, json, start, '"') orelse return null;
-    return json[start..end];
+    // Scan for closing quote, skipping escaped quotes
+    var i = start;
+    while (i < json.len) : (i += 1) {
+        if (json[i] == '\\' and i + 1 < json.len) { i += 1; continue; }
+        if (json[i] == '"') return json[start..i];
+    }
+    return null;
 }
 
 // Extract a JSON value (string, object, array, number, bool, null) for the given key.
@@ -996,9 +1198,9 @@ fn jsonValue(json: []const u8, key: []const u8) ?[]const u8 {
         var i = start + 1;
         while (i < json.len) : (i += 1) {
             if (json[i] == '\\' and i + 1 < json.len) { i += 1; continue; }
-            if (json[i] == '"') break;
+            if (json[i] == '"') return json[start .. i + 1]; // include both quotes
         }
-        return json[start .. i + 1]; // include both quotes
+        return null; // unterminated string — don't read past buffer
     } else if (ch == '{' or ch == '[') {
         // Object or array — find matching close bracket
         const close: u8 = if (ch == '{') '}' else ']';
@@ -1082,6 +1284,389 @@ fn hexVal(c: u8) ?u4 {
     if (c >= 'a' and c <= 'f') return @intCast(c - 'a' + 10);
     if (c >= 'A' and c <= 'F') return @intCast(c - 'A' + 10);
     return null;
+}
+
+// ─── WebSocket ───────────────────────────────────────────────────────────
+
+/// Read exactly `buf.len` bytes from the stream, looping as needed.
+fn wsReadExact(conn: std.net.Server.Connection, buf: []u8) !void {
+    var filled: usize = 0;
+    while (filled < buf.len) {
+        const n = conn.stream.read(buf[filled..]) catch return error.ReadFailed;
+        if (n == 0) return error.ConnectionClosed;
+        filled += n;
+    }
+}
+/// Case-insensitive header value check.
+fn headerContains(raw: []const u8, name: []const u8, value: []const u8) bool {
+    const headers = raw[0..@min(raw.len, 4096)];
+    var i: usize = 0;
+    while (i + name.len + 2 < headers.len) : (i += 1) {
+        if (headers[i] == '\n') {
+            const line_start = i + 1;
+            if (line_start + name.len + 2 >= headers.len) continue;
+            var match = true;
+            for (0..name.len) |j| {
+                const a = headers[line_start + j];
+                const b = name[j];
+                const al = if (a >= 'A' and a <= 'Z') a + 32 else a;
+                const bl = if (b >= 'A' and b <= 'Z') b + 32 else b;
+                if (al != bl) { match = false; break; }
+            }
+            if (!match) continue;
+            if (headers[line_start + name.len] != ':') continue;
+            // Found header — check value (case-insensitive)
+            var vs = line_start + name.len + 1;
+            while (vs < headers.len and (headers[vs] == ' ' or headers[vs] == '\t')) vs += 1;
+            const ve = std.mem.indexOfScalarPos(u8, headers, vs, '\r') orelse
+                std.mem.indexOfScalarPos(u8, headers, vs, '\n') orelse headers.len;
+            const hval = headers[vs..ve];
+            if (hval.len < value.len) continue;
+            var vmatch = true;
+            for (0..value.len) |j| {
+                const a = hval[j];
+                const b = value[j];
+                const al = if (a >= 'A' and a <= 'Z') a + 32 else a;
+                const bl = if (b >= 'A' and b <= 'Z') b + 32 else b;
+                if (al != bl) { vmatch = false; break; }
+            }
+            if (vmatch) return true;
+        }
+    }
+    return false;
+}
+
+/// Extract a specific header value from raw HTTP request.
+fn headerValue(raw: []const u8, name: []const u8) ?[]const u8 {
+    const headers = raw[0..@min(raw.len, 4096)];
+    var i: usize = 0;
+    while (i + name.len + 2 < headers.len) : (i += 1) {
+        if (headers[i] == '\n') {
+            const ls = i + 1;
+            if (ls + name.len + 2 >= headers.len) continue;
+            var match = true;
+            for (0..name.len) |j| {
+                const a = headers[ls + j];
+                const b = name[j];
+                const al = if (a >= 'A' and a <= 'Z') a + 32 else a;
+                const bl = if (b >= 'A' and b <= 'Z') b + 32 else b;
+                if (al != bl) { match = false; break; }
+            }
+            if (!match) continue;
+            if (headers[ls + name.len] != ':') continue;
+            var vs = ls + name.len + 1;
+            while (vs < headers.len and (headers[vs] == ' ' or headers[vs] == '\t')) vs += 1;
+            const ve = std.mem.indexOfScalarPos(u8, headers, vs, '\r') orelse
+                std.mem.indexOfScalarPos(u8, headers, vs, '\n') orelse headers.len;
+            return headers[vs..ve];
+        }
+    }
+    return null;
+}
+
+const WS_MAGIC = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
+
+/// Perform WebSocket upgrade handshake, then loop reading WS frames.
+/// Each text message is a JSON request dispatched through the normal
+/// HTTP handler; the response body is sent back as a WS text frame.
+fn handleWebSocket(srv: *Server, conn: std.net.Server.Connection, initial: []const u8) !void {
+    // Extract Sec-WebSocket-Key
+    const ws_key = headerValue(initial, "Sec-WebSocket-Key") orelse return error.MissingKey;
+
+    // Compute accept hash: SHA1(key ++ magic), base64-encoded
+    var sha = std.crypto.hash.Sha1.init(.{});
+    sha.update(ws_key);
+    sha.update(WS_MAGIC);
+    const digest = sha.finalResult();
+    var accept_buf: [28]u8 = undefined;
+    const accept = std.base64.standard.Encoder.encode(&accept_buf, &digest);
+
+    // Send upgrade response
+    var resp_buf: [256]u8 = undefined;
+    const resp_len = std.fmt.bufPrint(&resp_buf,
+        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n",
+        .{accept}) catch return error.FormatFailed;
+    conn.stream.writeAll(resp_len) catch return error.WriteFailed;
+
+    // WebSocket frame loop — heap-allocate frame buffer (too large for stack).
+    const frame_buf = std.heap.page_allocator.alloc(u8, MAX_BULK) catch return error.OutOfMemory;
+    defer std.heap.page_allocator.free(frame_buf);
+    while (true) {
+        // Read frame header (2 bytes minimum)
+        var hdr: [14]u8 = undefined;
+        wsReadExact(conn, hdr[0..2]) catch return;
+        const fin = hdr[0] & 0x80 != 0;
+        const opcode = hdr[0] & 0x0F;
+        const masked = hdr[1] & 0x80 != 0;
+        var payload_len: u64 = hdr[1] & 0x7F;
+
+        if (opcode == 0x8) return; // close frame
+        if (opcode == 0x9) { // ping → pong
+            // Resolve the full payload length (may be extended).
+            var ping_len: u64 = payload_len;
+            if (ping_len == 126) {
+                wsReadExact(conn, hdr[2..4]) catch return;
+                ping_len = std.mem.readInt(u16, hdr[2..4], .big);
+            } else if (ping_len == 127) {
+                wsReadExact(conn, hdr[2..10]) catch return;
+                ping_len = std.mem.readInt(u64, hdr[2..10], .big);
+            }
+            // Read and discard mask key if present.
+            var ping_mask: [4]u8 = .{0, 0, 0, 0};
+            if (masked) wsReadExact(conn, &ping_mask) catch return;
+            // Read the ping payload so the stream stays synchronised.
+            const pl: usize = @intCast(ping_len);
+            if (pl > 0 and pl <= frame_buf.len) {
+                wsReadExact(conn, frame_buf[0..pl]) catch return;
+                // Unmask payload before echoing it back.
+                if (masked) {
+                    for (frame_buf[0..pl], 0..) |*b, j| b.* ^= ping_mask[j % 4];
+                }
+            }
+            // Send pong with the same payload.
+            var pong_hdr: [2]u8 = .{ 0x8A, @intCast(ping_len & 0x7F) };
+            conn.stream.writeAll(&pong_hdr) catch return;
+            if (pl > 0 and pl <= frame_buf.len) {
+                conn.stream.writeAll(frame_buf[0..pl]) catch return;
+            }
+            continue;
+        }
+
+        // Extended payload length
+        if (payload_len == 126) {
+            wsReadExact(conn, hdr[2..4]) catch return;
+            payload_len = std.mem.readInt(u16, hdr[2..4], .big);
+        } else if (payload_len == 127) {
+            wsReadExact(conn, hdr[2..10]) catch return;
+            payload_len = std.mem.readInt(u64, hdr[2..10], .big);
+        }
+
+        if (payload_len > MAX_BULK) {
+            wsWriteClose(conn, 1009); // message too big
+            return;
+        }
+
+        // Read mask key (4 bytes if masked)
+        var mask: [4]u8 = .{0, 0, 0, 0};
+        if (masked) wsReadExact(conn, &mask) catch return;
+
+        // Read payload
+        const plen: usize = @intCast(payload_len);
+        const payload = frame_buf[0..plen];
+        wsReadExact(conn, payload) catch return;
+
+        // Unmask
+        if (masked) {
+            for (payload, 0..) |*b, j| b.* ^= mask[j % 4];
+        }
+
+        _ = fin; // TODO: handle fragmented messages
+
+        if (opcode == 0x1) { // text frame
+            _ = srv.req_count.fetchAdd(1, .monotonic);
+
+            // STREAM mode: fire-and-forget bulk insert (no per-frame response).
+            if (payload.len >= 7 and std.mem.startsWith(u8, payload, "STREAM ")) {
+                handleWsStream(srv, conn, payload, frame_buf) catch return;
+                return; // stream handler owns the connection
+            }
+
+            // Normal WS dispatch (request-response).
+            const resp_body = wsDispatch(srv, payload);
+            wsWriteText(conn, resp_body) catch return;
+        }
+    }
+}
+
+/// Extract a `name=value` parameter from a space-separated string.
+fn extractParam(msg: []const u8, name: []const u8) ?[]const u8 {
+    const pos = std.mem.indexOf(u8, msg, name) orelse return null;
+    const start = pos + name.len;
+    const end = std.mem.indexOfScalarPos(u8, msg, start, ' ') orelse msg.len;
+    if (start >= end) return null;
+    return msg[start..end];
+}
+
+/// WebSocket streaming bulk insert — fire-and-forget NDJSON frames.
+/// Init frame: "STREAM /db/:col/bulk [tenant=X]"
+/// Data frames: NDJSON text (no per-frame response sent).
+/// Close frame: triggers final summary response.
+fn handleWsStream(srv: *Server, conn: std.net.Server.Connection, init_msg: []const u8, frame_buf: []u8) !void {
+    // Parse collection and tenant from init message.
+    const after_prefix = init_msg[7..]; // skip "STREAM "
+    const path_end = std.mem.indexOfScalar(u8, after_prefix, ' ') orelse after_prefix.len;
+    const path = after_prefix[0..path_end];
+    const params = if (path_end < after_prefix.len) after_prefix[path_end + 1 ..] else "";
+
+    // Extract collection name from /db/:col/bulk (or /db/:col).
+    if (!std.mem.startsWith(u8, path, "/db/")) {
+        wsWriteText(conn, "{\"error\":\"invalid stream path\"}") catch {};
+        wsWriteClose(conn, 1008);
+        return;
+    }
+    const after_db = path[4..];
+    const col_end = std.mem.indexOfScalar(u8, after_db, '/') orelse after_db.len;
+    const col_name = after_db[0..col_end];
+    if (col_name.len == 0) {
+        wsWriteText(conn, "{\"error\":\"missing collection name\"}") catch {};
+        wsWriteClose(conn, 1008);
+        return;
+    }
+
+    const tenant_id = extractParam(params, "tenant=") orelse collection.DEFAULT_TENANT;
+
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch {
+        wsWriteText(conn, "{\"error\":\"open collection failed\"}") catch {};
+        wsWriteClose(conn, 1011);
+        return;
+    };
+
+    // ACK — client waits for this before streaming.
+    wsWriteText(conn, "{\"status\":\"streaming\"}") catch return error.WriteFailed;
+
+    var total_inserted: u64 = 0;
+    var total_errors: u64 = 0;
+    var total_bytes: u64 = 0;
+    var frame_count: u64 = 0;
+    const start_ns = std.time.nanoTimestamp();
+
+    // Ensure billing is recorded even on connection drop.
+    defer srv.recordQueryCost(tenant_id, "ws_stream", @intCast(total_inserted), @intCast(total_bytes), start_ns);
+
+    // Frame loop — same structure as handleWebSocket but no per-frame response.
+    while (true) {
+        var hdr: [14]u8 = undefined;
+        wsReadExact(conn, hdr[0..2]) catch break;
+        const opcode = hdr[0] & 0x0F;
+        const masked = hdr[1] & 0x80 != 0;
+        var payload_len: u64 = hdr[1] & 0x7F;
+
+        if (opcode == 0x8) break; // close — end of stream
+        if (opcode == 0x9) { // ping → pong
+            var ping_len: u64 = payload_len;
+            if (ping_len == 126) {
+                wsReadExact(conn, hdr[2..4]) catch break;
+                ping_len = std.mem.readInt(u16, hdr[2..4], .big);
+            } else if (ping_len == 127) {
+                wsReadExact(conn, hdr[2..10]) catch break;
+                ping_len = std.mem.readInt(u64, hdr[2..10], .big);
+            }
+            var ping_mask: [4]u8 = .{ 0, 0, 0, 0 };
+            if (masked) wsReadExact(conn, &ping_mask) catch break;
+            const pl: usize = @intCast(ping_len);
+            if (pl > 0 and pl <= frame_buf.len) {
+                wsReadExact(conn, frame_buf[0..pl]) catch break;
+                if (masked) {
+                    for (frame_buf[0..pl], 0..) |*b, j| b.* ^= ping_mask[j % 4];
+                }
+            }
+            var pong_hdr: [2]u8 = .{ 0x8A, @intCast(ping_len & 0x7F) };
+            conn.stream.writeAll(&pong_hdr) catch break;
+            if (pl > 0 and pl <= frame_buf.len) {
+                conn.stream.writeAll(frame_buf[0..pl]) catch break;
+            }
+            continue;
+        }
+
+        // Extended payload length.
+        if (payload_len == 126) {
+            wsReadExact(conn, hdr[2..4]) catch break;
+            payload_len = std.mem.readInt(u16, hdr[2..4], .big);
+        } else if (payload_len == 127) {
+            wsReadExact(conn, hdr[2..10]) catch break;
+            payload_len = std.mem.readInt(u64, hdr[2..10], .big);
+        }
+
+        if (payload_len > MAX_BULK) {
+            wsWriteClose(conn, 1009);
+            break;
+        }
+
+        var mask: [4]u8 = .{ 0, 0, 0, 0 };
+        if (masked) wsReadExact(conn, &mask) catch break;
+
+        const plen: usize = @intCast(payload_len);
+        const payload = frame_buf[0..plen];
+        wsReadExact(conn, payload) catch break;
+
+        if (masked) {
+            for (payload, 0..) |*b, j| b.* ^= mask[j % 4];
+        }
+
+        // Process NDJSON frame (text or binary).
+        if (opcode == 0x1 or opcode == 0x2) {
+            srv.db.recordTenantOperation(tenant_id) catch break;
+            const r = parseAndInsertNdjson(col, payload);
+            total_inserted += r.inserted;
+            total_errors += r.errors;
+            total_bytes += r.total_bytes;
+            frame_count += 1;
+        }
+    }
+
+    // Send final summary before closing.
+    var summary_buf: [256]u8 = undefined;
+    const summary = std.fmt.bufPrint(&summary_buf,
+        "{{\"inserted\":{d},\"errors\":{d},\"frames\":{d}}}",
+        .{ total_inserted, total_errors, frame_count }) catch "{\"error\":\"format\"}";
+    wsWriteText(conn, summary) catch {};
+    wsWriteClose(conn, 1000);
+}
+
+
+/// Dispatch a WebSocket text message. Supports two formats:
+///   1. Raw HTTP: "METHOD /path\n{body}" — reuses dispatch()
+///   2. JSON ops: {"op":"insert","col":"c","key":"k","value":{}} (future)
+fn wsDispatch(srv: *Server, msg: []const u8) []const u8 {
+    // Wrap as a minimal HTTP request so we can reuse dispatch().
+    // Find first \n to split method+path from body.
+    const nl = std.mem.indexOfScalar(u8, msg, '\n') orelse msg.len;
+    const req_line = msg[0..nl];
+    const body = if (nl < msg.len) msg[nl + 1 ..] else "";
+
+    // Build HTTP/1.1 request with Content-Length.
+    // Heap-allocate since WS messages can be up to 16MB.
+    const needed = req_line.len + 64 + body.len;
+    const http_buf = std.heap.page_allocator.alloc(u8, needed) catch
+        return "{\"error\":\"request too large\"}";
+    defer std.heap.page_allocator.free(http_buf);
+    const http_len = std.fmt.bufPrint(http_buf,
+        "{s} HTTP/1.1\r\nContent-Length: {d}\r\n\r\n{s}",
+        .{ req_line, body.len, body }) catch return "{\"error\":\"request too large\"}";
+
+    const resp_len = dispatch(srv, http_len, std.heap.page_allocator);
+    const resp = getRespBuf()[0..resp_len];
+
+    // Strip HTTP headers from response, return just the body
+    if (std.mem.indexOf(u8, resp, "\r\n\r\n")) |p| return resp[p + 4 ..];
+    return resp;
+}
+
+fn wsWriteText(conn: std.net.Server.Connection, payload: []const u8) !void {
+    var hdr: [10]u8 = undefined;
+    hdr[0] = 0x81; // FIN + text
+    var hdr_len: usize = 2;
+    if (payload.len < 126) {
+        hdr[1] = @intCast(payload.len);
+    } else if (payload.len < 65536) {
+        hdr[1] = 126;
+        std.mem.writeInt(u16, hdr[2..4], @intCast(payload.len), .big);
+        hdr_len = 4;
+    } else {
+        hdr[1] = 127;
+        std.mem.writeInt(u64, hdr[2..10], @intCast(payload.len), .big);
+        hdr_len = 10;
+    }
+    try conn.stream.writeAll(hdr[0..hdr_len]);
+    try conn.stream.writeAll(payload);
+}
+
+fn wsWriteClose(conn: std.net.Server.Connection, code: u16) void {
+    var frame: [4]u8 = undefined;
+    frame[0] = 0x88; // FIN + close
+    frame[1] = 2;    // payload = 2 bytes (status code)
+    std.mem.writeInt(u16, frame[2..4], code, .big);
+    conn.stream.writeAll(&frame) catch {};
 }
 
 test "parse as_of accepts seconds and milliseconds" {

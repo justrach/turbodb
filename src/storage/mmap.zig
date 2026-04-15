@@ -4,22 +4,41 @@
 //! zero-copy; writes go through the page cache and are made durable
 //! by msync(MS_SYNC) at checkpoint time.
 //!
-//! Growth strategy: grow in GROW_CHUNK increments (256 MiB) to amortise
-//! ftruncate + remap syscalls.  On macOS (no mremap) we munmap and remap.
+//! Stability guarantee: we pre-reserve a large virtual address range
+//! (MAX_VA_SIZE) at open() time.  grow() extends the backing file and
+//! maps new pages into the *same* VA range with MAP_FIXED, so the base
+//! pointer never moves.  at() / slice() are therefore lock-free — no
+//! pointer can dangle because the mapping base is stable for the
+//! lifetime of the MmapFile.
 const std   = @import("std");
 const posix = std.posix;
 
-pub const GROW_CHUNK: usize = 256 * 1024 * 1024; // 256 MiB
+pub const GROW_CHUNK: usize = 64 * 1024 * 1024; // 64 MiB
 pub const PAGE_SIZE:  usize = 4096;
+
+/// OS minimum page alignment — on Apple Silicon this is 16384, on x86-64
+/// it is 4096.  All mmap pointers must satisfy this alignment.
+const OS_PAGE_ALIGN: usize = std.heap.page_size_min;
+
+/// 4 GiB virtual reservation.  Costs zero physical memory — pages are
+/// only materialised when backed by ftruncate + MAP_FIXED.
+pub const MAX_VA_SIZE: usize = 1024 * 1024 * 1024; // 1 GiB
 
 pub const MmapFile = struct {
     fd:       posix.fd_t,
-    ptr:      [*]align(PAGE_SIZE) u8,
-    len:      usize,        // logical data length
-    capacity: usize,        // mapped (file) length; >= len, multiple of PAGE_SIZE
-    /// Protects ptr/capacity against concurrent grow+read.
-    /// Writers (grow) take exclusive; readers (at/slice) take shared.
-    rw_lock:  std.Thread.RwLock,
+    /// Stable base pointer — lives for the entire VA reservation lifetime.
+    /// Never changes after open().
+    ptr:      [*]align(OS_PAGE_ALIGN) u8,
+    /// Logical data length.  Written by grow(), read by appendRecords() and
+    /// external callers.  Uses atomic ops to avoid a data race with
+    /// concurrent readers (no lock needed thanks to the stable VA range).
+    len:      std.atomic.Value(usize),
+    /// How many bytes of the VA range are currently file-backed and mapped
+    /// PROT_READ|PROT_WRITE.  Atomic so concurrent at()/slice() callers
+    /// can read without holding grow_mu.
+    capacity: std.atomic.Value(usize),
+    /// Serialises concurrent grow() calls.  NOT needed for readers.
+    grow_mu:  std.Thread.Mutex,
 
     // ── Open / Close ──────────────────────────────────────────────────────────
 
@@ -32,100 +51,131 @@ pub const MmapFile = struct {
         const existing: usize = @intCast(stat.size);
         const capacity = alignUp(
             @max(existing, @max(initial_size, GROW_CHUNK)),
-            PAGE_SIZE,
+            OS_PAGE_ALIGN,
         );
 
+        // 1. Reserve the full virtual address range (PROT_NONE, anonymous).
+        //    No physical memory is consumed — this just carves out VA space.
+        const reserve = try posix.mmap(
+            null, MAX_VA_SIZE,
+            posix.PROT.NONE,
+            .{ .TYPE = .PRIVATE, .ANONYMOUS = true },
+            -1, 0,
+        );
+        const base_ptr: [*]align(OS_PAGE_ALIGN) u8 = @alignCast(reserve.ptr);
+
+        // 2. Extend the backing file to `capacity` if needed.
         if (@as(usize, @intCast(stat.size)) < capacity)
             try posix.ftruncate(fd, @intCast(capacity));
 
-        const ptr = try posix.mmap(
-            null, capacity,
+        // 3. Map the file content over the start of the reserved range
+        //    with MAP_FIXED so the kernel places it exactly at base_ptr.
+        _ = try posix.mmap(
+            base_ptr, capacity,
             posix.PROT.READ | posix.PROT.WRITE,
-            .{ .TYPE = .SHARED },
+            .{ .TYPE = .SHARED, .FIXED = true },
             fd, 0,
         );
 
         return .{
             .fd       = fd,
-            .ptr      = ptr.ptr,
-            .len      = existing,
-            .capacity = capacity,
-            .rw_lock  = .{},
+            .ptr      = base_ptr,
+            .len      = std.atomic.Value(usize).init(existing),
+            .capacity = std.atomic.Value(usize).init(capacity),
+            .grow_mu  = .{},
         };
     }
 
     pub fn close(self: *MmapFile) void {
-        posix.munmap(@alignCast(self.ptr[0..self.capacity]));
+        // Unmap the entire VA reservation in one call.
+        posix.munmap(@alignCast(self.ptr[0..MAX_VA_SIZE]));
         posix.close(self.fd);
     }
 
     // ── Sync / Checkpoint ─────────────────────────────────────────────────────
 
-    pub fn syncAsync(self: MmapFile) void {
-        posix.msync(@alignCast(self.ptr[0..self.capacity]), posix.MSF.ASYNC) catch {};
+    pub fn syncAsync(self: *MmapFile) void {
+        const cap = self.capacity.load(.acquire);
+        posix.msync(@alignCast(self.ptr[0..cap]), posix.MSF.ASYNC) catch {};
     }
 
-    pub fn syncSync(self: MmapFile) !void {
-        try posix.msync(@alignCast(self.ptr[0..self.capacity]), posix.MSF.SYNC);
+    pub fn syncSync(self: *MmapFile) !void {
+        const cap = self.capacity.load(.acquire);
+        try posix.msync(@alignCast(self.ptr[0..cap]), posix.MSF.SYNC);
     }
 
     // ── Grow ──────────────────────────────────────────────────────────────────
 
-    /// Extend the logical length.  Remaps if needed (macOS: munmap + mmap).
-    /// Takes an exclusive lock so concurrent readers cannot hold stale pointers.
+    /// Extend the logical length.  If the file-backed region is too small,
+    /// extends the file and maps the new pages into the pre-reserved VA
+    /// range with MAP_FIXED.  The base pointer never changes.
     pub fn grow(self: *MmapFile, needed_len: usize) !void {
-        if (needed_len <= self.capacity) {
-            self.len = needed_len;
+        if (needed_len <= self.capacity.load(.acquire)) {
+            // Capacity is sufficient — just advance the logical length.
+            self.len.store(needed_len, .release);
             return;
         }
-        // Must remap — take exclusive lock to block readers during munmap/mmap.
-        self.rw_lock.lock();
-        defer self.rw_lock.unlock();
+
+        // Must extend capacity — serialise with other growers.
+        self.grow_mu.lock();
+        defer self.grow_mu.unlock();
+
         // Re-check after acquiring lock (another thread may have grown).
-        if (needed_len <= self.capacity) {
-            self.len = needed_len;
+        const cur_cap = self.capacity.load(.acquire);
+        if (needed_len <= cur_cap) {
+            self.len.store(needed_len, .release);
             return;
         }
-        const new_cap = alignUp(needed_len + GROW_CHUNK, PAGE_SIZE);
-        // Extend file
+
+        const old_cap = cur_cap;
+        const new_cap = alignUp(needed_len + GROW_CHUNK, OS_PAGE_ALIGN);
+
+        std.debug.assert(new_cap <= MAX_VA_SIZE);
+
+        // Extend the backing file.
         try posix.ftruncate(self.fd, @intCast(new_cap));
-        // Remap (macOS has no mremap; unmap then remap)
-        posix.munmap(@alignCast(self.ptr[0..self.capacity]));
-        const ptr = try posix.mmap(
-            null, new_cap,
+
+        // Map the NEW portion of the file into the pre-reserved VA range.
+        // MAP_FIXED overwrites the PROT_NONE reservation for this sub-range.
+        const delta = new_cap - old_cap;
+        _ = try posix.mmap(
+            @alignCast(self.ptr + old_cap), delta,
             posix.PROT.READ | posix.PROT.WRITE,
-            .{ .TYPE = .SHARED },
-            self.fd, 0,
+            .{ .TYPE = .SHARED, .FIXED = true },
+            self.fd, @intCast(old_cap),
         );
-        self.ptr      = ptr.ptr;
-        self.capacity = new_cap;
-        self.len      = needed_len;
+
+        self.capacity.store(new_cap, .release);
+        self.len.store(needed_len, .release);
     }
 
     // ── Typed access ──────────────────────────────────────────────────────────
 
     /// Return a pointer to the record at byte offset `off`.
-    /// Takes a shared lock so grow() cannot remap underneath us.
+    /// Lock-free: the base pointer is stable for the lifetime of the mapping.
     pub fn at(self: *MmapFile, comptime T: type, off: usize) *T {
-        self.rw_lock.lockShared();
-        defer self.rw_lock.unlockShared();
+        std.debug.assert(off + @sizeOf(T) <= self.capacity.load(.acquire));
         return @alignCast(@ptrCast(&self.ptr[off]));
     }
 
     /// Return a slice of T starting at byte offset `off`, `count` elements.
-    /// Takes a shared lock so grow() cannot remap underneath us.
+    /// Lock-free: the base pointer is stable for the lifetime of the mapping.
     pub fn slice(self: *MmapFile, comptime T: type, off: usize, count: usize) []T {
-        self.rw_lock.lockShared();
-        defer self.rw_lock.unlockShared();
+        std.debug.assert(off + count * @sizeOf(T) <= self.capacity.load(.acquire));
         return @as([*]T, @alignCast(@ptrCast(&self.ptr[off])))[0..count];
     }
 
     /// Append `count` new T-records after existing data; returns their base offset.
     pub fn appendRecords(self: *MmapFile, comptime T: type, count: usize) !usize {
-        const off  = alignUp(self.len, @alignOf(T));
+        const off  = alignUp(self.len.load(.acquire), @alignOf(T));
         const need = off + @sizeOf(T) * count;
         try self.grow(need);
         return off;
+    }
+
+    /// Read the logical data length (atomic, safe from any thread).
+    pub fn dataLen(self: *const MmapFile) usize {
+        return self.len.load(.acquire);
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────

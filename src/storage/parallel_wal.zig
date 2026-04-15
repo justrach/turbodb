@@ -20,6 +20,7 @@ pub const WALSegment = struct {
     fd: std.fs.File,
     buf: []align(4096) u8,
     pos: std.atomic.Value(u32),
+    completed: std.atomic.Value(u32), // tracks how far writes have actually finished
     flushed_pos: u32,
 
     pub const BUF_SIZE: u32 = 65536;
@@ -39,6 +40,7 @@ pub const WALSegment = struct {
             .fd = fd,
             .buf = buf,
             .pos = std.atomic.Value(u32).init(0),
+            .completed = std.atomic.Value(u32).init(0),
             .flushed_pos = 0,
         };
     }
@@ -56,8 +58,9 @@ pub const WALSegment = struct {
         // Reserve space atomically — lock-free.
         const offset = self.pos.fetchAdd(total, .monotonic);
         if (offset + total > BUF_SIZE) {
-            // Roll back so other threads see accurate remaining space.
-            _ = self.pos.fetchSub(total, .monotonic);
+            // Don't roll back — the segment is full. Other threads that already
+            // reserved valid offsets can still complete. A rollback via fetchSub
+            // races with concurrent fetchAdd and can corrupt offsets.
             return error.SegmentFull;
         }
 
@@ -70,20 +73,25 @@ pub const WALSegment = struct {
         // Write payload.
         @memcpy(self.buf[offset + ENTRY_HEADER_SIZE .. offset + total], data);
 
+        // Signal completion: spin until it's our turn, then advance `completed`.
+        // This ensures the flusher sees a contiguous range of finished writes.
+        while (self.completed.cmpxchgWeak(offset, offset + total, .release, .monotonic)) |_| {
+            std.atomic.spinLoopHint();
+        }
+
         return offset;
     }
 
     /// Flush dirty bytes to the underlying file. Called by the group-commit
     /// flusher — NOT per-transaction.
     pub fn flush(self: *WALSegment) !void {
-        const current = self.pos.load(.acquire);
-        if (current <= self.flushed_pos) return;
+        const safe = self.completed.load(.acquire);
+        if (safe <= self.flushed_pos) return;
 
-        const dirty = self.buf[self.flushed_pos..current];
-        const written = try self.fd.write(dirty);
-        if (written != dirty.len) return error.ShortWrite;
+        const dirty = self.buf[self.flushed_pos..safe];
+        try self.fd.writeAll(dirty);
 
-        self.flushed_pos = current;
+        self.flushed_pos = safe;
     }
 
     /// Fsync the segment file to durable storage.

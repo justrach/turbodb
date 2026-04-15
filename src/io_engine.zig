@@ -402,12 +402,14 @@ pub fn MpscRing(comptime T: type, comptime cap: usize) type {
         buf: [cap]T,
         head: std.atomic.Value(usize), // consumer reads from here
         tail: std.atomic.Value(usize), // producers write here (CAS)
+        ready: [cap]std.atomic.Value(u8), // per-slot readiness flag
 
         pub fn init() Self {
             return .{
                 .buf = undefined,
                 .head = std.atomic.Value(usize).init(0),
                 .tail = std.atomic.Value(usize).init(0),
+                .ready = [_]std.atomic.Value(u8){std.atomic.Value(u8).init(0)} ** cap,
             };
         }
 
@@ -418,11 +420,15 @@ pub fn MpscRing(comptime T: type, comptime cap: usize) type {
                 const h = self.head.load(.acquire);
                 const next = (t + 1) % cap;
                 if (next == h) return false; // full
+                // CAS to claim the slot
                 if (self.tail.cmpxchgWeak(t, next, .release, .monotonic) == null) {
+                    // We own slot t — write data, then publish via ready flag
                     self.buf[t] = item;
+                    self.ready[t].store(1, .release);
                     return true;
                 }
                 // CAS failed, retry.
+                std.atomic.spinLoopHint();
             }
         }
 
@@ -431,7 +437,10 @@ pub fn MpscRing(comptime T: type, comptime cap: usize) type {
             const h = self.head.load(.acquire);
             const t = self.tail.load(.acquire);
             if (h == t) return null; // empty
+            // Wait for producer to finish writing (check readiness)
+            if (self.ready[h].load(.acquire) != 1) return null;
             const item = self.buf[h];
+            self.ready[h].store(0, .release);
             self.head.store((h + 1) % cap, .release);
             return item;
         }

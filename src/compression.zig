@@ -35,7 +35,7 @@ pub fn compress(src: []const u8, dst: []u8) CompressionError!usize {
         return emitLiterals(src, 0, src.len, dst, 0);
     }
 
-    var hash_table: [HASH_SIZE]u16 = [_]u16{0} ** HASH_SIZE;
+    var hash_table: [HASH_SIZE]u32 = [_]u32{0} ** HASH_SIZE;
 
     var src_pos: usize = 0;
     var dst_pos: usize = 0;
@@ -47,7 +47,7 @@ pub fn compress(src: []const u8, dst: []u8) CompressionError!usize {
         // Hash current 4-byte sequence
         const h = hash4(src, src_pos);
         const match_pos: usize = hash_table[h];
-        hash_table[h] = @intCast(if (src_pos > std.math.maxInt(u16)) std.math.maxInt(u16) else src_pos);
+        hash_table[h] = @intCast(src_pos);
 
         // Check for match: must be within u16 offset range and actually match 4 bytes
         const offset = src_pos -% match_pos;

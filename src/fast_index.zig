@@ -35,6 +35,9 @@ pub const FastTrigramIndex = struct {
 
     allocator: std.mem.Allocator,
 
+    /// Mutex for concurrent access.
+    mu: std.Thread.Mutex = .{},
+
     /// Map a byte to the reduced 0-63 alphabet.
     /// a-z -> 0-25, 0-9 -> 26-35, _ -> 36, common punctuation -> 37-63, rest -> 63.
     fn charMap(c: u8) u6 {
@@ -120,9 +123,12 @@ pub const FastTrigramIndex = struct {
     }
 
     pub fn indexFile(self: *FastTrigramIndex, path: []const u8, content: []const u8) !void {
+        self.mu.lock();
+        defer self.mu.unlock();
+
         // If file was previously indexed, remove it first.
         if (self.path_to_id.contains(path)) {
-            self.removeFile(path);
+            self.removeFileInner(path);
         }
 
         // Allocate or recycle a file_id.
@@ -186,6 +192,12 @@ pub const FastTrigramIndex = struct {
     }
 
     pub fn removeFile(self: *FastTrigramIndex, path: []const u8) void {
+        self.mu.lock();
+        defer self.mu.unlock();
+        self.removeFileInner(path);
+    }
+
+    fn removeFileInner(self: *FastTrigramIndex, path: []const u8) void {
         const file_id = self.path_to_id.get(path) orelse return;
 
         // Remove file_id from each trigram's posting list.
@@ -226,8 +238,10 @@ pub const FastTrigramIndex = struct {
     }
 
     pub fn candidates(self: *FastTrigramIndex, query: []const u8, alloc: std.mem.Allocator) ?[]const []const u8 {
-        if (query.len < 3) return null;
+        self.mu.lock();
+        defer self.mu.unlock();
 
+        if (query.len < 3) return null;
         const tri_count = query.len - 2;
 
         // Collect unique trigram keys from query.

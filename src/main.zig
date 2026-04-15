@@ -111,8 +111,11 @@ pub fn main() !void {
 
     // ── configure auth ────────────────────────────────────────────────────
     if (auth_key) |key| {
-        _ = db.auth.addKey(key, "cli", .admin);
-        std.log.info("Auth enabled (--auth-key)", .{});
+        if (db.auth.addKey(key, "cli", .admin)) |_| {
+            std.log.info("Auth enabled (--auth-key)", .{});
+        } else {
+            std.log.err("Failed to add auth key: key store full (MAX_KEYS reached)", .{});
+        }
     }
 
     // ── replication setup ─────────────────────────────────────────────────

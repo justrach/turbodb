@@ -211,14 +211,15 @@ pub const Router = struct {
     };
 
     fn parseU16(s: []const u8) ?u16 {
+        if (s.len == 0) return null;
+        if (s[0] < '0' or s[0] > '9') return null;
         var val: u16 = 0;
         for (s) |c| {
             if (c >= '0' and c <= '9') {
-                val = val *% 10 +% (@as(u16, c) - '0');
+                val = std.math.mul(u16, val, 10) catch return null;
+                val = std.math.add(u16, val, @as(u16, c) - '0') catch return null;
             } else break;
         }
-        if (s.len == 0) return null;
-        if (s[0] < '0' or s[0] > '9') return null;
         return val;
     }
 

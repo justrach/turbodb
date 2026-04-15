@@ -490,9 +490,13 @@ pub const ART = struct {
             }
 
             if (mismatch < prefix_len) {
-                // Prefix mismatch: split the node
-                hdr.writeUnlock();
-                const new_node = try Node4.create(self.alloc);
+                // Prefix mismatch: split the node.
+                // Keep write lock held through the entire operation to prevent
+                // TOCTOU races (another thread modifying prefix between unlock/relock).
+                const new_node = Node4.create(self.alloc) catch |err| {
+                    hdr.writeUnlock();
+                    return err;
+                };
 
                 // New node's prefix is the common part
                 new_node.header.prefix_len = @intCast(mismatch);
@@ -508,7 +512,6 @@ pub const ART = struct {
                 }
 
                 // Adjust existing node's prefix (remove consumed part)
-                hdr.writeLock();
                 const remaining = prefix_len - mismatch - 1;
                 if (remaining > 0 and mismatch + 1 < MAX_PREFIX_LEN) {
                     var dst: [MAX_PREFIX_LEN]u8 = [_]u8{0} ** MAX_PREFIX_LEN;

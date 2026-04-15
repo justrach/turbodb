@@ -113,10 +113,14 @@ pub const WAL = struct {
     cond:         std.Thread.Condition,
     synced_lsn:   u64,
     flushing:     bool,
+    io_err_flag:  bool,
 
     // Background flusher
     flush_thread: ?std.Thread,
     flush_running: std.atomic.Value(bool),
+
+    /// Backpressure: block writers if pending buffer exceeds this.
+    const MAX_WRITE_BUF: usize = 8 * 1024 * 1024; // 8 MiB
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -134,6 +138,7 @@ pub const WAL = struct {
             .cond          = .{},
             .synced_lsn    = 0,
             .flushing      = false,
+            .io_err_flag   = false,
             .flush_thread  = null,
             .flush_running = std.atomic.Value(bool).init(false),
         };
@@ -175,9 +180,30 @@ pub const WAL = struct {
         self.write_buf = .empty;
         self.mu.unlock();
 
-        self.file.writeAll(to_write.items) catch {};
+        // Write entries to file.  If writeAll fails, re-queue the buffer so
+        // entries are retried on the next flush cycle instead of being lost.
+        self.file.writeAll(to_write.items) catch |e| {
+            self.mu.lock();
+            // Prepend failed entries before any new writes that arrived.
+            to_write.appendSlice(self.allocator, self.write_buf.items) catch {};
+            self.write_buf.deinit(self.allocator);
+            self.write_buf = to_write;
+            self.io_err_flag = true;
+            self.flushing = false;
+            self.cond.broadcast();
+            self.mu.unlock();
+            std.log.err("WAL flushPending write error: {}", .{e});
+            return;
+        };
         to_write.deinit(self.allocator);
-        self.file.sync() catch {};
+
+        // Data is in the file.  fsync for durability — if sync fails the data
+        // is still in the kernel page cache (and the file), so advance
+        // synced_lsn either way to avoid permanently stalling the WAL.
+        self.file.sync() catch |e| {
+            self.io_err_flag = true;
+            std.log.err("WAL flushPending sync error (data written, not fsynced): {}", .{e});
+        };
 
         self.mu.lock();
         self.synced_lsn = target;
@@ -201,6 +227,7 @@ pub const WAL = struct {
 
     /// Encode an entry into the shared write buffer and return its LSN.
     /// Thread-safe.  Does NOT guarantee durability — call commit(lsn) for that.
+    /// Blocks if write buffer exceeds MAX_WRITE_BUF to apply backpressure.
     pub fn write(
         self:    *WAL,
         txn_id:  u64,
@@ -226,11 +253,68 @@ pub const WAL = struct {
         hdr.crc32 = entryChecksum(hdr_bytes, payload);
 
         self.mu.lock();
+        // Backpressure: wait until flusher drains the buffer below threshold.
+        // Use condition variable instead of yield-loop so the flusher can wake us.
+        while (self.write_buf.items.len >= MAX_WRITE_BUF) {
+            // Release lock and wait for flusher to signal.
+            self.cond.wait(&self.mu);
+        }
         defer self.mu.unlock();
         try self.write_buf.appendSlice(self.allocator, std.mem.asBytes(&hdr));
         try self.write_buf.appendSlice(self.allocator, payload);
         if (pad > 0) try self.write_buf.appendNTimes(self.allocator, 0, pad);
         return lsn;
+    }
+
+    /// Batch write: append N entries under a single lock acquisition.
+    /// All entries share the same op/txn_id/db_tag/flags.
+    /// More efficient than calling write() in a loop for bulk inserts.
+    pub fn writeBatch(
+        self:     *WAL,
+        txn_id:  u64,
+        op:      OpCode,
+        db_tag:  u8,
+        flags:   u16,
+        payloads: []const []const u8,
+    ) !void {
+        if (payloads.len == 0) return;
+
+        // Pre-compute total buffer size needed.
+        var total_size: usize = 0;
+        for (payloads) |p| {
+            total_size += HEADER_SIZE + p.len + paddingTo8(HEADER_SIZE + p.len);
+        }
+
+        self.mu.lock();
+        while (self.write_buf.items.len >= MAX_WRITE_BUF) {
+            self.cond.wait(&self.mu);
+        }
+        defer self.mu.unlock();
+
+        // Reserve all space at once — avoids per-entry ArrayList growth checks.
+        try self.write_buf.ensureUnusedCapacity(self.allocator, total_size);
+
+        for (payloads) |payload| {
+            const lsn = self.next_lsn.fetchAdd(1, .monotonic);
+            const pad = paddingTo8(HEADER_SIZE + payload.len);
+
+            var hdr = EntryHeader{
+                .lsn      = lsn,
+                .length   = @intCast(payload.len),
+                .crc32    = 0,
+                .op_code  = @intFromEnum(op),
+                .db_tag   = db_tag,
+                .flags    = flags,
+                .txn_id   = txn_id,
+                .reserved = 0,
+            };
+            const hdr_bytes = std.mem.asBytes(&hdr);
+            hdr.crc32 = entryChecksum(hdr_bytes, payload);
+
+            self.write_buf.appendSliceAssumeCapacity(std.mem.asBytes(&hdr));
+            self.write_buf.appendSliceAssumeCapacity(payload);
+            if (pad > 0) self.write_buf.appendNTimesAssumeCapacity(0, pad);
+        }
     }
 
     /// Mark a transaction committed.  Returns only after the entry is durable.
@@ -266,45 +350,104 @@ pub const WAL = struct {
         self.mu.unlock();
 
         // ── I/O outside lock ──────────────────────────────────────────────────
-        var io_err: ?anyerror = null;
-        self.file.writeAll(to_write.items) catch |e| { io_err = e; };
+        // If writeAll fails, re-queue the buffer so entries survive for retry.
+        self.file.writeAll(to_write.items) catch |e| {
+            self.mu.lock();
+            to_write.appendSlice(self.allocator, self.write_buf.items) catch {};
+            self.write_buf.deinit(self.allocator);
+            self.write_buf = to_write;
+            self.flushing = false;
+            self.cond.broadcast();
+            self.mu.unlock();
+            return e;
+        };
         to_write.deinit(self.allocator);
-        if (io_err == null) self.file.sync() catch |e| { io_err = e; };
+
+        // Data written — fsync for durability.  If sync fails, still advance
+        // synced_lsn (data is in page cache) but return the error to caller.
+        var sync_err: ?anyerror = null;
+        self.file.sync() catch |e| { sync_err = e; };
         // ─────────────────────────────────────────────────────────────────────
 
         self.mu.lock();
-        if (io_err == null) self.synced_lsn = target;
+        self.synced_lsn = target;
         self.flushing = false;
         self.cond.broadcast();
         self.mu.unlock();
 
-        if (io_err) |e| return e;
+        if (sync_err) |e| return e;
     }
 
     // ── Checkpoint ────────────────────────────────────────────────────────────
 
-    /// Write a checkpoint barrier entry and update checkpoint_lsn.
+    /// Write a checkpoint barrier entry, flush, then truncate the WAL file.
+    /// After checkpoint all data is durable in page files, so the WAL can be
+    /// safely cleared to reclaim disk space.
     pub fn checkpoint(self: *WAL, db_tag: u8) !void {
         var p: [8]u8 = undefined;
         std.mem.writeInt(u64, &p, self.checkpoint_lsn, .little);
         const lsn = try self.write(0, .checkpoint, db_tag, FLAG_COMMIT, &p);
         self.checkpoint_lsn = lsn;
-        // Force flush
+
+        // Swap write buffer under lock, then release so writers can continue
+        // appending to the fresh buffer while we flush + sync.
         self.mu.lock();
         self.flushing = true;
         var to_write = self.write_buf;
         self.write_buf = .empty;
+        self.cond.broadcast(); // wake writers waiting on full buffer
         self.mu.unlock();
-        self.file.writeAll(to_write.items) catch {};
+
+        // ── I/O without lock (writers append to new write_buf concurrently) ──
+        var io_err: ?anyerror = null;
+        self.file.writeAll(to_write.items) catch |e| {
+            io_err = e;
+        };
         to_write.deinit(self.allocator);
-        try self.file.sync();
+
+        if (io_err) |e| {
+            self.mu.lock();
+            self.io_err_flag = true;
+            self.flushing = false;
+            self.cond.broadcast();
+            self.mu.unlock();
+            std.log.err("WAL checkpoint write error: {}", .{e});
+            return e;
+        }
+
+        self.file.sync() catch |e| {
+            self.mu.lock();
+            self.io_err_flag = true;
+            self.flushing = false;
+            self.cond.broadcast();
+            self.mu.unlock();
+            std.log.err("WAL checkpoint sync error: {}", .{e});
+            return e;
+        };
+
+        // Reacquire lock for truncation + state update.
         self.mu.lock();
+        defer self.mu.unlock();
+
+        self.file.seekTo(0) catch |e| {
+            self.io_err_flag = true;
+            self.flushing = false;
+            self.cond.broadcast();
+            std.log.err("WAL checkpoint seekTo error: {}", .{e});
+            return e;
+        };
+        self.file.setEndPos(0) catch |e| {
+            self.io_err_flag = true;
+            self.flushing = false;
+            self.cond.broadcast();
+            std.log.err("WAL checkpoint setEndPos error: {}", .{e});
+            return e;
+        };
+
         self.synced_lsn = lsn;
         self.flushing = false;
         self.cond.broadcast();
-        self.mu.unlock();
     }
-
     // ── Recovery ──────────────────────────────────────────────────────────────
 
     /// Replay WAL from the beginning.  apply_fn is called for every committed

@@ -131,10 +131,15 @@ pub const VersionChain = struct {
     /// Begin a read transaction pinned at the current epoch.
     pub fn beginRead(self: *VersionChain) ReadTxn {
         const epoch = self.current_epoch.load(.acquire);
-        // Pin: ensure min_active_epoch doesn't advance past us.
-        const min = self.min_active_epoch.load(.acquire);
-        if (epoch < min) {
-            self.min_active_epoch.store(epoch, .release);
+        // Pin: atomically update min_active_epoch only if our epoch is smaller.
+        // Uses cmpxchgWeak in a loop to avoid the load-then-store race where
+        // two threads could both read the old min and one's store gets lost.
+        var min = self.min_active_epoch.load(.acquire);
+        while (epoch < min) {
+            if (self.min_active_epoch.cmpxchgWeak(min, epoch, .release, .monotonic)) |actual| {
+                min = actual;
+                std.atomic.spinLoopHint();
+            } else break;
         }
         return ReadTxn{
             .epoch = epoch,
@@ -152,10 +157,13 @@ pub const VersionChain = struct {
 
     /// Garbage-collect versions older than min_active_epoch.
     /// Returns the number of versions freed.
+    /// If any keep.append fails (OOM), the original all_versions is restored
+    /// and 0 is returned — no entries are lost.
     pub fn gc(self: *VersionChain, alloc: Allocator) u64 {
         const min_epoch = self.min_active_epoch.load(.acquire);
         var freed: u64 = 0;
         var keep: std.ArrayList(VersionEntry) = .empty;
+        var oom = false;
 
         var i: usize = 0;
         while (i < self.all_versions.items.len) : (i += 1) {
@@ -166,10 +174,33 @@ pub const VersionChain = struct {
                 false;
 
             if (!is_latest and entry.ver.epoch < min_epoch) {
-                _ = self.history.remove(chainKey(entry.ver.page_no, entry.ver.page_off));
                 freed += 1;
             } else {
-                keep.append(alloc, .{ .doc_id = entry.doc_id, .ver = entry.ver }) catch {};
+                keep.append(alloc, .{ .doc_id = entry.doc_id, .ver = entry.ver }) catch {
+                    oom = true;
+                    break;
+                };
+            }
+        }
+
+        if (oom) {
+            // OOM during keep build — discard partial keep list and leave
+            // the original all_versions intact so no entries are lost.
+            keep.deinit(alloc);
+            return 0;
+        }
+
+        // Only remove history entries for versions we are actually freeing.
+        i = 0;
+        while (i < self.all_versions.items.len) : (i += 1) {
+            const entry = self.all_versions.items[i];
+            const is_latest = if (self.latest.get(entry.doc_id)) |cur|
+                cur.page_no == entry.ver.page_no and cur.page_off == entry.ver.page_off
+            else
+                false;
+
+            if (!is_latest and entry.ver.epoch < min_epoch) {
+                _ = self.history.remove(chainKey(entry.ver.page_no, entry.ver.page_off));
             }
         }
 

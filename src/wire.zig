@@ -23,18 +23,19 @@ const STATUS_NOT_FOUND: u8 = 0x01;
 const STATUS_ERROR: u8 = 0x02;
 
 const HDR: usize = 5;
-const MAX_FRAME: usize = 1048576;
+const MAX_FRAME: usize = RD_BUF;
 const RD_BUF: usize = 65536;
 const WR_BUF: usize = 131072;
-
+const MAX_WIRE_CONNECTIONS: u32 = 512;
 pub const WireServer = struct {
     db: *Database,
     port: u16,
     running: std.atomic.Value(bool),
     activity: activity.ActivityTracker,
+    conn_count: std.atomic.Value(u32),
 
     pub fn init(db: *Database, port: u16) WireServer {
-        return .{ .db = db, .port = port, .running = std.atomic.Value(bool).init(false), .activity = activity.ActivityTracker.init() };
+        return .{ .db = db, .port = port, .running = std.atomic.Value(bool).init(false), .activity = activity.ActivityTracker.init(), .conn_count = std.atomic.Value(u32).init(0) };
     }
 
     pub fn run(self: *WireServer) !void {
@@ -45,7 +46,16 @@ pub const WireServer = struct {
         std.log.info("TurboDB wire protocol on :{d}", .{self.port});
         while (self.running.load(.acquire)) {
             const conn = listener.accept() catch continue;
-            const t = std.Thread.spawn(.{}, handleConn, .{ self, conn }) catch continue;
+            if (self.conn_count.load(.acquire) >= MAX_WIRE_CONNECTIONS) {
+                conn.stream.close();
+                continue;
+            }
+            _ = self.conn_count.fetchAdd(1, .acq_rel);
+            const t = std.Thread.spawn(.{}, handleConn, .{ self, conn }) catch {
+                _ = self.conn_count.fetchSub(1, .acq_rel);
+                conn.stream.close();
+                continue;
+            };
             t.detach();
         }
     }
@@ -75,7 +85,16 @@ pub const WireServer = struct {
             const client_fd = std.posix.accept(fd, @ptrCast(&client_addr), &addr_len, 0) catch continue;
             const stream = std.net.Stream{ .handle = client_fd };
             const conn = std.net.Server.Connection{ .stream = stream, .address = std.net.Address.initUnix(path) catch continue };
-            const t = std.Thread.spawn(.{}, handleConn, .{ self, conn }) catch continue;
+            if (self.conn_count.load(.acquire) >= MAX_WIRE_CONNECTIONS) {
+                conn.stream.close();
+                continue;
+            }
+            _ = self.conn_count.fetchAdd(1, .acq_rel);
+            const t = std.Thread.spawn(.{}, handleConn, .{ self, conn }) catch {
+                _ = self.conn_count.fetchSub(1, .acq_rel);
+                conn.stream.close();
+                continue;
+            };
             t.detach();
         }
     }
@@ -89,19 +108,27 @@ const Bufs = struct { rd: [RD_BUF]u8, wr: [WR_BUF]u8 };
 
 fn handleConn(srv: *WireServer, conn: std.net.Server.Connection) void {
     defer conn.stream.close();
+    defer _ = srv.conn_count.fetchSub(1, .acq_rel);
     const bufs = std.heap.page_allocator.create(Bufs) catch return;
     defer std.heap.page_allocator.destroy(bufs);
 
-    // Pre-resolve the most common collection for the fast path
-    var cached_col: ?*collection_mod.Collection = null;
+    // Cache only the collection name for fast-path lookups; the pointer
+    // is re-resolved every time via lookupCollection (O(1) RwLock + HashMap)
+    // to avoid dangling pointers when another connection drops a collection.
     var cached_col_name: [128]u8 = undefined;
     var cached_col_len: usize = 0;
 
     var rp: usize = 0;
 
     while (true) {
-        if (rp >= RD_BUF) rp = 0;
-        const n = conn.stream.read(bufs.rd[rp..]) catch return;
+        // Clamp read to remaining buffer space.
+        const remaining = RD_BUF - rp;
+        if (remaining == 0) {
+            // Buffer full with an incomplete frame — the frame is larger
+            // than RD_BUF so it can never be processed.  Close connection.
+            return;
+        }
+        const n = conn.stream.read(bufs.rd[rp..RD_BUF]) catch return;
         if (n == 0) return;
         rp += n;
 
@@ -116,12 +143,12 @@ fn handleConn(srv: *WireServer, conn: std.net.Server.Connection) void {
             // ── FAST PATH: inline GET with zero-copy ──
             if (op == OP_GET) {
                 srv.activity.recordQuery();
-                const wn = fastGet(srv, payload, &bufs.wr, &cached_col, &cached_col_name, &cached_col_len);
+                const wn = fastGet(srv, payload, &bufs.wr, &cached_col_name, &cached_col_len);
                 conn.stream.writeAll(bufs.wr[0..wn]) catch return;
             } else {
-                // Invalidate collection cache on writes
+                // Invalidate collection name cache on writes
                 if (op == OP_INSERT or op == OP_UPDATE or op == OP_DELETE) {
-                    cached_col = null;
+                    cached_col_len = 0;
                 }
                 srv.activity.recordQuery();
                 const wn = dispatch(srv, op, payload, &bufs.wr);
@@ -141,26 +168,23 @@ fn fastGet(
     srv: *WireServer,
     p: []const u8,
     w: *[WR_BUF]u8,
-    cached_col: *?*collection_mod.Collection,
     cached_name: *[128]u8,
     cached_len: *usize,
 ) usize {
     const a = parseKey(p) orelse return errResp(w, OP_GET, STATUS_ERROR);
 
-    // Fast collection lookup: skip mutex if same collection as last call
-    const col = blk: {
-        if (cached_col.*) |cc| {
-            if (cached_len.* == a.col.len and std.mem.eql(u8, cached_name[0..cached_len.*], a.col)) {
-                break :blk cc;
-            }
+    // Always re-resolve the collection pointer via lookupCollection to
+    // avoid dangling pointers.  The DB's internal path (RwLock read +
+    // HashMap get) is already O(1), so the overhead is negligible.
+    // We still cache the name so callers can invalidate on writes.
+    if (cached_len.* != a.col.len or !std.mem.eql(u8, cached_name[0..cached_len.*], a.col)) {
+        if (a.col.len <= cached_name.len) {
+            @memcpy(cached_name[0..a.col.len], a.col);
+            cached_len.* = a.col.len;
         }
-        const c = lookupCollection(srv, a.col) catch return errResp(w, OP_GET, STATUS_ERROR);
-        @memcpy(cached_name[0..a.col.len], a.col);
-        cached_len.* = a.col.len;
-        cached_col.* = c;
-        break :blk c;
-    };
+    }
 
+    const col = lookupCollection(srv, a.col) catch return errResp(w, OP_GET, STATUS_ERROR);
     const d = col.get(a.key) orelse return errResp(w, OP_GET, STATUS_NOT_FOUND);
 
     // Write response: [len:4][op:1][status:1][doc_id:8][ver:1][val_len:4][val:N]
@@ -275,7 +299,8 @@ fn doScan(srv: *WireServer, p: []const u8, w: *[WR_BUF]u8) usize {
     var pos: usize = HDR + 1 + 4; // header + status + count
     w[4] = OP_SCAN;
     w[5] = STATUS_OK;
-    wrU32LE(w[6..10], @intCast(result.docs.len));
+    // Count placeholder — will be overwritten after the loop
+    var written_count: u32 = 0;
 
     for (result.docs) |d| {
         const dsz = 8 + 1 + 2 + d.key.len + 4 + d.value.len;
@@ -288,7 +313,11 @@ fn doScan(srv: *WireServer, p: []const u8, w: *[WR_BUF]u8) usize {
         if (d.value.len > 0)
             @memcpy(w[pos + 15 + d.key.len ..][0..d.value.len], d.value);
         pos += dsz;
+        written_count += 1;
     }
+    // Write the actual count of docs serialized (may be less than result.docs.len
+    // if the write buffer was exhausted)
+    wrU32LE(w[6..10], written_count);
     wrU32BE(w, @intCast(pos));
     return pos;
 }
