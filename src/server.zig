@@ -525,7 +525,9 @@ fn parseAndInsertNdjson(col: *collection.Collection, body: []const u8) NdjsonRes
     var errors: u32 = 0;
     var total_bytes: u64 = 0;
 
-    const MaxLines = 4096;
+    // Keep outer batch small (32KB stack vs 128KB at 4096) — insertBatch
+    // handles its own internal chunking so throughput is the same.
+    const MaxLines = 1024;
     var key_buf: [MaxLines][]const u8 = undefined;
     var val_buf: [MaxLines][]const u8 = undefined;
     var n_lines: usize = 0;
