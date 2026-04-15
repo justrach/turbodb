@@ -497,16 +497,23 @@ pub const Collection = struct {
         const count = @min(keys.len, values.len);
 
         // Phase 1: encode + write pages (no shared lock needed — page-level locking).
-        const MaxBatch = 1024;
+        // Increased from 1024 to match server-side MaxLines (4096) — one flush per HTTP batch.
+        const MaxBatch = 4096;
         var entries: [MaxBatch]BTreeEntry = undefined;
         var doc_ids: [MaxBatch]u64 = undefined;
         var hashes: [MaxBatch]u64 = undefined;
+        var wal_payloads: [MaxBatch][]const u8 = undefined;
         var batch_n: usize = 0;
+
+        // Cache current leaf page — avoid per-doc findOrAllocLeaf scan.
+        var current_leaf: u32 = 0;
+        var leaf_valid = false;
 
         var i: usize = 0;
         while (i < count) : (i += 1) {
             if (batch_n >= MaxBatch) {
-                // Flush accumulated batch to indexes.
+                // Flush WAL batch (single lock), then index batch.
+                self.wal_log.writeBatch(0, .doc_insert, 0, 0, wal_payloads[0..batch_n]) catch {};
                 self.flushBatch(entries[0..batch_n], doc_ids[0..batch_n], hashes[0..batch_n], keys, values, i - batch_n);
                 result.inserted += @intCast(batch_n);
                 batch_n = 0;
@@ -521,28 +528,38 @@ pub const Collection = struct {
             const d = Doc{ .header = hdr, .key = key, .value = value };
             const total_size = DocHeader.size + key.len + value.len;
 
-            // WAL (fast — just buffer append)
-            var wal_buf: [65536]u8 = undefined;
-            const wal_enc = d.encodeBuf(&wal_buf) catch { result.errors += 1; continue; };
-            _ = self.wal_log.write(0, .doc_insert, 0, 0, wal_enc) catch { result.errors += 1; continue; };
+            // Page write — try cached leaf first, allocate fresh only when full.
+            if (!leaf_valid) {
+                current_leaf = self.findOrAllocLeaf(total_size) catch { result.errors += 1; continue; };
+                leaf_valid = true;
+            }
+            var reserved = self.pf.leafReserve(current_leaf, total_size);
+            if (reserved == null) {
+                // Current leaf full — allocate a fresh page directly (skip backward scan
+                // since we know recent pages are full from this batch).
+                current_leaf = self.pf.allocPage(.leaf) catch { result.errors += 1; leaf_valid = false; continue; };
+                reserved = self.pf.leafReserve(current_leaf, total_size);
+                if (reserved == null) { result.errors += 1; leaf_valid = false; continue; }
+            }
+            const res = reserved.?;
 
-            // Page write
-            const pno = self.findOrAllocLeaf(total_size) catch { result.errors += 1; continue; };
-            const reserved = self.pf.leafReserve(pno, total_size) orelse { result.errors += 1; continue; };
-            _ = d.encodeBuf(reserved.buf) catch { result.errors += 1; continue; };
+            // Encode ONCE — directly to the page. WAL reads from page memory.
+            _ = d.encodeBuf(res.buf) catch { result.errors += 1; continue; };
 
             entries[batch_n] = BTreeEntry{
                 .key_hash = hdr.key_hash,
                 .doc_id   = doc_id,
-                .page_no  = pno,
-                .page_off = reserved.off,
+                .page_no  = current_leaf,
+                .page_off = res.off,
             };
             doc_ids[batch_n] = doc_id;
             hashes[batch_n] = hdr.key_hash;
+            wal_payloads[batch_n] = res.buf[0..total_size];
             batch_n += 1;
         }
         // Flush remaining.
         if (batch_n > 0) {
+            self.wal_log.writeBatch(0, .doc_insert, 0, 0, wal_payloads[0..batch_n]) catch {};
             self.flushBatch(entries[0..batch_n], doc_ids[0..batch_n], hashes[0..batch_n], keys, values, count - batch_n);
             result.inserted += @intCast(batch_n);
         }

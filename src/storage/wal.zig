@@ -266,6 +266,57 @@ pub const WAL = struct {
         return lsn;
     }
 
+    /// Batch write: append N entries under a single lock acquisition.
+    /// All entries share the same op/txn_id/db_tag/flags.
+    /// More efficient than calling write() in a loop for bulk inserts.
+    pub fn writeBatch(
+        self:     *WAL,
+        txn_id:  u64,
+        op:      OpCode,
+        db_tag:  u8,
+        flags:   u16,
+        payloads: []const []const u8,
+    ) !void {
+        if (payloads.len == 0) return;
+
+        // Pre-compute total buffer size needed.
+        var total_size: usize = 0;
+        for (payloads) |p| {
+            total_size += HEADER_SIZE + p.len + paddingTo8(HEADER_SIZE + p.len);
+        }
+
+        self.mu.lock();
+        while (self.write_buf.items.len >= MAX_WRITE_BUF) {
+            self.cond.wait(&self.mu);
+        }
+        defer self.mu.unlock();
+
+        // Reserve all space at once — avoids per-entry ArrayList growth checks.
+        try self.write_buf.ensureUnusedCapacity(self.allocator, total_size);
+
+        for (payloads) |payload| {
+            const lsn = self.next_lsn.fetchAdd(1, .monotonic);
+            const pad = paddingTo8(HEADER_SIZE + payload.len);
+
+            var hdr = EntryHeader{
+                .lsn      = lsn,
+                .length   = @intCast(payload.len),
+                .crc32    = 0,
+                .op_code  = @intFromEnum(op),
+                .db_tag   = db_tag,
+                .flags    = flags,
+                .txn_id   = txn_id,
+                .reserved = 0,
+            };
+            const hdr_bytes = std.mem.asBytes(&hdr);
+            hdr.crc32 = entryChecksum(hdr_bytes, payload);
+
+            self.write_buf.appendSliceAssumeCapacity(std.mem.asBytes(&hdr));
+            self.write_buf.appendSliceAssumeCapacity(payload);
+            if (pad > 0) self.write_buf.appendNTimesAssumeCapacity(0, pad);
+        }
+    }
+
     /// Mark a transaction committed.  Returns only after the entry is durable.
     /// Implements group commit: the first caller flushes for everyone.
     pub fn commit(self: *WAL, txn_id: u64, db_tag: u8) !void {
