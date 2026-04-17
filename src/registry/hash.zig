@@ -10,6 +10,7 @@
 /// Same source tree ALWAYS produces same hash regardless of filesystem ordering.
 const std = @import("std");
 const compat = @import("compat");
+const runtime = @import("runtime");
 const Blake3 = std.crypto.hash.Blake3;
 
 /// Hash raw bytes with BLAKE3. Returns 32-byte digest.
@@ -90,10 +91,10 @@ fn collectFiles(
         base_dir;
 
     var dir = compat.fs.cwdOpenDir(dir_to_open, .{ .iterate = true }) catch return;
-    defer dir.close();
+    defer compat.fs.dirClose(dir);
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(runtime.io)) |entry| {
         // Skip hidden files and common non-source dirs
         if (entry.name.len > 0 and entry.name[0] == '.') continue;
         if (std.mem.eql(u8, entry.name, "zig-out")) continue;

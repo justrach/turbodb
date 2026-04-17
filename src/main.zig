@@ -133,7 +133,7 @@ pub fn main(init: std.process.Init) !void {
     const S = struct {
         var g_http: ?*server.Server = null;
         var g_wire: ?*wire.WireServer = null;
-        fn handler(_: c_int) callconv(.c) void {
+        fn handler(_: std.posix.SIG) callconv(.c) void {
             if (g_http) |s| s.stop();
             if (g_wire) |w| w.stop();
         }

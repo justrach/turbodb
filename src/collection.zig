@@ -1452,7 +1452,7 @@ fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
             // Sleep on futex instead of spinning — woken by index push path.
             const cur = col.index_wake.load(.acquire);
             if (!col.index_stop.load(.acquire))
-                runtime.io.futexWaitTimeout(u32, &col.index_wake.raw, cur, .{ .duration = .fromNanoseconds(50_000_000) }) catch {};
+                runtime.io.futexWaitTimeout(u32, &col.index_wake.raw, cur, .{ .duration = .{ .raw = std.Io.Duration.fromNanoseconds(50_000_000), .clock = .awake } }) catch {};
             continue;
         }
         // Batch trigram indexing (single lock acquisition for all docs).

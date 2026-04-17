@@ -59,7 +59,7 @@ pub const CalvinExecutor = struct {
             .local_partitions = .empty,
             .alloc = alloc,
             .last_executed_epoch = 0,
-            .execute_mu = .{},
+            .execute_mu = .init,
         };
     }
 
@@ -163,8 +163,7 @@ pub const CalvinExecutor = struct {
             const data_len = try r.takeInt(u32, .little);
             if (data_len > 0) {
                 const d = try alloc.alloc(u8, data_len);
-                const bytes_read = try r.readAll(d);
-                if (bytes_read != data_len) return error.UnexpectedEof;
+                try r.readSliceAll(d);
                 txn.data = d;
             } else {
                 txn.data = &.{};

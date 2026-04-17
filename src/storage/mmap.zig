@@ -25,19 +25,20 @@ pub const MmapFile = struct {
         const fd = try posix.openatZ(posix.AT.FDCWD, path, flags, 0o644);
         errdefer _ = std.c.close(fd);
 
-        const stat = try posix.fstat(fd);
-        const existing: usize = @intCast(stat.size);
+        var stat_buf: std.c.Stat = undefined;
+        if (std.c.fstat(fd, &stat_buf) != 0) return error.FstatFailed;
+        const existing: usize = @intCast(stat_buf.size);
         const capacity = alignUp(
             @max(existing, @max(initial_size, GROW_CHUNK)),
             PAGE_SIZE,
         );
 
-        if (@as(usize, @intCast(stat.size)) < capacity)
+        if (@as(usize, @intCast(stat_buf.size)) < capacity)
             if (std.c.ftruncate(fd, @intCast(capacity)) != 0) return error.FtruncateFailed;
 
         const ptr = try posix.mmap(
             null, capacity,
-            posix.PROT.READ | posix.PROT.WRITE,
+            .{ .READ = true, .WRITE = true },
             .{ .TYPE = .SHARED },
             fd, 0,
         );
@@ -80,7 +81,7 @@ pub const MmapFile = struct {
         posix.munmap(@alignCast(self.ptr[0..self.capacity]));
         const ptr = try posix.mmap(
             null, new_cap,
-            posix.PROT.READ | posix.PROT.WRITE,
+            .{ .READ = true, .WRITE = true },
             .{ .TYPE = .SHARED },
             self.fd, 0,
         );

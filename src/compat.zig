@@ -106,6 +106,11 @@ pub const fs = struct {
         return file.readStreaming(runtime.io, &bufs);
     }
 
+
+    /// Seek to absolute byte position. Wraps raw lseek since std.Io.File has no seekTo.
+    pub fn fileSeekTo(file: File, pos: u64) void {
+        _ = std.c.lseek(file.handle, @intCast(pos), std.posix.SEEK.SET);
+    }
 };
 // ─── Time ─────────────────────────────────────────────────────────────────
 // `std.time.{timestamp, milliTimestamp, nanoTimestamp}` are all gone in 0.16.

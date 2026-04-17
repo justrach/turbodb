@@ -15,6 +15,7 @@
 ///
 const std = @import("std");
 const compat = @import("compat");
+const runtime = @import("runtime");
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -153,7 +154,7 @@ pub const DiskIndexBuilder = struct {
         const posts_path = try std.fmt.bufPrint(&posts_path_buf, "{s}/posts.tdb", .{dir_path});
 
         const posts_file = try compat.fs.cwdCreateFile(posts_path, .{});
-        defer posts_file.close();
+        defer posts_file.close(runtime.io);
 
         var offset: u32 = 0;
         for (entries.items) |*entry| {
@@ -165,7 +166,7 @@ pub const DiskIndexBuilder = struct {
 
             entry.offset = offset;
             const bytes = std.mem.sliceAsBytes(list.items);
-            try posts_file.writeAll(bytes);
+            try posts_file.writeStreamingAll(runtime.io, bytes);
             offset += @intCast(bytes.len);
         }
         stats.postings_bytes = offset;
@@ -175,15 +176,15 @@ pub const DiskIndexBuilder = struct {
         const idx_path = try std.fmt.bufPrint(&idx_path_buf, "{s}/index.tdb", .{dir_path});
 
         const idx_file = try compat.fs.cwdCreateFile(idx_path, .{});
-        defer idx_file.close();
+        defer idx_file.close(runtime.io);
 
         // Header: entry count
         const n_entries: u32 = @intCast(entries.items.len);
-        try idx_file.writeAll(std.mem.asBytes(&n_entries));
+        try idx_file.writeStreamingAll(runtime.io, std.mem.asBytes(&n_entries));
 
         // Entries
         const entry_bytes = std.mem.sliceAsBytes(entries.items);
-        try idx_file.writeAll(entry_bytes);
+        try idx_file.writeStreamingAll(runtime.io, entry_bytes);
         stats.index_bytes = 4 + @as(u32, @intCast(entry_bytes.len));
         stats.n_trigrams = n_entries;
 
@@ -192,33 +193,33 @@ pub const DiskIndexBuilder = struct {
         const files_path = try std.fmt.bufPrint(&files_path_buf, "{s}/files.tdb", .{dir_path});
 
         const files_file = try compat.fs.cwdCreateFile(files_path, .{});
-        defer files_file.close();
+        defer files_file.close(runtime.io);
 
         const n_files: u32 = @intCast(self.file_paths.items.len);
-        try files_file.writeAll(std.mem.asBytes(&n_files));
+        try files_file.writeStreamingAll(runtime.io, std.mem.asBytes(&n_files));
 
         // Offset table: (offset: u32, len: u16) per file
         var path_offset: u32 = 0;
         for (self.file_paths.items) |p| {
-            try files_file.writeAll(std.mem.asBytes(&path_offset));
+            try files_file.writeStreamingAll(runtime.io, std.mem.asBytes(&path_offset));
             const plen: u16 = @intCast(p.len);
-            try files_file.writeAll(std.mem.asBytes(&plen));
+            try files_file.writeStreamingAll(runtime.io, std.mem.asBytes(&plen));
             path_offset += @intCast(p.len);
         }
 
         // Path strings
         for (self.file_paths.items) |p| {
-            try files_file.writeAll(p);
+            try files_file.writeStreamingAll(runtime.io, p);
         }
-        stats.files_bytes = @intCast(try files_file.getPos());
+        stats.files_bytes = @intCast(blk: { var st: std.c.Stat = undefined; if (std.c.fstat(files_file.handle, &st) != 0) return error.FstatFailed; break :blk @as(u64, @intCast(st.size)); });
         stats.n_files = n_files;
 
         // ── 5. Write frequency table ────────────────────────────────────
         var freq_path_buf: [512]u8 = undefined;
         const freq_path = try std.fmt.bufPrint(&freq_path_buf, "{s}/freq.tdb", .{dir_path});
         const freq_file = try compat.fs.cwdCreateFile(freq_path, .{});
-        defer freq_file.close();
-        try freq_file.writeAll(std.mem.asBytes(&self.freq.counts));
+        defer freq_file.close(runtime.io);
+        try freq_file.writeStreamingAll(runtime.io, std.mem.asBytes(&self.freq.counts));
         stats.freq_bytes = 256 * 256 * 4;
 
         return stats;
@@ -245,7 +246,7 @@ pub const DiskIndex = struct {
     lookup: []const LookupEntry,
     lookup_mmap: []align(std.heap.page_size_min) const u8,
     /// Postings file handle (pread for on-demand loading)
-    posts_fd: std.fs.File,
+    posts_fd: std.Io.File,
     /// File path table (mmap'd)
     files_mmap: []align(std.heap.page_size_min) const u8,
     n_files: u32,
@@ -259,9 +260,11 @@ pub const DiskIndex = struct {
         // mmap lookup table
         const idx_path = try std.fmt.bufPrint(&buf, "{s}/index.tdb", .{dir_path});
         const idx_file = try compat.fs.cwdOpenFile(idx_path, .{});
-        defer idx_file.close();
-        const idx_stat = try idx_file.stat();
-        const idx_mmap = try std.posix.mmap(null, idx_stat.size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, idx_file.handle, 0);
+        defer idx_file.close(runtime.io);
+        var idx_stat_buf: std.c.Stat = undefined;
+        if (std.c.fstat(idx_file.handle, &idx_stat_buf) != 0) return error.FstatFailed;
+        const idx_stat_size: usize = @intCast(idx_stat_buf.size);
+        const idx_mmap = try std.posix.mmap(null, idx_stat_size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, idx_file.handle, 0);
 
         const n_entries = std.mem.bytesToValue(u32, idx_mmap[0..4]);
         const entries_start = 4;
@@ -275,17 +278,21 @@ pub const DiskIndex = struct {
         // mmap files table
         const files_path = try std.fmt.bufPrint(&buf, "{s}/files.tdb", .{dir_path});
         const files_file = try compat.fs.cwdOpenFile(files_path, .{});
-        defer files_file.close();
-        const files_stat = try files_file.stat();
-        const files_mmap = try std.posix.mmap(null, files_stat.size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, files_file.handle, 0);
+        defer files_file.close(runtime.io);
+        var files_stat_buf: std.c.Stat = undefined;
+        if (std.c.fstat(files_file.handle, &files_stat_buf) != 0) return error.FstatFailed;
+        const files_stat_size: usize = @intCast(files_stat_buf.size);
+        const files_mmap = try std.posix.mmap(null, files_stat_size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, files_file.handle, 0);
         const n_files = std.mem.bytesToValue(u32, files_mmap[0..4]);
 
         // mmap frequency table
         const freq_path = try std.fmt.bufPrint(&buf, "{s}/freq.tdb", .{dir_path});
         const freq_file = try compat.fs.cwdOpenFile(freq_path, .{});
-        defer freq_file.close();
-        const freq_stat = try freq_file.stat();
-        const freq_mmap = try std.posix.mmap(null, freq_stat.size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, freq_file.handle, 0);
+        defer freq_file.close(runtime.io);
+        var freq_stat_buf: std.c.Stat = undefined;
+        if (std.c.fstat(freq_file.handle, &freq_stat_buf) != 0) return error.FstatFailed;
+        const freq_stat_size: usize = @intCast(freq_stat_buf.size);
+        const freq_mmap = try std.posix.mmap(null, freq_stat_size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, freq_file.handle, 0);
 
         return .{
             .lookup = lookup,
@@ -302,7 +309,7 @@ pub const DiskIndex = struct {
         std.posix.munmap(self.lookup_mmap);
         std.posix.munmap(self.files_mmap);
         std.posix.munmap(self.freq_mmap);
-        self.posts_fd.close();
+        self.posts_fd.close(runtime.io);
     }
 
     /// Binary search the sorted lookup table for a trigram.
@@ -327,11 +334,9 @@ pub const DiskIndex = struct {
     pub fn loadPostingList(self: *DiskIndex, entry: LookupEntry) ![]u32 {
         const result = try self.alloc.alloc(u32, entry.count);
         errdefer self.alloc.free(result);
-
         const buf = std.mem.sliceAsBytes(result);
-        const n = try self.posts_fd.pread(buf, entry.offset);
+        const n = try self.posts_fd.readPositionalAll(runtime.io, buf, entry.offset);
         if (n != buf.len) return error.ShortRead;
-
         return result;
     }
 

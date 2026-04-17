@@ -41,7 +41,7 @@ pub const BTree = struct {
     mu: std.Io.RwLock,
 
     pub fn init(pf: *PageFile, root_page: u32) BTree {
-        return .{ .pf = pf, .root = root_page, .mu = .{} };
+        return .{ .pf = pf, .root = root_page, .mu = .init };
     }
 
     // ─── search ──────────────────────────────────────────────────────────

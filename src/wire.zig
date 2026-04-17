@@ -53,7 +53,12 @@ pub const WireServer = struct {
     pub fn runUnix(self: *WireServer, path: []const u8) !void {
         // Remove any existing socket file
         // Remove any existing socket file
-        std.posix.unlink(path) catch {};
+        var path_buf: [4096]u8 = undefined;
+        if (path.len < path_buf.len) {
+            @memcpy(path_buf[0..path.len], path);
+            path_buf[path.len] = 0;
+            _ = std.c.unlink(@ptrCast(&path_buf));
+        }
         const fd = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
         defer std.posix.close(fd);
 

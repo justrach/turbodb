@@ -78,7 +78,7 @@ pub const Server = struct {
             .query_cpu_us = std.atomic.Value(u64).init(0),
             .query_cost_nanos_usd = std.atomic.Value(u64).init(0),
             .billing_log = .empty,
-            .billing_mu = .{},
+            .billing_mu = .init,
             .activity = activity.ActivityTracker.init(),
         };
     }
@@ -108,7 +108,12 @@ pub const Server = struct {
     pub fn runUnix(self: *Server, path: []const u8) !void {
         // Remove any existing socket file
         // Remove any existing socket file
-        std.posix.unlink(path) catch {};
+        var path_buf: [4096]u8 = undefined;
+        if (path.len < path_buf.len) {
+            @memcpy(path_buf[0..path.len], path);
+            path_buf[path.len] = 0;
+            _ = std.c.unlink(@ptrCast(&path_buf));
+        }
         const fd = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
         defer std.posix.close(fd);
 

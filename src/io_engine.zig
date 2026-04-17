@@ -667,7 +667,7 @@ pub const EventLoop = struct {
                 const cur = self.wake_signal.load(.acquire);
                 // Re-check running before sleeping (avoid missed wake on shutdown).
                 if (!self.running.load(.acquire)) break;
-                runtime.io.futexWaitTimeout(u32, &self.wake_signal.raw, cur, .{ .duration = .fromNanoseconds(50_000_000) }) catch {};
+                runtime.io.futexWaitTimeout(u32, &self.wake_signal.raw, cur, .{ .duration = .{ .raw = std.Io.Duration.fromNanoseconds(50_000_000), .clock = .awake } }) catch {};
                 continue;
             };
 

@@ -124,7 +124,7 @@ fn cmdIndex(db: *Database, col_name: []const u8, dir_path: []const u8, alloc: st
         std.debug.print("Cannot open directory: {any}\n", .{e});
         return;
     };
-    defer dir.close();
+    defer compat.fs.dirClose(dir);
 
     var indexed: u64 = 0;
     var skipped: u64 = 0;
@@ -133,19 +133,19 @@ fn cmdIndex(db: *Database, col_name: []const u8, dir_path: []const u8, alloc: st
     var walker = try dir.walk(alloc);
     defer walker.deinit();
 
-    while (try walker.next()) |entry| {
+    while (try walker.next(runtime.io)) |entry| {
         if (entry.kind != .file) continue;
         if (!hasValidExt(entry.basename)) continue;
 
         // Read file content (first 8KB for indexing)
-        var file = dir.openFile(entry.path, .{}) catch {
+        const file = compat.fs.dirOpenFile(dir, entry.path, .{}) catch {
             skipped += 1;
             continue;
         };
-        defer file.close();
+        defer compat.fs.fileClose(file);
 
         var buf: [8192]u8 = undefined;
-        const n = file.read(&buf) catch {
+        const n = compat.fs.fileReadAll(file, &buf) catch {
             skipped += 1;
             continue;
         };
@@ -331,7 +331,7 @@ fn findSnippet(value: []const u8, query: []const u8) []const u8 {
             if (value[ls] == '\n' and ls < vi) ls += 1;
             var le = end;
             while (le < value.len and value[le] != '\n') le += 1;
-            return std.mem.trimRight(u8, value[ls..le], " \t\r\n");
+            return std.mem.trimEnd(u8, value[ls..le], " \t\r\n");
         }
     }
     return "";

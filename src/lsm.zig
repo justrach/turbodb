@@ -203,39 +203,39 @@ pub const SSTable = struct {
     const FLAG_TOMBSTONE: u8 = 0x00;
 
     /// Write a u64 in little-endian to a file.
-    fn writeU64(file: std.fs.File, val: u64) !void {
+    fn writeU64(file: std.Io.File, val: u64) !void {
         var buf: [8]u8 = undefined;
         std.mem.writeInt(u64, &buf, val, .little);
-        try file.writeAll(&buf);
+        try file.writeStreamingAll(runtime.io, &buf);
     }
 
     /// Write a u32 in little-endian to a file.
-    fn writeU32(file: std.fs.File, val: u32) !void {
+    fn writeU32(file: std.Io.File, val: u32) !void {
         var buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &buf, val, .little);
-        try file.writeAll(&buf);
+        try file.writeStreamingAll(runtime.io, &buf);
     }
 
     /// Read a u64 in little-endian from a file.
-    fn readU64(file: std.fs.File) !u64 {
+    fn readU64(file: std.Io.File) !u64 {
         var buf: [8]u8 = undefined;
-        const n = try file.readAll(&buf);
+        var bufs = [_][]u8{&buf}; const n = try file.readStreaming(runtime.io, &bufs);
         if (n < 8) return error.UnexpectedEof;
         return std.mem.readInt(u64, &buf, .little);
     }
 
     /// Read a u32 in little-endian from a file.
-    fn readU32(file: std.fs.File) !u32 {
+    fn readU32(file: std.Io.File) !u32 {
         var buf: [4]u8 = undefined;
-        const n = try file.readAll(&buf);
+        var bufs = [_][]u8{&buf}; const n = try file.readStreaming(runtime.io, &bufs);
         if (n < 4) return error.UnexpectedEof;
         return std.mem.readInt(u32, &buf, .little);
     }
 
     /// Read a single byte from a file.
-    fn readByte(file: std.fs.File) !u8 {
+    fn readByte(file: std.Io.File) !u8 {
         var buf: [1]u8 = undefined;
-        const n = try file.readAll(&buf);
+        var bufs = [_][]u8{&buf}; const n = try file.readStreaming(runtime.io, &bufs);
         if (n < 1) return error.UnexpectedEof;
         return buf[0];
     }
@@ -272,11 +272,11 @@ pub const SSTable = struct {
 
         // Write data file.
         const data_file = try compat.fs.cwdCreateFile(dp, .{});
-        defer data_file.close();
+        defer data_file.close(runtime.io);
 
         // Write index file.
         const idx_file = try compat.fs.cwdCreateFile(ip, .{});
-        defer idx_file.close();
+        defer idx_file.close(runtime.io);
 
         var data_offset: u64 = 0;
         for (entries, 0..) |e, i| {
@@ -291,12 +291,12 @@ pub const SSTable = struct {
 
             switch (e.value) {
                 .live => |bte| {
-                    try data_file.writeAll(&[_]u8{FLAG_LIVE});
-                    try data_file.writeAll(std.mem.asBytes(&bte));
+                    try data_file.writeStreamingAll(runtime.io, &[_]u8{FLAG_LIVE});
+                    try data_file.writeStreamingAll(runtime.io, std.mem.asBytes(&bte));
                     data_offset += LIVE_ENTRY_SIZE;
                 },
                 .tombstone => {
-                    try data_file.writeAll(&[_]u8{FLAG_TOMBSTONE});
+                    try data_file.writeStreamingAll(runtime.io, &[_]u8{FLAG_TOMBSTONE});
                     data_offset += TOMB_ENTRY_SIZE;
                 },
             }
@@ -304,7 +304,7 @@ pub const SSTable = struct {
 
         // Write bloom filter data to end of data file.
         const bloom_offset = data_offset;
-        try data_file.writeAll(sst.bloom.bits);
+        try data_file.writeStreamingAll(runtime.io, sst.bloom.bits);
         data_offset += sst.bloom.bits.len;
 
         // Footer.
@@ -328,16 +328,16 @@ pub const SSTable = struct {
             self.data_path[0..self.data_path_len],
             .{},
         );
-        defer data_file.close();
+        defer data_file.close(runtime.io);
 
         // Load sparse index to find starting offset.
         const idx_file = try compat.fs.cwdOpenFile(
             self.index_path[0..self.index_path_len],
             .{},
         );
-        defer idx_file.close();
+        defer idx_file.close(runtime.io);
 
-        const idx_stat = try idx_file.stat();
+        const idx_stat = blk: { var st: std.c.Stat = undefined; if (std.c.fstat(idx_file.handle, &st) != 0) return error.FstatFailed; break :blk .{ .size = @as(u64, @intCast(st.size)) }; };
         const n_index_entries = idx_stat.size / INDEX_ENTRY_SIZE;
 
         // Binary search the sparse index.
@@ -348,9 +348,9 @@ pub const SSTable = struct {
             var best_offset: u64 = 0;
             while (lo < hi) {
                 const mid = lo + (hi - lo) / 2;
-                try idx_file.seekTo(mid * INDEX_ENTRY_SIZE);
+                compat.fs.fileSeekTo(idx_file, mid * INDEX_ENTRY_SIZE);
                 var idx_buf: [INDEX_ENTRY_SIZE]u8 = undefined;
-                const read_n = try idx_file.readAll(&idx_buf);
+                const read_n = try compat.fs.fileReadAll(idx_file, &idx_buf);
                 if (read_n < INDEX_ENTRY_SIZE) break;
                 const idx_key = std.mem.readInt(u64, idx_buf[0..8], .little);
                 const idx_off = std.mem.readInt(u64, idx_buf[8..16], .little);
@@ -365,14 +365,14 @@ pub const SSTable = struct {
         }
 
         // Linear scan from scan_offset.
-        try data_file.seekTo(scan_offset);
+        compat.fs.fileSeekTo(data_file, scan_offset);
         var scanned: u32 = 0;
         while (scanned < self.entry_count) : (scanned += 1) {
             const k = readU64(data_file) catch return null;
             const flag = readByte(data_file) catch return null;
             if (flag == FLAG_LIVE) {
                 var entry_bytes: [BTreeEntry.size]u8 = undefined;
-                const n_read = data_file.readAll(&entry_bytes) catch return null;
+                const n_read = compat.fs.fileReadAll(data_file, &entry_bytes) catch return null;
                 if (n_read < BTreeEntry.size) return null;
                 if (k == key_hash) {
                     return std.mem.bytesToValue(BTreeEntry, &entry_bytes);
@@ -388,7 +388,7 @@ pub const SSTable = struct {
     }
 
     pub const Iterator = struct {
-        file: std.fs.File,
+        file: std.Io.File,
         remaining: u32,
 
         pub fn next(self: *Iterator) ?KVEntry {
@@ -398,7 +398,7 @@ pub const SSTable = struct {
             const flag = readByte(self.file) catch return null;
             if (flag == FLAG_LIVE) {
                 var entry_bytes: [BTreeEntry.size]u8 = undefined;
-                const n_read = self.file.readAll(&entry_bytes) catch return null;
+                const n_read = compat.fs.fileReadAll(self.file, &entry_bytes) catch return null;
                 if (n_read < BTreeEntry.size) return null;
                 return .{
                     .key_hash = k,
@@ -413,7 +413,7 @@ pub const SSTable = struct {
         }
 
         pub fn deinit(self: *Iterator) void {
-            self.file.close();
+            self.file.close(runtime.io);
         }
     };
 
@@ -457,7 +457,7 @@ pub const LSMTree = struct {
         lsm.immutable_mem = null;
         lsm.alloc = alloc;
         lsm.next_sst_id = 0;
-        lsm.flush_mu = .{};
+        lsm.flush_mu = .init;
 
         lsm.data_dir = std.mem.zeroes([256]u8);
         if (data_dir.len > 256) return error.PathTooLong;

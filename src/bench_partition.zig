@@ -227,7 +227,7 @@ fn emitJSON() void {
     // Also write to a JSON file for CI consumption
     const json_path = "/tmp/turbodb_shard_bench.json";
     const file = compat.fs.cwdCreateFile(json_path, .{}) catch return;
-    defer file.close();
+    defer compat.fs.fileClose(file);
 
     var buf: [16384]u8 = undefined;
     var pos: usize = 0;
@@ -250,7 +250,7 @@ fn emitJSON() void {
 
     pos += (std.fmt.bufPrint(buf[pos..], "  }}\n}}\n", .{}) catch return).len;
 
-    file.writeAll(buf[0..pos]) catch return;
+    file.writeStreamingAll(runtime.io, buf[0..pos]) catch return;
     std.debug.print("\nJSON results written to: {s}\n", .{json_path});
 }
 

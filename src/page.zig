@@ -46,7 +46,7 @@ pub const PageFile = struct {
             .mm         = mm,
             .free_head  = std.atomic.Value(u32).init(0),
             .next_alloc = std.atomic.Value(u32).init(page_count),
-            .mu         = .{},
+            .mu         = .init,
         };
     }
 
