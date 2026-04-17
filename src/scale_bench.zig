@@ -102,7 +102,7 @@ pub fn main(init: std.process.Init) !void {
 
     var indexed: u64 = 0;
     var total_bytes: u64 = 0;
-    const t_index_start = std.time.nanoTimestamp();
+    const t_index_start = compat.nanoTimestamp();
 
     var copy: u32 = 0;
     while (copy < COPIES) : (copy += 1) {
@@ -116,7 +116,7 @@ pub fn main(init: std.process.Init) !void {
             indexed += 1;
             total_bytes += f.content.len;
         }
-        const elapsed_ns = std.time.nanoTimestamp() - t_index_start;
+        const elapsed_ns = compat.nanoTimestamp() - t_index_start;
         const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
         const rate = @as(f64, @floatFromInt(indexed)) / elapsed_s;
         std.debug.print("\r  Copy {d}/{d}: {d} files indexed ({d:.0} files/s)  ", .{
@@ -124,7 +124,7 @@ pub fn main(init: std.process.Init) !void {
         });
     }
 
-    const t_index_end = std.time.nanoTimestamp();
+    const t_index_end = compat.nanoTimestamp();
     const index_s = @as(f64, @floatFromInt(t_index_end - t_index_start)) / 1e9;
     const index_rate = @as(f64, @floatFromInt(indexed)) / index_s;
     const total_mb = @as(f64, @floatFromInt(total_bytes)) / (1024.0 * 1024.0);
@@ -172,9 +172,9 @@ pub fn main(init: std.process.Init) !void {
         var run: u32 = 0;
         while (run < 3) : (run += 1) {
             if (last_result) |r| r.deinit();
-            const t0 = std.time.nanoTimestamp();
+            const t0 = compat.nanoTimestamp();
             last_result = try col.searchText(q, 50, alloc);
-            const elapsed_ns = std.time.nanoTimestamp() - t0;
+            const elapsed_ns = compat.nanoTimestamp() - t0;
             times[run] = @as(f64, @floatFromInt(elapsed_ns)) / 1e3;
         }
 
@@ -231,9 +231,9 @@ pub fn main(init: std.process.Init) !void {
         "Promise", "setTimeout", "addEventListener",
     };
 
-    const t_burst_start = std.time.nanoTimestamp();
+    const t_burst_start = compat.nanoTimestamp();
     var burst_count: u32 = 0;
-    var rng = std.Random.DefaultPrng.init(@intCast(std.time.nanoTimestamp()));
+    var rng = std.Random.DefaultPrng.init(@intCast(compat.nanoTimestamp()));
     const random = rng.random();
 
     while (burst_count < 1000) : (burst_count += 1) {
@@ -242,7 +242,7 @@ pub fn main(init: std.process.Init) !void {
         result.deinit();
     }
 
-    const t_burst_end = std.time.nanoTimestamp();
+    const t_burst_end = compat.nanoTimestamp();
     const burst_s = @as(f64, @floatFromInt(t_burst_end - t_burst_start)) / 1e9;
     const burst_qps = 1000.0 / burst_s;
 

@@ -54,7 +54,7 @@ pub const Marketplace = struct {
         try copyDirRecursive(self.alloc, snapshot.parent_path, base_dir);
         try copyDirRecursive(self.alloc, snapshot.overlay_dir, overlay_dir);
 
-        const created_at_ms = std.time.milliTimestamp();
+        const created_at_ms = compat.milliTimestamp();
         try self.writeManifest(release_root, snapshot, description, base_dir, overlay_dir, version, created_at_ms);
         return .{
             .dataset_name = try self.alloc.dupe(u8, snapshot.dataset_name),

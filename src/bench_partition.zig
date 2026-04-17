@@ -76,7 +76,7 @@ fn record(name_src: []const u8, json_src: []const u8, ops: usize, elapsed_ns: i1
 // ─── Timing helper ──────────────────────────────────────────────────────────
 
 inline fn now() i128 {
-    return std.time.nanoTimestamp();
+    return compat.nanoTimestamp();
 }
 
 // ─── Partition benchmark for a given partition count ─────────────────────────
@@ -190,7 +190,7 @@ fn benchPartitionCount(n_partitions: u16) !void {
 
 fn emitJSON() void {
     // Timestamp
-    const ts = std.time.timestamp();
+    const ts = compat.timestampSec();
     const epoch_secs: u64 = @intCast(ts);
     const secs_in_day: u64 = 86400;
     const days = epoch_secs / secs_in_day;

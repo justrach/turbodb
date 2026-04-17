@@ -14,6 +14,7 @@ const std = @import("std");
 const activity = @import("activity.zig");
 const auth = @import("auth.zig");
 const collection = @import("collection.zig");
+const compat = @import("compat");
 const Database = collection.Database;
 
 const MAX_REQ  = 65536;  // 64 KiB (initial read)
@@ -138,7 +139,7 @@ pub const Server = struct {
     }
 
     fn recordQueryCost(self: *Server, tenant_id: []const u8, op: []const u8, rows_scanned: usize, bytes_read: usize, start_ns: i128) void {
-        const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+        const elapsed_ns = compat.nanoTimestamp() - start_ns;
         const cpu_us: u64 = @intCast(@max(@divTrunc(elapsed_ns, 1000), 0));
         const cost_nanos_usd: u64 = cpu_us * 5 + @as(u64, @intCast(rows_scanned)) + @as(u64, @intCast(bytes_read / 1024));
 
@@ -400,7 +401,7 @@ fn handleInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, body:
     const key_raw = jsonStr(body, "key") orelse {
         // Auto-generate key from timestamp + counter.
         var kb: [32]u8 = undefined;
-        const k = std.fmt.bufPrint(&kb, "doc_{d}", .{std.time.milliTimestamp()}) catch
+        const k = std.fmt.bufPrint(&kb, "doc_{d}", .{compat.milliTimestamp()}) catch
             return err(400, "bad key");
         return doInsert(srv, tenant_id, col_name, k, body);
     };
@@ -408,7 +409,7 @@ fn handleInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, body:
 }
 
 fn doInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, value: []const u8) usize {
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = compat.nanoTimestamp();
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     srv.db.ensureTenantStorageAvailable(tenant_id, value.len) catch return err(429, "tenant storage quota exceeded");
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
@@ -426,7 +427,7 @@ fn doInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []co
 /// Response: {"inserted":N,"errors":M,"collection":"...","tenant":"..."}
 fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
     _ = alloc;
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = compat.nanoTimestamp();
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
 
@@ -465,7 +466,7 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, as_of: ?i64) usize {
-        const start_ns = std.time.nanoTimestamp();
+        const start_ns = compat.nanoTimestamp();
         srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
         const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
         const d = if (as_of) |ts_ms|
@@ -499,7 +500,7 @@ fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []c
     }
 
 fn handleUpdate(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = compat.nanoTimestamp();
     _ = alloc;
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     srv.db.ensureTenantStorageAvailable(tenant_id, body.len) catch return err(429, "tenant storage quota exceeded");
@@ -511,7 +512,7 @@ fn handleUpdate(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: 
 }
 
 fn handleDelete(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8) usize {
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = compat.nanoTimestamp();
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
     const deleted = col.delete(key) catch return err(500, "delete failed");
@@ -521,7 +522,7 @@ fn handleDelete(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: 
 }
 
 fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_str: []const u8, as_of: ?i64, alloc: std.mem.Allocator) usize {
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = compat.nanoTimestamp();
     const limit: u32 = qparamInt(query_str, "limit") orelse 20;
     const offset: u32 = qparamInt(query_str, "offset") orelse 0;
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
@@ -551,7 +552,7 @@ fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_s
 }
 
 fn handleDrop(srv: *Server, tenant_id: []const u8, col_name: []const u8) usize {
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = compat.nanoTimestamp();
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     srv.db.dropCollectionForTenant(tenant_id, col_name);
     srv.recordQueryCost(tenant_id, "drop", 0, 0, start_ns);
@@ -559,7 +560,7 @@ fn handleDrop(srv: *Server, tenant_id: []const u8, col_name: []const u8) usize {
 }
 
 fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query: []const u8, limit: u32, alloc: std.mem.Allocator) usize {
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = compat.nanoTimestamp();
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
     const result = col.searchText(query, limit, alloc) catch return err(500, "search failed");
@@ -591,7 +592,7 @@ fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query
 }
 
 fn handleDiscoverContext(srv: *Server, tenant_id: []const u8, col_name: []const u8, query: []const u8, limit: u32, alloc: std.mem.Allocator) usize {
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = compat.nanoTimestamp();
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
     var result = col.discoverContext(query, limit, alloc) catch return err(500, "context discovery failed");
@@ -629,7 +630,7 @@ fn handleDiscoverContext(srv: *Server, tenant_id: []const u8, col_name: []const 
 }
 
 fn handleListCollections(srv: *Server, tenant_id: []const u8, alloc: std.mem.Allocator) usize {
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = compat.nanoTimestamp();
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     var cols = srv.db.listCollectionsForTenant(tenant_id, alloc) catch return err(500, "list collections failed");
     defer {

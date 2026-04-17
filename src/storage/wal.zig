@@ -28,6 +28,7 @@
 //!   4. Truncates the tail of any partial (unfinished) entry at the end.
 const std = @import("std");
 const runtime = @import("runtime");
+const compat = @import("compat");
 
 // ── Entry header (32 bytes, cache-line harmless) ──────────────────────────────
 
@@ -240,7 +241,7 @@ pub const WAL = struct {
         // Write COMMIT entry to buffer
         var commit_payload: [16]u8 = undefined;
         std.mem.writeInt(u64, commit_payload[0..8], txn_id,          .little);
-        std.mem.writeInt(u64, commit_payload[8..16], @as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())))), .little);
+        std.mem.writeInt(u64, commit_payload[8..16], @as(u64, @truncate(@as(u128, @bitCast(compat.nanoTimestamp())))), .little);
         const lsn = try self.write(txn_id, .txn_commit, db_tag, FLAG_COMMIT, &commit_payload);
 
         // Group commit: become flusher or wait

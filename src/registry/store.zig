@@ -136,7 +136,7 @@ pub const BlobStore = struct {
             hash_hex[0..2],
             hash_hex[0..],
         });
-        const now = std.time.timestamp();
+        const now = compat.timestampSec();
         return std.fmt.bufPrint(buf,
             \\{{"hash":"{s}","size":{d},"content_type":"application/zstd","disk_path":"{s}","uploaded_at":{d},"ref_count":1}}
         , .{ hash_hex, data_len, disk_path, now });

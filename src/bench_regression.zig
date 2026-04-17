@@ -59,7 +59,7 @@ fn record(name: []const u8, json_key: []const u8, ops: usize, elapsed_ns: i128) 
 // ─── Timing helper ──────────────────────────────────────────────────────────
 
 inline fn now() i128 {
-    return std.time.nanoTimestamp();
+    return compat.nanoTimestamp();
 }
 
 // ─── Benchmark: Core Path (INSERT / GET / UPDATE / DELETE) ──────────────────
@@ -410,7 +410,7 @@ fn benchMVCC() !void {
 
 fn emitJSON() void {
     // Timestamp
-    const ts = std.time.timestamp();
+    const ts = compat.timestampSec();
     const epoch_secs: u64 = @intCast(ts);
     const secs_in_day: u64 = 86400;
     const days = epoch_secs / secs_in_day;

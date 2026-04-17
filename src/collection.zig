@@ -1664,7 +1664,7 @@ pub const Database = struct {
         const quota = self.tenant_quotas.get(tenant_id) orelse return;
         if (quota.max_ops_per_second == std.math.maxInt(u32)) return;
 
-        const now_ms: i64 = std.time.milliTimestamp();
+        const now_ms: i64 = compat.milliTimestamp();
         const window_ms = now_ms - @mod(now_ms, 1000);
         const usage = try self.getOrCreateTenantUsageLocked(tenant_id);
         if (usage.ops_window_ms != window_ms) {

@@ -7,6 +7,7 @@
 ///   - Request signing/verification (Ed25519 over method+path+timestamp)
 const std = @import("std");
 const sign_mod = @import("sign.zig");
+const compat = @import("compat");
 
 // ─── Visibility ────────────────────────────────────────────────────────────────
 
@@ -204,7 +205,7 @@ pub fn signRequest(method: []const u8, path: []const u8, timestamp: i64, secret_
 /// Verify an HTTP request signature.
 pub fn verifyRequest(method: []const u8, path: []const u8, timestamp: i64, signature: [64]u8, pubkey: [32]u8) bool {
     // Check timestamp is within 5 minutes
-    const now = std.time.timestamp();
+    const now = compat.timestampSec();
     const diff = if (now > timestamp) now - timestamp else timestamp - now;
     if (diff > 300) return false; // 5 minute window
 
@@ -362,7 +363,7 @@ test "format package key" {
 
 test "request signing and verification" {
     const kp = sign_mod.KeyPair.generate();
-    const now = std.time.timestamp();
+    const now = compat.timestampSec();
 
     const sig = signRequest("GET", "/api/v1/packages/test", now, kp.secret_key);
     try std.testing.expect(verifyRequest("GET", "/api/v1/packages/test", now, sig, kp.public_key));

@@ -21,37 +21,37 @@ pub fn main() !void {
     const value = "{}";
 
     // ── INSERT benchmark ──
-    const t0 = std.time.nanoTimestamp();
+    const t0 = compat.nanoTimestamp();
     var i: usize = 0;
     while (i < N) : (i += 1) {
         const k = std.fmt.bufPrint(&key_buf, "k{d:0>9}", .{i}) catch continue;
         _ = db.insert("bench", k, value) catch continue;
     }
-    const t1 = std.time.nanoTimestamp();
+    const t1 = compat.nanoTimestamp();
     const insert_ns: f64 = @floatFromInt(@as(i128, t1 - t0));
     const insert_ops: f64 = @as(f64, @floatFromInt(N)) / (insert_ns / 1e9);
 
     // ── GET benchmark (random lookups) ──
     var rng = std.Random.DefaultPrng.init(42);
-    const t2 = std.time.nanoTimestamp();
+    const t2 = compat.nanoTimestamp();
     var g: usize = 0;
     while (g < N) : (g += 1) {
         const idx = rng.random().intRangeAtMost(usize, 0, N - 1);
         const k = std.fmt.bufPrint(&key_buf, "k{d:0>9}", .{idx}) catch continue;
         _ = db.get("bench", k) catch null;
     }
-    const t3 = std.time.nanoTimestamp();
+    const t3 = compat.nanoTimestamp();
     const get_ns: f64 = @floatFromInt(@as(i128, t3 - t2));
     const get_ops: f64 = @as(f64, @floatFromInt(N)) / (get_ns / 1e9);
 
     // ── SEARCH benchmark (brute-force path since trigram index is empty) ──
-    const t4 = std.time.nanoTimestamp();
+    const t4 = compat.nanoTimestamp();
     var s: usize = 0;
     while (s < 1000) : (s += 1) {
         var sr = db.search("bench", "k00000", 10, alloc) catch continue;
         sr.deinit();
     }
-    const t5 = std.time.nanoTimestamp();
+    const t5 = compat.nanoTimestamp();
     const search_ns: f64 = @floatFromInt(@as(i128, t5 - t4));
     const search_ops: f64 = 1000.0 / (search_ns / 1e9);
 

@@ -36,10 +36,10 @@ const Timer = struct {
     start: i128 = 0,
 
     fn begin(self: *Timer) void {
-        self.start = std.time.nanoTimestamp();
+        self.start = compat.nanoTimestamp();
     }
     fn end(self: *Timer) void {
-        self.total_ns += std.time.nanoTimestamp() - self.start;
+        self.total_ns += compat.nanoTimestamp() - self.start;
         self.count += 1;
     }
     fn avgUs(self: *const Timer) f64 {

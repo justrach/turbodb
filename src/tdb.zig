@@ -128,7 +128,7 @@ fn cmdIndex(db: *Database, col_name: []const u8, dir_path: []const u8, alloc: st
 
     var indexed: u64 = 0;
     var skipped: u64 = 0;
-    const t0 = std.time.nanoTimestamp();
+    const t0 = compat.nanoTimestamp();
 
     var walker = try dir.walk(alloc);
     defer walker.deinit();
@@ -165,14 +165,14 @@ fn cmdIndex(db: *Database, col_name: []const u8, dir_path: []const u8, alloc: st
         indexed += 1;
 
         if (indexed % 1000 == 0) {
-            const elapsed_ns = std.time.nanoTimestamp() - t0;
+            const elapsed_ns = compat.nanoTimestamp() - t0;
             const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
             const rate = @as(f64, @floatFromInt(indexed)) / elapsed_s;
             std.debug.print("\r  Indexed {d} files ({d:.0} files/s)...", .{ indexed, rate });
         }
     }
 
-    const elapsed_ns = std.time.nanoTimestamp() - t0;
+    const elapsed_ns = compat.nanoTimestamp() - t0;
     const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
     const rate = @as(f64, @floatFromInt(indexed)) / elapsed_s;
 
@@ -184,10 +184,10 @@ fn cmdIndex(db: *Database, col_name: []const u8, dir_path: []const u8, alloc: st
 fn cmdSearch(db: *Database, col_name: []const u8, query: []const u8, alloc: std.mem.Allocator) !void {
     const col = try db.collection(col_name);
 
-    const t0 = std.time.nanoTimestamp();
+    const t0 = compat.nanoTimestamp();
     const result = try col.searchText(query, 20, alloc);
     defer result.deinit();
-    const elapsed_ns = std.time.nanoTimestamp() - t0;
+    const elapsed_ns = compat.nanoTimestamp() - t0;
     const elapsed_us = @as(f64, @floatFromInt(elapsed_ns)) / 1e3;
 
     const n_cand = result.candidate_paths.len;
@@ -251,9 +251,9 @@ fn cmdBench(db: *Database, col_name: []const u8, dir_path: []const u8, alloc: st
     var total_candidates: u64 = 0;
 
     for (queries) |q| {
-        const t0 = std.time.nanoTimestamp();
+        const t0 = compat.nanoTimestamp();
         const result = try col.searchText(q, 50, alloc);
-        const elapsed_ns = std.time.nanoTimestamp() - t0;
+        const elapsed_ns = compat.nanoTimestamp() - t0;
         const elapsed_us = @as(f64, @floatFromInt(elapsed_ns)) / 1e3;
         total_us += elapsed_us;
         total_hits += result.docs.len;

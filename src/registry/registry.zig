@@ -141,7 +141,7 @@ pub const Registry = struct {
         // 7. Build package metadata JSON
         var pubkey_hex = sign_mod.pubkeyHex(pubkey);
         var sig_hex = sign_mod.signatureHex(signature);
-        const now = std.time.timestamp();
+        const now = compat.timestampSec();
 
         // Package metadata (upsert — latest version wins)
         var pkg_buf: [2048]u8 = undefined;
@@ -314,7 +314,7 @@ pub const Registry = struct {
     /// Register an author identity.
     pub fn registerIdentity(self: *Registry, pubkey: [32]u8, display_name: []const u8, email: []const u8) !void {
         var pubkey_hex = sign_mod.pubkeyHex(pubkey);
-        const now = std.time.timestamp();
+        const now = compat.timestampSec();
 
         var buf: [1024]u8 = undefined;
         const json = try std.fmt.bufPrint(&buf,
