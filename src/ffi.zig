@@ -138,6 +138,51 @@ export fn turbodb_insert_with_embedding(
     return 0;
 }
 
+/// Batch insert from a packed buffer. Wire format (caller packs):
+///   repeated { u32 key_len | key_bytes | u32 val_len | val_bytes }
+/// `count` records must be present. `out_ids` receives the doc_id for each,
+/// in input order. Returns 0 on full success, -1 on any parse/insert failure
+/// (after which `out_ids[0..N]` contains the IDs of the N items that
+/// succeeded before the failure; caller reads `*out_inserted` to know N).
+///
+/// Saves (count - 1) boundary crossings vs looping `turbodb_insert` from the
+/// host language.
+export fn turbodb_insert_many(
+    col_handle: *anyopaque,
+    packed_ptr: [*]const u8,
+    packed_len: usize,
+    count: u32,
+    out_ids: [*]u64,
+    out_inserted: *u32,
+) c_int {
+    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const buf = packed_ptr[0..packed_len];
+
+    var off: usize = 0;
+    var i: u32 = 0;
+    out_inserted.* = 0;
+    while (i < count) : (i += 1) {
+        if (off + 4 > buf.len) return -1;
+        const key_len = std.mem.readInt(u32, buf[off..][0..4], .little);
+        off += 4;
+        if (off + key_len > buf.len) return -1;
+        const key = buf[off..][0..key_len];
+        off += key_len;
+
+        if (off + 4 > buf.len) return -1;
+        const val_len = std.mem.readInt(u32, buf[off..][0..4], .little);
+        off += 4;
+        if (off + val_len > buf.len) return -1;
+        const val = buf[off..][0..val_len];
+        off += val_len;
+
+        const doc_id = col.insert(key, val) catch return -1;
+        out_ids[i] = doc_id;
+        out_inserted.* = i + 1;
+    }
+    return 0;
+}
+
 /// Get a document by key. On success, fills `out` with pointers into
 /// mmap'd memory (valid until next write to this collection).
 /// Returns 0 if found, -1 if not found.

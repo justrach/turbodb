@@ -466,6 +466,33 @@ pub const Collection = struct {
 
     /// Insert a document with a pre-computed embedding (no JSON parsing needed).
     /// This is the fast path — embedding is passed directly as f32 slice.
+
+    /// Batch insert multiple (key, value) pairs. Each pair goes through the
+    /// same single-insert path (no deeper internal batching yet — the primary
+    /// win is amortizing FFI boundary crossings and syscall-style entry
+    /// overhead across N items). Allocates nothing beyond what per-doc
+    /// `insert` allocates.
+    ///
+    /// On partial failure, returns the error and `out_doc_ids[0..i]` is
+    /// populated for the items that succeeded.
+    pub const BatchItem = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+    pub fn insertBatch(
+        self: *Collection,
+        items: []const BatchItem,
+        /// Optional output. If non-null, must have length >= items.len.
+        out_doc_ids: ?[]u64,
+    ) !usize {
+        var inserted: usize = 0;
+        for (items) |item| {
+            const id = try self.insert(item.key, item.value);
+            if (out_doc_ids) |ids| ids[inserted] = id;
+            inserted += 1;
+        }
+        return inserted;
+    }
     pub fn insertWithEmbedding(self: *Collection, key: []const u8, value: []const u8, embedding: []const f32) !u64 {
         const doc_id = self.insert(key, value) catch |e| return e;
         // insert() already handles vector extraction from JSON, but if embedding
