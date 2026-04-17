@@ -424,18 +424,13 @@ pub const Collection = struct {
                 const owned_val = self.alloc.dupe(u8, value) catch null;
                 if (owned_key != null and owned_val != null) {
                     const q = &self.index_queue;
-                    var retries: u32 = 0;
-                    while (!q.push(owned_key.?, owned_val.?)) {
-                        retries += 1;
-                        if (retries > 1000) {
-                            // Queue full — fall back to synchronous indexing.
-                            self.tri.indexFile(owned_key.?, owned_val.?) catch {};
-                            self.words.indexFile(owned_key.?, owned_val.?) catch {};
-                            self.alloc.free(owned_key.?);
-                            self.alloc.free(owned_val.?);
-                            break;
-                        }
-                        std.Thread.yield() catch {};
+                    if (!q.push(owned_key.?, owned_val.?)) {
+                        // Queue full — index synchronously rather than spinning.
+                        // The queue is there to absorb bursts, not to block producers.
+                        self.tri.indexFile(owned_key.?, owned_val.?) catch {};
+                        self.words.indexFile(owned_key.?, owned_val.?) catch {};
+                        self.alloc.free(owned_key.?);
+                        self.alloc.free(owned_val.?);
                     }
                     // Wake sleeping index worker to process the new entry.
                     _ = self.index_wake.fetchAdd(1, .release);
