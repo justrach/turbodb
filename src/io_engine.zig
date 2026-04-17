@@ -457,9 +457,6 @@ pub const EventLoop = struct {
     work_queue: *MpscRing(WorkItem, 4096),
     workers: []std.Thread,
     worker_count: usize,
-    /// Futex-based wake signal — workers sleep on this instead of spinning.
-    /// Incremented by the I/O thread after pushing work; workers wait on it.
-    wake_signal: std.atomic.Value(u32),
 
     pub fn init(alloc: Allocator, max_conns: usize) !EventLoop {
         const wq = try alloc.create(MpscRing(WorkItem, 4096));
@@ -477,7 +474,6 @@ pub const EventLoop = struct {
             .work_queue = wq,
             .workers = try alloc.alloc(std.Thread, n_workers),
             .worker_count = n_workers,
-            .wake_signal = std.atomic.Value(u32).init(0),
         };
     }
 

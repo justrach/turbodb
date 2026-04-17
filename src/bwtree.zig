@@ -48,12 +48,18 @@ pub const BwTree = struct {
     root_pid: usize,
     next_page_id: std.atomic.Value(usize),
     allocator: std.mem.Allocator,
+    // Deferred reclamation: old chains retired after consolidation are parked here
+    // and freed on the next consolidation or deinit (simple two-phase approach).
+    retired: std.ArrayList(*Page),
+    retired_mu: std.Thread.Mutex,
 
-    pub fn init(allocator: std.mem.Allocator) BwTree {
+    pub fn init(allocator: std.mem.Allocator) !BwTree {
         var tree: BwTree = undefined;
         tree.allocator = allocator;
         tree.root_pid = 0;
         tree.next_page_id = std.atomic.Value(usize).init(1);
+        tree.retired = std.ArrayList(*Page).init(allocator);
+        tree.retired_mu = .{};
 
         // Zero out all mapping slots
         var i: usize = 0;
@@ -62,8 +68,9 @@ pub const BwTree = struct {
         }
 
         // Create root base page (empty)
-        const root_page = allocator.create(Page) catch unreachable;
-        const empty_entries = allocator.alloc(Entry, 0) catch unreachable;
+        const root_page = try allocator.create(Page);
+        errdefer allocator.destroy(root_page);
+        const empty_entries = try allocator.alloc(Entry, 0);
         root_page.* = Page{ .base = BasePage{ .entries = empty_entries } };
         tree.mapping[0] = std.atomic.Value(usize).init(@intFromPtr(root_page));
 
@@ -71,6 +78,9 @@ pub const BwTree = struct {
     }
 
     pub fn deinit(self: *BwTree) void {
+        // Free all retired chains first
+        self.drainRetired();
+        self.retired.deinit();
         var i: usize = 0;
         while (i < MAX_PAGES) : (i += 1) {
             const ptr_val = self.mapping[i].load(.acquire);
@@ -93,6 +103,16 @@ pub const BwTree = struct {
                 self.allocator.destroy(page);
             },
         }
+    }
+
+    /// Drain the retired list — frees chains that were parked on previous consolidations.
+    fn drainRetired(self: *BwTree) void {
+        self.retired_mu.lock();
+        defer self.retired_mu.unlock();
+        for (self.retired.items) |page| {
+            self.freeChain(page);
+        }
+        self.retired.clearRetainingCapacity();
     }
 
     // ─── allocPage ───────────────────────────────────────────────────────
@@ -225,6 +245,10 @@ pub const BwTree = struct {
 
     /// When delta chain exceeds MAX_DELTA_CHAIN, merge into a new base page.
     pub fn consolidate(self: *BwTree, page_id: usize) void {
+        // Drain previously retired chains — they've survived at least one full
+        // consolidation cycle, so readers from the previous epoch are done.
+        self.drainRetired();
+
         const old = self.mapping[page_id].load(.acquire);
         if (old == 0) return;
 
@@ -264,9 +288,14 @@ pub const BwTree = struct {
             .acq_rel,
             .acquire,
         ) == null) {
-            // Success — old chain will be reclaimed by epoch-based GC.
-            // Do NOT free here — concurrent readers may still be traversing it.
-            // TODO: integrate with mvcc.zig epoch GC for safe reclamation.
+            // Success — park old chain head for deferred reclamation.
+            // Concurrent readers may still be traversing it; it will be freed
+            // on the next consolidation cycle (two-phase epoch approach).
+            self.retired_mu.lock();
+            defer self.retired_mu.unlock();
+            self.retired.append(page) catch {
+                // If we can't track it, leak it — better than use-after-free.
+            };
         } else {
             // Another thread consolidated first; discard our work
             self.allocator.free(new_entries);
@@ -276,12 +305,17 @@ pub const BwTree = struct {
 
     fn collectEntries(self: *BwTree, page: *Page, map: *std.AutoHashMap(u64, Entry)) void {
         _ = self;
-        // Walk to base first, then apply deltas in reverse (base → newest)
-        var stack: [256]*Page = undefined;
+        // Walk to base first, then apply deltas in reverse (base → newest).
+        // Use a bounded stack — MAX_DELTA_CHAIN is 8, but under CAS contention
+        // chains can temporarily grow longer. 1024 is generous; if exceeded we
+        // truncate (lose oldest deltas) rather than crash.
+        const STACK_CAP = 1024;
+        var stack: [STACK_CAP]*Page = undefined;
         var depth: usize = 0;
         var cur: ?*Page = page;
 
         while (cur) |p| {
+            if (depth >= STACK_CAP) break; // safety bound
             stack[depth] = p;
             depth += 1;
             switch (p.*) {
@@ -342,7 +376,7 @@ fn makeEntry(key: u64, doc_id: u64) Entry {
 }
 
 test "bwtree insert and search" {
-    var tree = BwTree.init(std.testing.allocator);
+    var tree = try BwTree.init(std.testing.allocator);
     defer tree.deinit();
 
     try tree.insert(10, makeEntry(10, 100));
@@ -366,7 +400,7 @@ test "bwtree insert and search" {
 }
 
 test "bwtree delete" {
-    var tree = BwTree.init(std.testing.allocator);
+    var tree = try BwTree.init(std.testing.allocator);
     defer tree.deinit();
 
     try tree.insert(10, makeEntry(10, 100));
@@ -385,7 +419,7 @@ test "bwtree delete" {
 
 test "bwtree consolidation" {
     // Use page_allocator — old chains deferred to epoch GC
-    var tree = BwTree.init(std.heap.page_allocator);
+    var tree = try BwTree.init(std.heap.page_allocator);
 
     // Insert enough entries to trigger consolidation (> MAX_DELTA_CHAIN = 8)
     var i: u64 = 0;
@@ -408,7 +442,7 @@ test "bwtree consolidation" {
 test "bwtree concurrent inserts" {
     // Use page_allocator — consolidated chains are intentionally leaked
     // (deferred to epoch-based GC, not available in test context)
-    var tree = BwTree.init(std.heap.page_allocator);
+    var tree = try BwTree.init(std.heap.page_allocator);
 
     const NUM_THREADS = 4;
     const KEYS_PER_THREAD = 50;

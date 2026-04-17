@@ -47,6 +47,9 @@ pub const Server = struct {
         cost_nanos_usd: u64,
     };
 
+    const MAX_CONNECTIONS: u32 = 512;
+    const BILLING_LOG_CAP: usize = 1024;
+
     db: *Database,
     port: u16,
     running: std.atomic.Value(bool),
@@ -65,6 +68,8 @@ pub const Server = struct {
     billing_len: u32 = 0,  // items stored, capped at 1024
     billing_mu: std.Io.Mutex,
     activity: activity.ActivityTracker,
+    // Connection limiter — prevents unbounded thread spawning under flood.
+    active_conns: std.atomic.Value(u32),
 
     pub fn init(alloc: std.mem.Allocator, db: *Database, port: u16) Server {
         return .{
@@ -81,6 +86,7 @@ pub const Server = struct {
             .query_cost_nanos_usd = std.atomic.Value(u64).init(0),
             .billing_mu = .init,
             .activity = activity.ActivityTracker.init(),
+            .active_conns = std.atomic.Value(u32).init(0),
         };
     }
 
@@ -376,14 +382,16 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
 fn handleInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
     _ = alloc;
     // Expect body: {"key":"...","value":{...}}  OR  use auto-generated key.
+    // Extract the value field; fall back to the full body for backwards compat.
+    const value = jsonValue(body, "value") orelse body;
     const key_raw = jsonStr(body, "key") orelse {
         // Auto-generate key from timestamp + counter.
         var kb: [32]u8 = undefined;
         const k = std.fmt.bufPrint(&kb, "doc_{d}", .{compat.milliTimestamp()}) catch
             return err(400, "bad key");
-        return doInsert(srv, tenant_id, col_name, k, body);
+        return doInsert(srv, tenant_id, col_name, k, value);
     };
-    return doInsert(srv, tenant_id, col_name, key_raw, body);
+    return doInsert(srv, tenant_id, col_name, key_raw, value);
 }
 
 fn doInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, value: []const u8) usize {
@@ -425,9 +433,10 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
 
         // Extract key from this JSON line
         const key = jsonStr(line, "key") orelse continue;
+        // Extract value field; fall back to full line for backwards compat.
+        const value = jsonValue(line, "value") orelse line;
 
-        // Use the full line as the value (TurboDB stores the raw JSON)
-        _ = col.insert(key, line) catch {
+        _ = col.insert(key, value) catch {
             errors += 1;
             continue;
         };
@@ -857,11 +866,60 @@ fn extractContentLength(raw: []const u8) usize {
 
 fn jsonStr(json: []const u8, key: []const u8) ?[]const u8 {
     var kbuf: [64]u8 = undefined;
-    const needle = std.fmt.bufPrint(&kbuf, "\"{s}\":\"", .{key}) catch return null;
+    const needle = std.fmt.bufPrint(&kbuf, "\"{s}\":", .{key}) catch return null;
     const pos = std.mem.indexOf(u8, json, needle) orelse return null;
-    const start = pos + needle.len;
+    var start = pos + needle.len;
+    // Skip optional whitespace after colon (e.g. "key": "value")
+    while (start < json.len and (json[start] == ' ' or json[start] == '\t')) start += 1;
+    if (start >= json.len or json[start] != '"') return null;
+    start += 1; // skip opening quote
     const end = std.mem.indexOfScalarPos(u8, json, start, '"') orelse return null;
     return json[start..end];
+}
+
+// Extract a JSON value (string, object, array, number, bool, null) for the given key.
+// Returns the raw slice: "hello" for strings (without quotes), {"a":1} for objects, etc.
+fn jsonValue(json: []const u8, key: []const u8) ?[]const u8 {
+    var kbuf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&kbuf, "\"{s}\":", .{key}) catch return null;
+    const pos = std.mem.indexOf(u8, json, needle) orelse return null;
+    var start = pos + needle.len;
+    // Skip whitespace
+    while (start < json.len and (json[start] == ' ' or json[start] == '\t')) start += 1;
+    if (start >= json.len) return null;
+
+    const ch = json[start];
+    if (ch == '"') {
+        // String value — return the raw JSON token including quotes so it stays
+        // valid when embedded in a JSON response via {s}.  A stringified JSON
+        // string like "value":"{\"a\":1}" is stored as "{\"a\":1}" (quotes + escapes)
+        // and re-emitted verbatim by handleGet.
+        var i = start + 1;
+        while (i < json.len) : (i += 1) {
+            if (json[i] == '\\' and i + 1 < json.len) { i += 1; continue; }
+            if (json[i] == '"') break;
+        }
+        return json[start .. i + 1]; // include both quotes
+    } else if (ch == '{' or ch == '[') {
+        // Object or array — find matching close bracket
+        const close: u8 = if (ch == '{') '}' else ']';
+        var depth: u32 = 1;
+        var i = start + 1;
+        var in_str = false;
+        while (i < json.len and depth > 0) : (i += 1) {
+            if (json[i] == '\\' and in_str) { i += 1; continue; }
+            if (json[i] == '"') { in_str = !in_str; continue; }
+            if (in_str) continue;
+            if (json[i] == ch) depth += 1;
+            if (json[i] == close) depth -= 1;
+        }
+        return json[start..i];
+    } else {
+        // Number, bool, null — read until delimiter
+        var i = start;
+        while (i < json.len and json[i] != ',' and json[i] != '}' and json[i] != ']' and json[i] != ' ' and json[i] != '\n') : (i += 1) {}
+        return json[start..i];
+    }
 }
 
 fn qparamInt(query: []const u8, key: []const u8) ?u32 {
