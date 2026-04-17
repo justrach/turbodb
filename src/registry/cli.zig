@@ -143,7 +143,8 @@ fn cmdInit(alloc: std.mem.Allocator, args: []const []const u8) !void {
 }
 
 fn cmdKeygen() !void {
-    const home = std.posix.getenv("HOME") orelse "/tmp";
+    const home_cstr = std.c.getenv("HOME");
+    const home: []const u8 = if (home_cstr) |p| std.mem.span(@as([*:0]const u8, @ptrCast(p))) else "/tmp";
     var path_buf: [512]u8 = undefined;
     const keys_dir = try std.fmt.bufPrint(&path_buf, "{s}/.zag/keys", .{home});
 

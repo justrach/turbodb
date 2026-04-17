@@ -5,6 +5,7 @@
 /// Keypairs are stored at ~/.zag/keys/
 const std = @import("std");
 const compat = @import("compat");
+const runtime = @import("runtime");
 const Ed25519 = std.crypto.sign.Ed25519;
 
 pub const KeyPair = struct {
@@ -13,7 +14,7 @@ pub const KeyPair = struct {
 
     /// Generate a new random Ed25519 keypair.
     pub fn generate() KeyPair {
-        const kp = Ed25519.KeyPair.generate();
+        const kp = Ed25519.KeyPair.generate(runtime.io);
         return .{
             .public_key = kp.public_key.toBytes(),
             .secret_key = kp.secret_key.toBytes(),
@@ -102,40 +103,40 @@ pub fn saveKeyPair(kp: KeyPair, dir_path: []const u8) !void {
     compat.fs.cwdMakePath(dir_path) catch {};
 
     var dir = try compat.fs.cwdOpenDir(dir_path, .{});
-    defer dir.close();
+    defer dir.close(runtime.io);
 
     // Write public key
     {
         var hex: [64]u8 = undefined;
         hexEncode32(kp.public_key, &hex);
-        const file = try dir.createFile("default.pub", .{});
-        defer file.close();
-        try file.writeAll(&hex);
-        try file.writeAll("\n");
+        const file = try dir.createFile(runtime.io, "default.pub", .{});
+        defer file.close(runtime.io);
+        try file.writeStreamingAll(runtime.io, &hex);
+        try file.writeStreamingAll(runtime.io, "\n");
     }
 
     // Write secret key
     {
         var hex: [128]u8 = undefined;
         hexEncode64(kp.secret_key, &hex);
-        const file = try dir.createFile("default.sec", .{});
-        defer file.close();
-        try file.writeAll(&hex);
-        try file.writeAll("\n");
+        const file = try dir.createFile(runtime.io, "default.sec", .{});
+        defer file.close(runtime.io);
+        try file.writeStreamingAll(runtime.io, &hex);
+        try file.writeStreamingAll(runtime.io, "\n");
     }
 }
 
 /// Load keypair from directory.
 pub fn loadKeyPair(dir_path: []const u8) !KeyPair {
     var dir = try compat.fs.cwdOpenDir(dir_path, .{});
-    defer dir.close();
+    defer dir.close(runtime.io);
 
     // Read public key
     var pub_buf: [128]u8 = undefined;
     const pub_len = blk: {
-        const file = try dir.openFile("default.pub", .{});
-        defer file.close();
-        const n = try file.readAll(&pub_buf);
+        const file = try dir.openFile(runtime.io, "default.pub", .{});
+        defer file.close(runtime.io);
+        const n = try compat.fs.fileReadAll(file, &pub_buf);
         break :blk n;
     };
     // Trim trailing newline
@@ -146,9 +147,9 @@ pub fn loadKeyPair(dir_path: []const u8) !KeyPair {
     // Read secret key
     var sec_buf: [256]u8 = undefined;
     const sec_len = blk: {
-        const file = try dir.openFile("default.sec", .{});
-        defer file.close();
-        const n = try file.readAll(&sec_buf);
+        const file = try dir.openFile(runtime.io, "default.sec", .{});
+        defer file.close(runtime.io);
+        const n = try compat.fs.fileReadAll(file, &sec_buf);
         break :blk n;
     };
     var sec_hex = sec_buf[0..sec_len];

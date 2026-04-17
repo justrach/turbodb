@@ -19,6 +19,7 @@
 
 const std = @import("std");
 const runtime = @import("runtime");
+const compat = @import("compat");
 
 // ─── Filesystem (cwd) ─────────────────────────────────────────────────────
 // Each wrapper does `std.Io.Dir.cwd().X(runtime.io, ...)`.

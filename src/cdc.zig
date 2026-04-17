@@ -116,8 +116,8 @@ pub const CDCManager = struct {
             .deliveries = .empty,
             .next_subscription_id = std.atomic.Value(u64).init(1),
             .next_seq = std.atomic.Value(u64).init(1),
-            .mu = .{},
-            .cond = .{},
+            .mu = .init,
+            .cond = .init,
             .running = std.atomic.Value(bool).init(false),
             .worker = null,
         };

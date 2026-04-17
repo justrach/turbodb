@@ -1,6 +1,7 @@
 const std = @import("std");
 const sequencer = @import("sequencer.zig");
 const runtime = @import("runtime");
+const compat = @import("compat");
 
 pub const NodeId = u16;
 

@@ -623,8 +623,9 @@ export fn turbodb_branch_diff(
     const br = col.getBranch(branch_name[0..branch_len]) orelse return -1;
     const branch_mod = @import("branch.zig");
 
-    var buf: std.ArrayList(u8) = .empty;
-    const w = buf.writer(alloc);
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    const w = &aw.writer;
     w.writeAll("{\"files\":[") catch return -1;
 
     var first_file = true;
@@ -655,7 +656,7 @@ export fn turbodb_branch_diff(
                 .added => "added",
                 .removed => "removed",
             };
-            std.fmt.format(w, "{{\"no\":{d},\"kind\":\"{s}\",\"text\":\"", .{ d.line_no, kind_str }) catch return -1;
+            w.print("{{\"no\":{d},\"kind\":\"{s}\",\"text\":\"", .{ d.line_no, kind_str }) catch return -1;
             // Escape text for JSON
             for (d.text) |c| {
                 switch (c) {
@@ -673,8 +674,7 @@ export fn turbodb_branch_diff(
     }
 
     w.writeAll("]}") catch return -1;
-
-    const json = buf.toOwnedSlice(alloc) catch return -1;
+    const json = aw.toOwnedSlice() catch return -1;
     out_json.* = json.ptr;
     out_len.* = @intCast(json.len);
     return 0;
@@ -742,28 +742,28 @@ export fn turbodb_discover_context(
     defer result.deinit();
 
     // Format as JSON
-    var buf: std.ArrayList(u8) = .empty;
-    const w = buf.writer(alloc);
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    const w = &aw.writer;
 
     w.writeAll("{\"matching_files\":[") catch return -1;
     for (result.matching_files, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch return -1;
-        std.fmt.format(w, "{{\"key\":\"{s}\",\"size\":{d}}}", .{ d.key, d.value.len }) catch return -1;
+        w.print("{{\"key\":\"{s}\",\"size\":{d}}}", .{ d.key, d.value.len }) catch return -1;
     }
     w.writeAll("],\"related_files\":[") catch return -1;
     for (result.related_files, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch return -1;
-        std.fmt.format(w, "{{\"key\":\"{s}\"}}", .{d.key}) catch return -1;
+        w.print("{{\"key\":\"{s}\"}}", .{d.key}) catch return -1;
     }
     w.writeAll("],\"test_files\":[") catch return -1;
     for (result.test_files, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch return -1;
-        std.fmt.format(w, "{{\"key\":\"{s}\"}}", .{d.key}) catch return -1;
+        w.print("{{\"key\":\"{s}\"}}", .{d.key}) catch return -1;
     }
-    std.fmt.format(w, "],\"recent_versions\":{d},\"total_files\":{d}}}", .{ result.recent_versions, result.total_files }) catch return -1;
-
+    w.print("],\"recent_versions\":{d},\"total_files\":{d}}}", .{ result.recent_versions, result.total_files }) catch return -1;
+    const json = aw.toOwnedSlice() catch return -1;
     // Copy to output
-    const json = buf.toOwnedSlice(alloc) catch return -1;
     out_json.* = json.ptr;
     out_len.* = @intCast(json.len);
     return 0;

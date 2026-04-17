@@ -333,7 +333,7 @@ pub const Collection = struct {
         var total_ns: u64 = 0;
         const max_ns: u64 = 30_000_000_000; // 30s total cap
         while ((self.index_queue.len() > 0 or self.index_queue2.len() > 0 or self.indexing_count.load(.acquire) > 0) and total_ns < max_ns) {
-            std.Thread.sleep(sleep_ns);
+            compat.threadSleep(sleep_ns);
             total_ns += sleep_ns;
             // Exponential backoff: 100µs → 200µs → ... → 10ms cap.
             sleep_ns = @min(sleep_ns * 2, 10_000_000);
@@ -1521,7 +1521,7 @@ pub const Database = struct {
         db.cdc = cdc_mod.CDCManager.init(alloc);
         try db.cdc.start();
         db.alloc = alloc;
-        db.mu = .{};
+        db.mu = .init;
         db.auth = .{};
 
         const n = @min(resolved_data_dir.len, 255);
@@ -1755,7 +1755,6 @@ fn makeStorageName(buf: []u8, tenant_id: []const u8, collection_name: []const u8
     try appendSanitizedComponent(&w, collection_name);
     return w.buffered();
 }
-}
 
 fn appendSanitizedComponent(writer: anytype, input: []const u8) !void {
     for (input) |c| {
@@ -1918,7 +1917,7 @@ test "cdc emits signed ordered deliveries for tenant mutations" {
     _ = try col.insert("u1", "{\"name\":\"alice\"}");
     _ = try col.update("u1", "{\"name\":\"alice-2\"}");
     try std.testing.expect(try col.delete("u1"));
-    std.Thread.sleep(20_000_000);
+    compat.threadSleep(20_000_000);
 
     const deliveries = try db.listWebhookDeliveries(alloc, "tenant-a");
     defer alloc.free(deliveries);

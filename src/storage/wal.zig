@@ -153,7 +153,7 @@ pub const WAL = struct {
 
     fn flushLoop(self: *WAL) void {
         while (self.flush_running.load(.acquire)) {
-            std.Thread.sleep(1_000_000); // 1ms
+            compat.threadSleep(1_000_000); // 1ms
             self.flushPending();
         }
         // Final flush on shutdown

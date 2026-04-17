@@ -230,7 +230,7 @@ pub const ParallelWAL = struct {
     fn flusherLoop(self: *ParallelWAL) void {
         while (self.running.load(.acquire) == 1) {
             self.groupCommit() catch {};
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            compat.threadSleep(1 * std.time.ns_per_ms);
         }
         // Final flush on shutdown.
         self.groupCommit() catch {};
@@ -358,7 +358,7 @@ test "ParallelWAL background flusher runs" {
     _ = try wal.write(.put, 99, "flusher-test");
 
     // Sleep a bit to let the flusher run at least once (~1 ms interval).
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    compat.threadSleep(10 * std.time.ns_per_ms);
 
     const epoch = wal.current_epoch.load(.acquire);
     try std.testing.expect(epoch >= 1);

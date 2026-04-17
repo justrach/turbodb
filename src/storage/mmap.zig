@@ -22,8 +22,8 @@ pub const MmapFile = struct {
 
     pub fn open(path: [:0]const u8, initial_size: usize) !MmapFile {
         const flags = posix.O{ .ACCMODE = .RDWR, .CREAT = true };
-        const fd = try posix.open(path, flags, 0o644);
-        errdefer posix.close(fd);
+        const fd = try posix.openatZ(posix.AT.FDCWD, path, flags, 0o644);
+        errdefer _ = std.c.close(fd);
 
         const stat = try posix.fstat(fd);
         const existing: usize = @intCast(stat.size);
@@ -33,7 +33,7 @@ pub const MmapFile = struct {
         );
 
         if (@as(usize, @intCast(stat.size)) < capacity)
-            try posix.ftruncate(fd, @intCast(capacity));
+            if (std.c.ftruncate(fd, @intCast(capacity)) != 0) return error.FtruncateFailed;
 
         const ptr = try posix.mmap(
             null, capacity,
@@ -52,7 +52,7 @@ pub const MmapFile = struct {
 
     pub fn close(self: *MmapFile) void {
         posix.munmap(@alignCast(self.ptr[0..self.capacity]));
-        posix.close(self.fd);
+        _ = std.c.close(self.fd);
     }
 
     // ── Sync / Checkpoint ─────────────────────────────────────────────────────
@@ -75,7 +75,7 @@ pub const MmapFile = struct {
         }
         const new_cap = alignUp(needed_len + GROW_CHUNK, PAGE_SIZE);
         // Extend file
-        try posix.ftruncate(self.fd, @intCast(new_cap));
+        if (std.c.ftruncate(self.fd, @intCast(new_cap)) != 0) return error.FtruncateFailed;
         // Remap (macOS has no mremap; unmap then remap)
         posix.munmap(@alignCast(self.ptr[0..self.capacity]));
         const ptr = try posix.mmap(

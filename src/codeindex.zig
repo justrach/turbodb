@@ -101,7 +101,7 @@ pub const WordIndex = struct {
                 if (!gop.found_existing) {
                     const duped_word = try self.allocator.dupe(u8, word);
                     gop.key_ptr.* = duped_word;
-                    gop.value_ptr.* = .{};
+                    gop.value_ptr.* = .empty;
                 }
 
                 if (gop.value_ptr.items.len > 0) {
@@ -381,7 +381,7 @@ pub const TrigramIndex = struct {
 
             const idx_gop = try self.index.getOrPut(tri);
             if (!idx_gop.found_existing) {
-                idx_gop.value_ptr.* = .{};
+                idx_gop.value_ptr.* = .empty;
             }
             postingSortedInsert(idx_gop.value_ptr, self.allocator, .{ .file_id = file_id, .mask = PostingMask{ .loc_mask = 0xFF, .next_mask = 0xFF } });
         }
@@ -456,7 +456,7 @@ pub const TrigramIndex = struct {
 
                 const idx_gop = self.index.getOrPut(tri) catch continue;
                 if (!idx_gop.found_existing) {
-                    idx_gop.value_ptr.* = .{};
+                    idx_gop.value_ptr.* = .empty;
                 }
                 postingSortedInsert(idx_gop.value_ptr, self.allocator, .{ .file_id = file_id, .mask = PostingMask{ .loc_mask = 0xFF, .next_mask = 0xFF } });
             }

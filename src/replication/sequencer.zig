@@ -56,7 +56,7 @@ pub const Sequencer = struct {
             .next_seq = 0,
             .current_epoch = 0,
             .batch_window_ns = default_batch_window_ns,
-            .mu = .{},
+            .mu = .init,
         };
     }
 
