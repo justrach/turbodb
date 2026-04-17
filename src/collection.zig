@@ -29,14 +29,44 @@ pub const MAX_TENANT_ID_LEN: usize = 64;
 pub const MAX_COLLECTION_NAME_LEN: usize = 64;
 
 // ─── IndexQueue ──────────────────────────────────────────────────────────
-// Lock-free MPSC queue for deferring trigram+word index builds to a background thread.
-// Insert path pushes owned (key, value) pairs; background thread pops and indexes.
+// ─── IndexQueue ──────────────────────────────────────────────────────────
+// Lock-free MPSC queue for deferring trigram+word index builds to a background
+// thread. Previously each push allocated TWICE (dupe(key) + dupe(value)) on
+// every insert, hitting the GPA global mutex on the hot path. Now:
+//   - Docs with (key.len + value.len) <= INLINE_CAP are stored inline in the
+//     entry. Zero heap alloc.
+//   - Larger docs get ONE heap allocation (both key and value in a single
+//     contiguous buffer) instead of two.
 pub const IndexQueue = struct {
     const CAPACITY = 32768; // 32K entries per queue
 
-    const Entry = struct {
-        key: []const u8,
-        value: []const u8,
+    /// Entries under this combined size store key+value inline.
+    /// Tuned to keep Entry close to one cache line (2 × 64 B).
+    const INLINE_CAP: usize = 240;
+
+    pub const Entry = struct {
+        // When `heap` is false, key and value live in `inline_buf`.
+        // When `heap` is true, they live in `heap_ptr[0..total_len]`.
+        inline_buf: [INLINE_CAP]u8,
+        heap_ptr: [*]u8,
+        key_len: u32,
+        total_len: u32,
+        heap: bool,
+
+        pub fn keySlice(self: *const Entry) []const u8 {
+            const base: [*]const u8 = if (self.heap) self.heap_ptr else &self.inline_buf;
+            return base[0..self.key_len];
+        }
+
+        pub fn valueSlice(self: *const Entry) []const u8 {
+            const base: [*]const u8 = if (self.heap) self.heap_ptr else &self.inline_buf;
+            return base[self.key_len..self.total_len];
+        }
+
+        /// Release any heap storage owned by this entry.
+        pub fn deinit(self: *Entry, alloc: std.mem.Allocator) void {
+            if (self.heap) alloc.free(self.heap_ptr[0..self.total_len]);
+        }
     };
 
     buf: []Entry,
@@ -58,27 +88,52 @@ pub const IndexQueue = struct {
     }
 
     /// Push a (key, value) pair. Lock-free MPSC via CAS + per-slot ready flag.
+    /// Returns false if the queue is full — caller keeps ownership of
+    /// key/value and is responsible for falling back to a synchronous index.
     pub fn push(self: *IndexQueue, key: []const u8, value: []const u8) bool {
+        const total = key.len + value.len;
+        // Construct entry payload first so we don't hold a slot while allocating.
+        var new_entry: Entry = .{
+            .inline_buf = undefined,
+            .heap_ptr = undefined,
+            .key_len = @intCast(key.len),
+            .total_len = @intCast(total),
+            .heap = false,
+        };
+        if (total <= INLINE_CAP) {
+            @memcpy(new_entry.inline_buf[0..key.len], key);
+            @memcpy(new_entry.inline_buf[key.len..total], value);
+        } else {
+            const heap = self.alloc.alloc(u8, total) catch return false;
+            @memcpy(heap[0..key.len], key);
+            @memcpy(heap[key.len..], value);
+            new_entry.heap_ptr = heap.ptr;
+            new_entry.heap = true;
+        }
+        errdefer if (new_entry.heap) self.alloc.free(new_entry.heap_ptr[0..total]);
+
         while (true) {
             const h = self.head.load(.acquire);
             const next = (h + 1) % CAPACITY;
-            if (next == self.tail.load(.acquire)) return false; // full
-            // Atomically claim this slot by advancing head.
+            if (next == self.tail.load(.acquire)) {
+                // Queue full — release any heap we allocated before returning.
+                if (new_entry.heap) self.alloc.free(new_entry.heap_ptr[0..total]);
+                return false;
+            }
             if (self.head.cmpxchgWeak(h, next, .acq_rel, .monotonic)) |_| {
                 continue; // CAS failed — another producer won, retry
             }
-            // We own slot h — write data then signal readiness.
-            self.buf[h] = .{ .key = key, .value = value };
+            self.buf[h] = new_entry;
             self.ready[h].store(1, .release);
             return true;
         }
     }
 
     /// Pop one entry. Returns null if empty or next slot not yet ready.
+    /// Caller owns any heap storage and must call `entry.deinit(alloc)`.
     pub fn pop(self: *IndexQueue) ?Entry {
         const t = self.tail.load(.acquire);
-        if (t == self.head.load(.acquire)) return null; // empty
-        // Wait for the producer to finish writing this slot.
+        if (t == self.head.load(.acquire)) return null;
         if (self.ready[t].load(.acquire) == 0) return null;
         const entry = self.buf[t];
         self.ready[t].store(0, .release);
@@ -280,14 +335,14 @@ pub const Collection = struct {
         runtime.io.futexWake(u32, &self.index_wake.raw, std.math.maxInt(u32));
         if (self.index_thread) |t| t.join();
         if (self.index_thread2) |t| t.join();
-        // Drain any leftover entries from both queues (free owned slices).
-        while (self.index_queue.pop()) |entry| {
-            self.alloc.free(entry.key);
-            self.alloc.free(entry.value);
+        // Drain any leftover entries from both queues, freeing heap storage.
+        while (self.index_queue.pop()) |popped| {
+            var e = popped;
+            e.deinit(self.alloc);
         }
-        while (self.index_queue2.pop()) |entry| {
-            self.alloc.free(entry.key);
-            self.alloc.free(entry.value);
+        while (self.index_queue2.pop()) |popped| {
+            var e = popped;
+            e.deinit(self.alloc);
         }
         self.index_queue.deinit();
         self.index_queue2.deinit();
@@ -420,19 +475,14 @@ pub const Collection = struct {
                 self.tri.indexFile(key, value) catch {};
                 self.words.indexFile(key, value) catch {};
             } else {
-                const owned_key = self.alloc.dupe(u8, key) catch null;
-                const owned_val = self.alloc.dupe(u8, value) catch null;
-                if (owned_key != null and owned_val != null) {
-                    const q = &self.index_queue;
-                    if (!q.push(owned_key.?, owned_val.?)) {
-                        // Queue full — index synchronously rather than spinning.
-                        // The queue is there to absorb bursts, not to block producers.
-                        self.tri.indexFile(owned_key.?, owned_val.?) catch {};
-                        self.words.indexFile(owned_key.?, owned_val.?) catch {};
-                        self.alloc.free(owned_key.?);
-                        self.alloc.free(owned_val.?);
-                    }
-                    // Wake sleeping index worker to process the new entry.
+                // Queue's push() now owns storage internally — inline for small
+                // docs, one contiguous heap alloc for large. No dupe per side.
+                const q = &self.index_queue;
+                if (!q.push(key, value)) {
+                    // Queue full — fall back to synchronous indexing.
+                    self.tri.indexFile(key, value) catch {};
+                    self.words.indexFile(key, value) catch {};
+                } else {
                     _ = self.index_wake.fetchAdd(1, .release);
                     runtime.io.futexWake(u32, &self.index_wake.raw, 1);
                 }
@@ -1453,48 +1503,45 @@ pub const Collection = struct {
 /// Background thread that drains the index queue and builds trigram indexes.
 fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
     const BATCH = 64;
+    // Store full Entry values — inline storage lives inside them and must
+    // outlive the slice views we hand to indexBatch.
+    var batch: [BATCH]IndexQueue.Entry = undefined;
     var batch_keys: [BATCH][]const u8 = undefined;
     var batch_vals: [BATCH][]const u8 = undefined;
     var reusable_tris = std.AutoHashMap(codeindex.Trigram, void).init(col.alloc);
     defer reusable_tris.deinit();
 
     while (!col.index_stop.load(.acquire)) {
-        // Signal "working" BEFORE popping so flushIndex doesn't see
-        // an empty queue + zero count between pop and processing.
         _ = col.indexing_count.fetchAdd(1, .release);
         var n: usize = 0;
         while (n < BATCH) {
-            const entry = queue.pop() orelse break;
-            batch_keys[n] = entry.key;
-            batch_vals[n] = entry.value;
+            const popped = queue.pop() orelse break;
+            batch[n] = popped;
+            batch_keys[n] = batch[n].keySlice();
+            batch_vals[n] = batch[n].valueSlice();
             n += 1;
         }
         if (n == 0) {
             _ = col.indexing_count.fetchSub(1, .release);
-            // Sleep on futex instead of spinning — woken by index push path.
             const cur = col.index_wake.load(.acquire);
             if (!col.index_stop.load(.acquire))
                 runtime.io.futexWaitTimeout(u32, &col.index_wake.raw, cur, .{ .duration = .{ .raw = std.Io.Duration.fromNanoseconds(50_000_000), .clock = .awake } }) catch {};
             continue;
         }
-        // Batch trigram indexing (single lock acquisition for all docs).
         col.tri.indexBatch(batch_keys[0..n], batch_vals[0..n], &reusable_tris) catch {};
-        // Word indexing (per-doc, no batching needed).
         for (0..n) |i| {
             col.words.indexFile(batch_keys[i], batch_vals[i]) catch {};
         }
-        for (0..n) |i| {
-            col.alloc.free(batch_vals[i]);
-            col.alloc.free(batch_keys[i]);
-        }
+        // Release per-entry heap storage (inline entries are no-ops).
+        for (0..n) |i| batch[i].deinit(col.alloc);
         _ = col.indexing_count.fetchSub(1, .release);
     }
     // Final drain on shutdown.
-    while (queue.pop()) |entry| {
-        col.tri.indexFile(entry.key, entry.value) catch {};
-        col.words.indexFile(entry.key, entry.value) catch {};
-        col.alloc.free(entry.value);
-        col.alloc.free(entry.key);
+    while (queue.pop()) |popped| {
+        var e = popped;
+        col.tri.indexFile(e.keySlice(), e.valueSlice()) catch {};
+        col.words.indexFile(e.keySlice(), e.valueSlice()) catch {};
+        e.deinit(col.alloc);
     }
 }
 
