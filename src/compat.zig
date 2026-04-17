@@ -112,6 +112,27 @@ pub fn threadSleep(nanoseconds: u64) void {
 // `std.crypto.random` is gone. `runtime.io.random` is threadsafe and seeded
 // from the process-wide CSPRNG.
 
+
+// ─── Command-line arguments ───────────────────────────────────────────────
+// `std.process.argsAlloc` is gone in 0.16. The new structured `main(init)`
+// passes args via `init.minimal.args`. These helpers collect them into a
+// heap-owned `[][:0]const u8` slice so existing index-based parsing keeps
+// working with minimal changes.
+
+pub fn argsAlloc(gpa: std.mem.Allocator, args: std.process.Args) ![][:0]const u8 {
+    var list: std.ArrayList([:0]const u8) = .empty;
+    errdefer list.deinit(gpa);
+    var it = std.process.Args.Iterator.init(args);
+    while (it.next()) |arg| {
+        try list.append(gpa, arg);
+    }
+    return list.toOwnedSlice(gpa);
+}
+
+pub fn argsFree(gpa: std.mem.Allocator, args: [][:0]const u8) void {
+    gpa.free(args);
+}
+
 pub fn randomBytes(buffer: []u8) void {
     runtime.io.random(buffer);
 }

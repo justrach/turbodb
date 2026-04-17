@@ -5,6 +5,8 @@ const doc_mod = @import("doc.zig");
 const wal_mod = @import("wal");
 const epoch_mod = @import("epoch");
 const cdc_mod = @import("cdc.zig");
+const runtime = @import("runtime");
+const compat = @import("compat");
 
 const Collection = collection_mod.Collection;
 const Database = collection_mod.Database;
@@ -255,6 +257,9 @@ fn emitJSON() void {
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 pub fn main() !void {
+    runtime.init(std.heap.c_allocator);
+    defer runtime.deinit();
+
     std.debug.print("\n", .{});
     std.debug.print("TurboDB Partition Scaling Benchmark\n", .{});
     std.debug.print("{s}", .{"\xe2\x95\x90" ** 24 ++ "\n"});

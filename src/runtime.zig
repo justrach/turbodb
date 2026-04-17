@@ -34,6 +34,16 @@ pub fn init(gpa: std.mem.Allocator) void {
     initialized = true;
 }
 
+/// Publish an externally-owned Io (e.g. `std.process.Init.io` from the new
+/// structured main) as the process-wide runtime. Preferred over `init()`
+/// because the stdlib start code already instantiates Io based on build
+/// options; we just piggyback on it.
+pub fn setIo(external: std.Io) void {
+    if (initialized) return;
+    io = external;
+    initialized = true;
+}
+
 pub fn deinit() void {
     if (!initialized) return;
     threaded.deinit();

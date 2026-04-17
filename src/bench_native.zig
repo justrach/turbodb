@@ -1,8 +1,12 @@
 const std = @import("std");
 const client = @import("client.zig");
+const runtime = @import("runtime");
+const compat = @import("compat");
 
 pub fn main() !void {
     const alloc = std.heap.c_allocator;
+    runtime.init(alloc);
+    defer runtime.deinit();
     const data_dir = "/tmp/turbodb_native_bench";
     std.fs.cwd().deleteTree(data_dir) catch {};
 

@@ -11,6 +11,8 @@ const collection_mod = @import("collection.zig");
 const doc_mod = @import("doc.zig");
 const sequencer = @import("replication/sequencer.zig");
 const calvin = @import("replication/calvin.zig");
+const runtime = @import("runtime");
+const compat = @import("compat");
 
 const Database = collection_mod.Database;
 const Collection = collection_mod.Collection;
@@ -88,10 +90,9 @@ fn makeTxn(alloc: std.mem.Allocator, txn_id: u64, txn_type: sequencer.TxnType, c
     };
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
+    runtime.setIo(init.io);
 
     // Clean up any previous test data
     std.fs.cwd().deleteTree("/tmp/calvin_test_leader") catch {};

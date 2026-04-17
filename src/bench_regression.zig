@@ -7,6 +7,8 @@ const lsm_mod = @import("lsm.zig");
 const columnar_mod = @import("columnar.zig");
 const mvcc_mod = @import("mvcc.zig");
 const btree_mod = @import("btree.zig");
+const runtime = @import("runtime");
+const compat = @import("compat");
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TurboDB Regression Benchmark
@@ -459,6 +461,9 @@ fn emitJSON() void {
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 pub fn main() !void {
+    runtime.init(std.heap.c_allocator);
+    defer runtime.deinit();
+
     std.debug.print("\n", .{});
     std.debug.print("TurboDB Regression Benchmark\n", .{});
     std.debug.print("{s}", .{"\xe2\x95\x90" ** 24 ++ "\n"});

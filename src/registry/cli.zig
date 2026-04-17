@@ -20,18 +20,19 @@ const registry_mod = @import("registry.zig");
 const resolver_mod = @import("resolver.zig");
 const config_mod = @import("config.zig");
 const auth_mod = @import("auth.zig");
+const runtime = @import("runtime");
+const compat = @import("compat");
 
 const DEFAULT_REGISTRY = "http://localhost:8080";
 const ZAG_DIR = ".zag";
 const GLOBAL_DIR = ".zag"; // ~/.zag/
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
+    runtime.setIo(init.io);
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const args = try compat.argsAlloc(alloc, init.minimal.args);
+    defer compat.argsFree(alloc, args);
 
     if (args.len < 2) {
         printUsage();

@@ -11,6 +11,8 @@ const codeindex = @import("codeindex.zig");
 const fast_index = @import("fast_index.zig");
 const parallel_index = @import("parallel_index.zig");
 const disk_index = @import("disk_index.zig");
+const runtime = @import("runtime");
+const compat = @import("compat");
 const Database = collection_mod.Database;
 
 const EXTS = [_][]const u8{
@@ -53,25 +55,14 @@ const Timer = struct {
     }
 };
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     // Use page_allocator for speed (no safety overhead in profiling mode)
     // Switch to GPA for leak/safety checks
-    var gpa = std.heap.GeneralPurposeAllocator(.{
-        .safety = true,
-        .never_unmap = true, // keeps freed pages mapped for use-after-free detection
-    }){};
-    defer {
-        const check = gpa.deinit();
-        if (check == .leak) {
-            std.debug.print("\n  ⚠ MEMORY LEAK DETECTED\n", .{});
-        } else {
-            std.debug.print("\n  ✓ No memory leaks\n", .{});
-        }
-    }
-    const alloc = gpa.allocator();
+    const alloc = init.gpa;
+    runtime.setIo(init.io);
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const args = try compat.argsAlloc(alloc, init.minimal.args);
+    defer compat.argsFree(alloc, args);
 
     if (args.len < 2) {
         std.debug.print("Usage: profile <codebase-dir>\n", .{});

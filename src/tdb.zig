@@ -13,6 +13,8 @@
 const std = @import("std");
 const collection_mod = @import("collection.zig");
 const codeindex = @import("codeindex.zig");
+const runtime = @import("runtime");
+const compat = @import("compat");
 const Database = collection_mod.Database;
 const Collection = collection_mod.Collection;
 
@@ -22,13 +24,12 @@ const EXTS = [_][]const u8{
     ".json", ".toml", ".yaml", ".yml", ".md",
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
+    runtime.setIo(init.io);
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const args = try compat.argsAlloc(alloc, init.minimal.args);
+    defer compat.argsFree(alloc, args);
 
     var data_dir: []const u8 = "./turbodb_data";
     var col_name: []const u8 = "code";

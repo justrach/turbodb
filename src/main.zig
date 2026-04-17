@@ -3,15 +3,16 @@ const std = @import("std");
 const collection = @import("collection.zig");
 const server = @import("server.zig");
 const wire = @import("wire.zig");
+const runtime = @import("runtime");
+const compat = @import("compat");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
+    runtime.setIo(init.io);
 
     // ── CLI args ──────────────────────────────────────────────────────────
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const args = try compat.argsAlloc(alloc, init.minimal.args);
+    defer compat.argsFree(alloc, args);
 
     var data_dir: []const u8 = "./turbodb_data";
     var port: u16 = 27017;
