@@ -251,6 +251,9 @@ pub const Collection = struct {
     index_thread: ?std.Thread,
     index_thread2: ?std.Thread,
     index_stop: std.atomic.Value(bool),
+    /// Futex signal — index workers sleep on this when queues are empty.
+    /// Insert path bumps it + futexWake; workers futexWait when both queues drain.
+    index_wake: std.atomic.Value(u32),
     queue_toggle: std.atomic.Value(u32),
     indexing_count: std.atomic.Value(u32),
 

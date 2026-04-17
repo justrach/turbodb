@@ -8,6 +8,7 @@
 //! ftruncate + remap syscalls.  On macOS (no mremap) we munmap and remap.
 const std   = @import("std");
 const posix = std.posix;
+const runtime = @import("runtime");
 
 pub const GROW_CHUNK: usize = 256 * 1024 * 1024; // 256 MiB
 pub const PAGE_SIZE:  usize = 4096;
@@ -19,7 +20,7 @@ pub const MmapFile = struct {
     capacity: usize,        // mapped (file) length; >= len, multiple of PAGE_SIZE
     /// Protects ptr/capacity against concurrent grow+read.
     /// Writers (grow) take exclusive; readers (at/slice) take shared.
-    rw_lock:  std.Thread.RwLock,
+    rw_lock:  std.Io.RwLock,
 
     // ── Open / Close ──────────────────────────────────────────────────────────
 
@@ -51,7 +52,7 @@ pub const MmapFile = struct {
             .ptr      = ptr.ptr,
             .len      = existing,
             .capacity = capacity,
-            .rw_lock  = .{},
+            .rw_lock  = .init,
         };
     }
 
@@ -80,8 +81,8 @@ pub const MmapFile = struct {
             return;
         }
         // Must remap — take exclusive lock to block readers during munmap/mmap.
-        self.rw_lock.lock();
-        defer self.rw_lock.unlock();
+        self.rw_lock.lockUncancelable(runtime.io);
+        defer self.rw_lock.unlock(runtime.io);
         // Re-check after acquiring lock (another thread may have grown).
         if (needed_len <= self.capacity) {
             self.len = needed_len;
@@ -108,16 +109,16 @@ pub const MmapFile = struct {
     /// Return a pointer to the record at byte offset `off`.
     /// Takes a shared lock so grow() cannot remap underneath us.
     pub fn at(self: *MmapFile, comptime T: type, off: usize) *T {
-        self.rw_lock.lockShared();
-        defer self.rw_lock.unlockShared();
+        self.rw_lock.lockSharedUncancelable(runtime.io);
+        defer self.rw_lock.unlockShared(runtime.io);
         return @alignCast(@ptrCast(&self.ptr[off]));
     }
 
     /// Return a slice of T starting at byte offset `off`, `count` elements.
     /// Takes a shared lock so grow() cannot remap underneath us.
     pub fn slice(self: *MmapFile, comptime T: type, off: usize, count: usize) []T {
-        self.rw_lock.lockShared();
-        defer self.rw_lock.unlockShared();
+        self.rw_lock.lockSharedUncancelable(runtime.io);
+        defer self.rw_lock.unlockShared(runtime.io);
         return @as([*]T, @alignCast(@ptrCast(&self.ptr[off])))[0..count];
     }
 
