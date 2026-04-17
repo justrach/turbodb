@@ -53,7 +53,7 @@ pub const fs = struct {
     }
 
     pub fn cwdRename(old_path: []const u8, new_path: []const u8) !void {
-        return Dir.cwd().rename(runtime.io, old_path, Dir.cwd(), new_path);
+        return Dir.cwd().rename(old_path, Dir.cwd(), new_path, runtime.io);
     }
 
     pub fn cwdDeleteFile(sub_path: []const u8) !void {
@@ -112,6 +112,21 @@ pub const fs = struct {
         _ = std.c.lseek(file.handle, @intCast(pos), std.posix.SEEK.SET);
     }
 };
+
+    /// Blocking read from a net stream. Returns bytes read, 0 on EOF.
+    pub fn streamRead(stream: std.Io.net.Stream, buffer: []u8) !usize {
+        return std.posix.read(stream.socket.handle, buffer);
+    }
+
+    /// Blocking write-all to a net stream.
+    pub fn streamWriteAll(stream: std.Io.net.Stream, data: []const u8) !void {
+        var rem = data;
+        while (rem.len > 0) {
+            const n = std.c.write(stream.socket.handle, rem.ptr, rem.len);
+            if (n <= 0) return error.BrokenPipe;
+            rem = rem[@intCast(n)..];
+        }
+    }
 // ─── Time ─────────────────────────────────────────────────────────────────
 // `std.time.{timestamp, milliTimestamp, nanoTimestamp}` are all gone in 0.16.
 

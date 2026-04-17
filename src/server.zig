@@ -84,60 +84,32 @@ pub const Server = struct {
     }
 
     pub fn run(self: *Server) !void {
-        const addr = try std.net.Address.parseIp("0.0.0.0", self.port);
-        var listener = try addr.listen(.{
+        const addr = try std.Io.net.IpAddress.parse("0.0.0.0", self.port);
+        var listener = try std.Io.net.IpAddress.listen(&addr, runtime.io, .{
             .reuse_address = true,
             .kernel_backlog = 256,
         });
-        defer listener.deinit();
+        defer listener.deinit(runtime.io);
 
         self.running.store(true, .release);
         std.log.info("TurboDB listening on :{d}", .{self.port});
 
         while (self.running.load(.acquire)) {
-            const conn = listener.accept() catch |e| {
-                if (e == error.WouldBlock) continue;
+            const stream = listener.accept(runtime.io) catch |e| {
                 std.log.err("accept: {}", .{e});
                 continue;
             };
-            const t = try std.Thread.spawn(.{}, handleConn, .{self, conn});
+            const t = try std.Thread.spawn(.{}, handleConn, .{self, stream});
             t.detach();
         }
     }
 
     pub fn runUnix(self: *Server, path: []const u8) !void {
-        // Remove any existing socket file
-        // Remove any existing socket file
-        var path_buf: [4096]u8 = undefined;
-        if (path.len < path_buf.len) {
-            @memcpy(path_buf[0..path.len], path);
-            path_buf[path.len] = 0;
-            _ = std.c.unlink(@ptrCast(&path_buf));
-        }
-        const fd = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-        defer std.posix.close(fd);
-
-        // Construct sockaddr_un
-        var addr: std.posix.sockaddr.un = .{ .family = std.posix.AF.UNIX, .path = undefined };
-        @memset(&addr.path, 0);
-        if (path.len >= addr.path.len) return error.PathTooLong;
-        @memcpy(addr.path[0..path.len], path);
-
-        try std.posix.bind(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
-        try std.posix.listen(fd, 256);
-
-        self.running.store(true, .release);
-        std.log.info("TurboDB HTTP on unix:{s}", .{path});
-
-        while (self.running.load(.acquire)) {
-            var client_addr: std.posix.sockaddr.un = undefined;
-            var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.un);
-            const client_fd = std.posix.accept(fd, @ptrCast(&client_addr), &addr_len, 0) catch continue;
-            const stream = std.net.Stream{ .handle = client_fd };
-            const conn = std.net.Server.Connection{ .stream = stream, .address = std.net.Address.initUnix(path) catch continue };
-            const t = std.Thread.spawn(.{}, handleConn, .{ self, conn }) catch continue;
-            t.detach();
-        }
+        // TODO(0.16): Unix socket support removed during Zig 0.16 migration.
+        // Reimplement on std.Io.net.UnixAddress when time permits.
+        _ = self;
+        _ = path;
+        return error.Unimplemented;
     }
 
     pub fn stop(self: *Server) void {
@@ -178,8 +150,8 @@ pub const Server = struct {
     }
 };
 
-fn handleConn(srv: *Server, conn: std.net.Server.Connection) void {
-    defer conn.stream.close();
+fn handleConn(srv: *Server, stream: std.Io.net.Stream) void {
+    defer stream.close(runtime.io);
 
     const bufs = std.heap.page_allocator.create(ConnBufs) catch {
         return;
@@ -189,7 +161,7 @@ fn handleConn(srv: *Server, conn: std.net.Server.Connection) void {
     defer tl_bufs = null;
 
     while (true) {
-        var n = conn.stream.read(&bufs.req) catch return;
+        var n = compat.streamRead(stream, &bufs.req) catch return;
         if (n == 0) return;
         _ = srv.req_count.fetchAdd(1, .monotonic);
 
@@ -209,32 +181,32 @@ fn handleConn(srv: *Server, conn: std.net.Server.Connection) void {
                 if (total_size <= MAX_BULK) {
                     const big_buf = std.heap.page_allocator.alloc(u8, total_size) catch {
                         const resp_len = dispatch(srv, initial, std.heap.page_allocator);
-                        conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
+                        compat.streamWriteAll(stream, bufs.resp[0..resp_len]) catch return;
                         continue;
                     };
                     defer std.heap.page_allocator.free(big_buf);
                     @memcpy(big_buf[0..n], initial);
                     // Read remaining bytes
                     while (n < total_size) {
-                        const r = conn.stream.read(big_buf[n..total_size]) catch break;
+                        const r = compat.streamRead(stream, big_buf[n..total_size]) catch break;
                         if (r == 0) break;
                         n += r;
                     }
                     const resp_len = dispatch(srv, big_buf[0..n], std.heap.page_allocator);
-                    conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
+                    compat.streamWriteAll(stream, bufs.resp[0..resp_len]) catch return;
                     continue;
                 }
             }
         }
 
         const resp_len = dispatch(srv, initial, std.heap.page_allocator);
-        conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
+        compat.streamWriteAll(stream, bufs.resp[0..resp_len]) catch return;
     }
 }
 fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
     // Parse request line.
     const nl = std.mem.indexOfScalar(u8, raw, '\n') orelse return err(400, "bad request");
-    const req_line = std.mem.trimRight(u8, raw[0..nl], "\r");
+    const req_line = std.mem.trimEnd(u8, raw[0..nl], "\r");
     var parts = std.mem.splitScalar(u8, req_line, ' ');
     const method = parts.next() orelse return err(400, "bad request");
     const full_path = parts.next() orelse return err(400, "bad request");
@@ -261,8 +233,8 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
 
     // Route: /metrics
     if (std.mem.eql(u8, path, "/metrics")) {
-        var fbs = std.io.fixedBufferStream(getBodyBuf());
-        std.fmt.format(fbs.writer(),
+        var w = std.Io.Writer.fixed(getBodyBuf());
+        w.print(
             "{{\"requests\":{d},\"errors\":{d},\"queries\":{d},\"rows_scanned\":{d},\"bytes_read\":{d},\"cpu_us\":{d},\"cost_nanos_usd\":{d}}}",
             .{
                 srv.req_count.load(.acquire),
@@ -273,7 +245,7 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
                 srv.query_cpu_us.load(.acquire),
                 srv.query_cost_nanos_usd.load(.acquire),
             }) catch {};
-        return ok(getBodyBuf()[0..fbs.pos]);
+        return ok(getBodyBuf()[0..w.end]);
     }
 
     // ── Auth gate — public endpoints above, protected endpoints below ────
@@ -421,11 +393,11 @@ fn doInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []co
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
     const doc_id = col.insert(key, value) catch return err(500, "insert failed");
     srv.recordQueryCost(tenant_id, "insert", 1, value.len, start_ns);
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    std.fmt.format(fbs.writer(),
+    var w = std.Io.Writer.fixed(getBodyBuf());
+    w.print(
         "{{\"doc_id\":{d},\"key\":\"{s}\",\"collection\":\"{s}\",\"tenant\":\"{s}\"}}",
         .{ doc_id, key, col_name, tenant_id }) catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 /// POST /db/:col/bulk — insert multiple documents in one request.
@@ -465,11 +437,11 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
 
     srv.recordQueryCost(tenant_id, "bulk_insert", inserted, total_bytes, start_ns);
 
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    std.fmt.format(fbs.writer(),
+    var w = std.Io.Writer.fixed(getBodyBuf());
+    w.print(
         "{{\"inserted\":{d},\"errors\":{d},\"collection\":\"{s}\",\"tenant\":\"{s}\"}}",
         .{ inserted, errors, col_name, tenant_id }) catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, as_of: ?i64) usize {
         const start_ns = compat.nanoTimestamp();
@@ -484,19 +456,19 @@ fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []c
         // Write JSON body directly into resp_buf at offset 256 (reserve space for headers)
         const HEADER_RESERVE = 256;
         var resp = getRespBuf();
-        var fbs = std.Io.Writer.fixed(resp[HEADER_RESERVE..]);
-        std.fmt.format(fbs.writer(),
+        var w = std.Io.Writer.fixed(resp[HEADER_RESERVE..]);
+        w.print(
             "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}",
             .{ d.header.doc_id, d.key, d.header.version,
                if (d.value.len > 0) d.value else "{}" }) catch {};
-        const body_len = fbs.pos;
+        const body_len = w.end;
 
         // Now write headers into the reserved space at the front
-        var hdr_fbs = std.Io.Writer.fixed(resp[0..HEADER_RESERVE]);
-        std.fmt.format(hdr_fbs.writer(),
+        var hdr_w = std.Io.Writer.fixed(resp[0..HEADER_RESERVE]);
+        hdr_w.print(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
             .{body_len}) catch {};
-        const hdr_len = hdr_fbs.pos;
+        const hdr_len = hdr_w.end;
 
         // Move body right after headers (memmove if needed)
         if (hdr_len < HEADER_RESERVE) {
@@ -542,19 +514,17 @@ fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_s
     for (result.docs) |d| bytes_read += d.key.len + d.value.len;
     srv.recordQueryCost(tenant_id, "scan", result.docs.len, bytes_read, start_ns);
 
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    const w = fbs.writer();
-    std.fmt.format(w, "{{\"tenant\":\"{s}\",\"collection\":\"{s}\",\"count\":{d},\"docs\":[",
+    var w = std.Io.Writer.fixed(getBodyBuf());
+    w.print("{{\"tenant\":\"{s}\",\"collection\":\"{s}\",\"count\":{d},\"docs\":[",
         .{ tenant_id, col_name, result.docs.len }) catch {};
     for (result.docs, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
-        std.fmt.format(w,
-            "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}",
+        w.print("{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}",
             .{ d.header.doc_id, d.key, d.header.version,
                if (d.value.len > 0) d.value else "{}" }) catch {};
     }
     w.writeAll("]}") catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn handleDrop(srv: *Server, tenant_id: []const u8, col_name: []const u8) usize {
@@ -575,26 +545,23 @@ fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query
     for (result.docs) |d| bytes_read += d.key.len + d.value.len;
     srv.recordQueryCost(tenant_id, "search", result.docs.len, bytes_read, start_ns);
 
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(getBodyBuf());
     // Write JSON header with escaped query string
     w.writeAll("{\"query\":\"") catch {};
     for (query) |ch| {
         if (ch == '"' or ch == '\\') { w.writeByte('\\') catch {}; }
         w.writeByte(ch) catch {};
     }
-    std.fmt.format(w,
-        "\",\"hits\":{d},\"candidates\":{d},\"total_docs\":{d},\"total_files\":{d},\"results\":[",
+    w.print("\",\"hits\":{d},\"candidates\":{d},\"total_docs\":{d},\"total_files\":{d},\"results\":[",
         .{ result.docs.len, result.candidate_paths.len, col.docCount(), result.total_files }) catch {};
     for (result.docs, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
-        std.fmt.format(w,
-            "{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":{s}}}",
+        w.print("{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":{s}}}",
             .{ d.header.doc_id, d.key,
                if (d.value.len > 0) d.value else "{}" }) catch {};
     }
     w.writeAll("]}") catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn handleDiscoverContext(srv: *Server, tenant_id: []const u8, col_name: []const u8, query: []const u8, limit: u32, alloc: std.mem.Allocator) usize {
@@ -607,8 +574,7 @@ fn handleDiscoverContext(srv: *Server, tenant_id: []const u8, col_name: []const 
     for (result.matching_files) |d| bytes_read += d.key.len + d.value.len;
     srv.recordQueryCost(tenant_id, "context", result.matching_files.len, bytes_read, start_ns);
 
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(getBodyBuf());
 
     // Write JSON: matching_files
     w.writeAll("{\"query\":\"") catch {};
@@ -619,20 +585,20 @@ fn handleDiscoverContext(srv: *Server, tenant_id: []const u8, col_name: []const 
     w.writeAll("\",\"matching_files\":[") catch {};
     for (result.matching_files, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
-        std.fmt.format(w, "{{\"key\":\"{s}\",\"size\":{d}}}", .{ d.key, d.value.len }) catch {};
+        w.print("{{\"key\":\"{s}\",\"size\":{d}}}", .{ d.key, d.value.len }) catch {};
     }
     w.writeAll("],\"related_files\":[") catch {};
     for (result.related_files, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
-        std.fmt.format(w, "{{\"key\":\"{s}\"}}", .{d.key}) catch {};
+        w.print("{{\"key\":\"{s}\"}}", .{d.key}) catch {};
     }
     w.writeAll("],\"test_files\":[") catch {};
     for (result.test_files, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
-        std.fmt.format(w, "{{\"key\":\"{s}\"}}", .{d.key}) catch {};
+        w.print("{{\"key\":\"{s}\"}}", .{d.key}) catch {};
     }
-    std.fmt.format(w, "],\"recent_versions\":{d},\"total_files\":{d}}}", .{ result.recent_versions, result.total_files }) catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    w.print("],\"recent_versions\":{d},\"total_files\":{d}}}", .{ result.recent_versions, result.total_files }) catch {};
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn handleListCollections(srv: *Server, tenant_id: []const u8, alloc: std.mem.Allocator) usize {
@@ -643,29 +609,26 @@ fn handleListCollections(srv: *Server, tenant_id: []const u8, alloc: std.mem.All
         for (cols.items) |name| alloc.free(name);
         cols.deinit(alloc);
     }
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    const w = fbs.writer();
-    std.fmt.format(w, "{{\"tenant\":\"{s}\",\"collections\":[", .{tenant_id}) catch {};
+    var w = std.Io.Writer.fixed(getBodyBuf());
+    w.print("{{\"tenant\":\"{s}\",\"collections\":[", .{tenant_id}) catch {};
     for (cols.items, 0..) |name, i| {
         if (i > 0) w.writeByte(',') catch {};
-        std.fmt.format(w, "\"{s}\"", .{name}) catch {};
+        w.print("\"{s}\"", .{name}) catch {};
     }
     srv.recordQueryCost(tenant_id, "list_collections", cols.items.len, 0, start_ns);
     w.writeAll("]}") catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn handleBillingLog(srv: *Server) usize {
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(getBodyBuf());
     w.writeAll("{\"queries\":[") catch {};
     srv.billing_mu.lockUncancelable(runtime.io);
     defer srv.billing_mu.unlock(runtime.io);
     const start = if (srv.billing_log.items.len > 100) srv.billing_log.items.len - 100 else 0;
     for (srv.billing_log.items[start..], 0..) |entry, i| {
         if (i > 0) w.writeByte(',') catch {};
-        std.fmt.format(w,
-            "{{\"tenant\":\"{s}\",\"op\":\"{s}\",\"rows_scanned\":{d},\"bytes_read\":{d},\"cpu_us\":{d},\"cost_nanos_usd\":{d}}}",
+        w.print("{{\"tenant\":\"{s}\",\"op\":\"{s}\",\"rows_scanned\":{d},\"bytes_read\":{d},\"cpu_us\":{d},\"cost_nanos_usd\":{d}}}",
             .{
                 entry.tenant_id[0..entry.tenant_id_len],
                 entry.op[0..entry.op_len],
@@ -677,17 +640,16 @@ fn handleBillingLog(srv: *Server) usize {
         ) catch {};
     }
     w.writeAll("]}") catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn handleResourceState(srv: *Server) usize {
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    std.fmt.format(
-        fbs.writer(),
+    var w = std.Io.Writer.fixed(getBodyBuf());
+    w.print(
         "{{\"state\":\"{s}\",\"queries_per_second\":{d},\"last_query_ms\":{d}}}",
         .{ resourceStateName(srv.activity.state()), srv.activity.queriesPerSecond(), srv.activity.lastQueryMs() },
     ) catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn handleWebhookRegistration(srv: *Server, body: []const u8) usize {
@@ -696,21 +658,19 @@ fn handleWebhookRegistration(srv: *Server, body: []const u8) usize {
     const secret = jsonStr(body, "secret") orelse return err(400, "missing secret");
     const collection_name = jsonStr(body, "collection") orelse "";
     const id = srv.db.registerWebhook(tenant, collection_name, webhook, secret) catch return err(500, "register webhook failed");
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    fbs.print("{{\"subscription_id\":{d}}}", .{id}) catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    var w = std.Io.Writer.fixed(getBodyBuf());
+    w.print("{{\"subscription_id\":{d}}}", .{id}) catch {};
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn handleCdcEvents(srv: *Server, tenant_filter: ?[]const u8, alloc: std.mem.Allocator) usize {
     const deliveries = srv.db.listWebhookDeliveries(alloc, tenant_filter) catch return err(500, "cdc read failed");
     defer alloc.free(deliveries);
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(getBodyBuf());
     w.writeAll("{\"events\":[") catch {};
     for (deliveries, 0..) |entry, i| {
         if (i > 0) w.writeByte(',') catch {};
-        std.fmt.format(w,
-            "{{\"seq\":{d},\"tenant\":\"{s}\",\"collection\":\"{s}\",\"webhook_url\":\"{s}\",\"signature\":\"{s}\",\"payload\":{s}}}",
+        w.print("{{\"seq\":{d},\"tenant\":\"{s}\",\"collection\":\"{s}\",\"webhook_url\":\"{s}\",\"signature\":\"{s}\",\"payload\":{s}}}",
             .{
                 entry.seq,
                 entry.tenant(),
@@ -722,7 +682,7 @@ fn handleCdcEvents(srv: *Server, tenant_filter: ?[]const u8, alloc: std.mem.Allo
         ) catch {};
     }
     w.writeAll("]}") catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 // ─── Branch handlers ─────────────────────────────────────────────────────
@@ -750,11 +710,11 @@ fn handleBranchRead(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
     const br = col.getBranch(branch_name) orelse return err(404, "branch not found");
     const val = col.getOnBranch(br, key) orelse return err(404, "not found");
     // Write response with raw value
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    fbs.print("{{\"key\":\"{s}\",\"value\":{s}}}", .{
+    var w = std.Io.Writer.fixed(getBodyBuf());
+    w.print("{{\"key\":\"{s}\",\"value\":{s}}}", .{
         key, if (val.len > 0) val else "{}",
     }) catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn handleBranchMerge(srv: *Server, tenant_id: []const u8, col_name: []const u8, branch_name: []const u8, alloc: std.mem.Allocator) usize {
@@ -765,13 +725,13 @@ fn handleBranchMerge(srv: *Server, tenant_id: []const u8, col_name: []const u8, 
     defer result.deinit();
     if (result.conflicts.len > 0) {
         // Return conflict count
-        var fbs = std.io.fixedBufferStream(getBodyBuf());
-        fbs.print("{{\"merged\":false,\"conflicts\":{d}}}", .{result.conflicts.len}) catch {};
-        return respond(409, "Conflict", getBodyBuf()[0..fbs.pos]);
+        var w = std.Io.Writer.fixed(getBodyBuf());
+        w.print("{{\"merged\":false,\"conflicts\":{d}}}", .{result.conflicts.len}) catch {};
+        return respond(409, "Conflict", getBodyBuf()[0..w.end]);
     }
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    fbs.print("{{\"merged\":true,\"applied\":{d}}}", .{result.applied}) catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    var w = std.Io.Writer.fixed(getBodyBuf());
+    w.print("{{\"merged\":true,\"applied\":{d}}}", .{result.applied}) catch {};
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn handleBranchSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, branch_name: []const u8, query_text: []const u8, limit: u32, alloc: std.mem.Allocator) usize {
@@ -781,18 +741,16 @@ fn handleBranchSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8,
     const result = col.searchOnBranch(br, query_text, limit, alloc) catch return err(500, "branch search failed");
     defer result.deinit();
 
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    const w = fbs.writer();
-    std.fmt.format(w, "{{\"branch\":\"{s}\",\"hits\":{d},\"results\":[", .{ branch_name, result.docs.len }) catch {};
+    var w = std.Io.Writer.fixed(getBodyBuf());
+    w.print("{{\"branch\":\"{s}\",\"hits\":{d},\"results\":[", .{ branch_name, result.docs.len }) catch {};
     for (result.docs, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
-        std.fmt.format(w,
-            "{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":{s}}}",
+        w.print("{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":{s}}}",
             .{ d.header.doc_id, d.key,
                if (d.value.len > 0) d.value else "{}" }) catch {};
     }
     w.writeAll("]}") catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn handleListBranches(srv: *Server, tenant_id: []const u8, col_name: []const u8, alloc: std.mem.Allocator) usize {
@@ -801,15 +759,14 @@ fn handleListBranches(srv: *Server, tenant_id: []const u8, col_name: []const u8,
     const names = col.listBranches(alloc) catch return err(500, "list branches failed");
     defer alloc.free(names);
 
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(getBodyBuf());
     w.writeAll("{\"branches\":[") catch {};
     for (names, 0..) |name, i| {
         if (i > 0) w.writeByte(',') catch {};
-        std.fmt.format(w, "\"{s}\"", .{name}) catch {};
+        w.print("\"{s}\"", .{name}) catch {};
     }
     w.writeAll("]}") catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn requestTenant(raw: []const u8, query: []const u8) []const u8 {
@@ -866,11 +823,11 @@ fn err(code: u16, msg: []const u8) usize {
 }
 
 fn respond(code: u16, status: []const u8, body: []const u8) usize {
-    var fbs = std.io.fixedBufferStream(getRespBuf());
-    std.fmt.format(fbs.writer(),
+    var w = std.Io.Writer.fixed(getRespBuf());
+    w.print(
         "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
         .{ code, status, body.len, body }) catch {};
-    return fbs.pos;
+    return w.end;
 }
 
 // ─── mini parsers ────────────────────────────────────────────────────────

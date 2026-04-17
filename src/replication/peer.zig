@@ -6,6 +6,7 @@
 ///
 /// Protocol: simple framed TCP — [4-byte big-endian length][batch payload]
 const std = @import("std");
+const runtime = @import("runtime");
 const sequencer = @import("sequencer.zig");
 const calvin = @import("calvin.zig");
 
@@ -50,16 +51,17 @@ pub const PeerSender = struct {
     }
 
     fn sendToPeer(peer: *const PeerAddr, payload: []const u8) !void {
-        // Parse IP address
-        const addr = try std.net.Address.parseIp(peer.hostSlice(), peer.port);
-        const stream = try std.net.tcpConnectToAddress(addr);
-        defer stream.close();
+        const addr = try std.Io.net.IpAddress.parse(peer.hostSlice(), peer.port);
+        const stream = try std.Io.net.IpAddress.connect(&addr, runtime.io, .{ .mode = .stream });
+        defer stream.close(runtime.io);
 
-        // Write length-prefixed frame
+        var write_buf: [4096]u8 = undefined;
+        var writer = stream.writer(runtime.io, &write_buf);
         var len_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &len_buf, @intCast(payload.len), .big);
-        _ = try stream.write(&len_buf);
-        _ = try stream.write(payload);
+        try writer.interface.writeAll(&len_buf);
+        try writer.interface.writeAll(payload);
+        try writer.interface.flush();
     }
 };
 
@@ -86,17 +88,17 @@ pub const PeerReceiver = struct {
     }
 
     pub fn run(self: *PeerReceiver) !void {
-        const addr = try std.net.Address.parseIp("0.0.0.0", self.port);
-        var listener = try addr.listen(.{ .reuse_address = true });
-        defer listener.deinit();
+        const addr = try std.Io.net.IpAddress.parse("0.0.0.0", self.port);
+        var listener = try std.Io.net.IpAddress.listen(&addr, runtime.io, .{ .reuse_address = true });
+        defer listener.deinit(runtime.io);
 
         self.running.store(true, .release);
         std.log.info("Calvin peer receiver on :{d}", .{self.port});
 
         while (self.running.load(.acquire)) {
-            const conn = listener.accept() catch continue;
-            const t = std.Thread.spawn(.{}, handlePeerConn, .{ self, conn }) catch {
-                conn.stream.close();
+            const stream = listener.accept(runtime.io) catch continue;
+            const t = std.Thread.spawn(.{}, handlePeerConn, .{ self, stream }) catch {
+                stream.close(runtime.io);
                 continue;
             };
             t.detach();
@@ -107,21 +109,22 @@ pub const PeerReceiver = struct {
         self.running.store(false, .release);
     }
 
-    fn handlePeerConn(self: *PeerReceiver, conn: std.net.Server.Connection) void {
-        defer conn.stream.close();
+    fn handlePeerConn(self: *PeerReceiver, stream: std.Io.net.Stream) void {
+        defer stream.close(runtime.io);
+
+        var read_buf: [4096]u8 = undefined;
+        var reader = stream.reader(runtime.io, &read_buf);
 
         // Read length-prefixed frame
         var len_buf: [4]u8 = undefined;
-        const n = conn.stream.readAll(&len_buf) catch return;
-        if (n != 4) return;
+        reader.interface.readSliceAll(&len_buf) catch return;
         const payload_len = std.mem.readInt(u32, &len_buf, .big);
         if (payload_len > 4 * 1024 * 1024) return; // 4MB max batch
 
         const payload = self.alloc.alloc(u8, payload_len) catch return;
         defer self.alloc.free(payload);
 
-        const read = conn.stream.readAll(payload) catch return;
-        if (read != payload_len) return;
+        reader.interface.readSliceAll(payload) catch return;
 
         // Deserialize and execute the batch
         var batch = calvin.CalvinExecutor.deserializeBatch(payload, self.alloc) catch return;

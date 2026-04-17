@@ -8,6 +8,7 @@
 const std = @import("std");
 const hash_mod = @import("hash.zig");
 const compat = @import("compat");
+const runtime = @import("runtime");
 
 /// BlobStore manages content-addressed blob storage.
 /// Works standalone (filesystem only) — TurboDB integration happens in registry.zig.
@@ -53,8 +54,8 @@ pub const BlobStore = struct {
 
         {
             const file = try compat.fs.cwdCreateFile(tmp_path, .{});
-            defer file.close();
-            try file.writeAll(data);
+            defer file.close(runtime.io);
+            try file.writeStreamingAll(runtime.io, data);
         }
 
         // Atomic rename
@@ -90,7 +91,7 @@ pub const BlobStore = struct {
         }) catch return null;
 
         const file = compat.fs.cwdOpenFile(path, .{}) catch return null;
-        defer file.close();
+        defer file.close(runtime.io);
         const stat = file.stat() catch return null;
         return stat.size;
     }
