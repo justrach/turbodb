@@ -453,28 +453,26 @@ fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []c
             (col.get(key) orelse return err(404, "not found"));
         srv.recordQueryCost(tenant_id, "get", 1, d.key.len + d.value.len, start_ns);
 
-        // Write JSON body directly into resp_buf at offset 256 (reserve space for headers)
-        const HEADER_RESERVE = 256;
+        // Fixed-length header = 103 bytes ("Content-Length" padded to 10 digits).
+        const HEADER_LEN = 103;
         var resp = getRespBuf();
-        var w = std.Io.Writer.fixed(resp[HEADER_RESERVE..]);
+
+        // Write body directly after the header region. No reserved-prefix
+        // memcpy dance — the header is always HEADER_LEN bytes.
+        var w = std.Io.Writer.fixed(resp[HEADER_LEN..]);
         w.print(
             "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}",
             .{ d.header.doc_id, d.key, d.header.version,
                if (d.value.len > 0) d.value else "{}" }) catch {};
         const body_len = w.end;
 
-        // Now write headers into the reserved space at the front
-        var hdr_w = std.Io.Writer.fixed(resp[0..HEADER_RESERVE]);
+        // Header with zero-padded Content-Length so length is deterministic.
+        var hdr_w = std.Io.Writer.fixed(resp[0..HEADER_LEN]);
         hdr_w.print(
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d:0>10}\r\nConnection: keep-alive\r\n\r\n",
             .{body_len}) catch {};
-        const hdr_len = hdr_w.end;
-
-        // Move body right after headers (memmove if needed)
-        if (hdr_len < HEADER_RESERVE) {
-            std.mem.copyForwards(u8, resp[hdr_len .. hdr_len + body_len], resp[HEADER_RESERVE .. HEADER_RESERVE + body_len]);
-        }
-        return hdr_len + body_len;
+        // hdr_w.end == HEADER_LEN by construction.
+        return HEADER_LEN + body_len;
     }
 
 fn handleUpdate(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
