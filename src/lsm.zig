@@ -84,86 +84,89 @@ pub const KVEntry = struct {
 // ─── MemTable ────────────────────────────────────────────────────────────────
 
 pub const MemTable = struct {
-    entries: std.ArrayList(KVEntry),
+    /// key_hash → EntryValue. O(1) put/get/delete. Order is materialized
+    /// once per flush via `sortedSnapshot`, so the hot ingest path pays
+    /// no per-op sort cost.
+    map: std.AutoHashMapUnmanaged(u64, KVEntry.EntryValue),
     size_bytes: usize,
     alloc: std.mem.Allocator,
 
-    const ENTRY_OVERHEAD = @sizeOf(KVEntry);
+    const ENTRY_OVERHEAD = @sizeOf(u64) + @sizeOf(KVEntry.EntryValue);
 
     pub fn init(alloc: std.mem.Allocator) MemTable {
         return .{
-            .entries = .empty,
+            .map = .empty,
             .size_bytes = 0,
             .alloc = alloc,
         };
     }
 
     pub fn deinit(self: *MemTable) void {
-        self.entries.deinit(self.alloc);
+        self.map.deinit(self.alloc);
         self.size_bytes = 0;
     }
 
-    /// Binary search for the index of key_hash. Returns the index if found, or
-    /// the insertion point if not.
-    fn findIndex(self: *const MemTable, key_hash: u64) struct { idx: usize, found: bool } {
-        const items = self.entries.items;
-        var lo: usize = 0;
-        var hi: usize = items.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (items[mid].key_hash < key_hash) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        const found = lo < items.len and items[lo].key_hash == key_hash;
-        return .{ .idx = lo, .found = found };
-    }
-
     pub fn put(self: *MemTable, key_hash: u64, entry: BTreeEntry) !void {
-        const result = self.findIndex(key_hash);
-        if (result.found) {
-            // Update in place — no size change.
-            self.entries.items[result.idx].value = .{ .live = entry };
-        } else {
-            try self.entries.insert(self.alloc, result.idx, .{
-                .key_hash = key_hash,
-                .value = .{ .live = entry },
-            });
-            self.size_bytes += ENTRY_OVERHEAD;
-        }
+        const gop = try self.map.getOrPut(self.alloc, key_hash);
+        if (!gop.found_existing) self.size_bytes += ENTRY_OVERHEAD;
+        gop.value_ptr.* = .{ .live = entry };
     }
 
     pub fn get(self: *const MemTable, key_hash: u64) ?BTreeEntry {
-        const result = self.findIndex(key_hash);
-        if (!result.found) return null;
-        return switch (self.entries.items[result.idx].value) {
+        const v = self.map.get(key_hash) orelse return null;
+        return switch (v) {
             .live => |e| e,
             .tombstone => null,
         };
     }
 
+    /// Probe for a key. Returns the raw `EntryValue` (live OR tombstone) if
+    /// present in this memtable, or null if the key is not here at all.
+    /// Callers that need to stop descending to SSTables on tombstone use
+    /// this instead of `get`.
+    pub fn probe(self: *const MemTable, key_hash: u64) ?KVEntry.EntryValue {
+        return self.map.get(key_hash);
+    }
+
     pub fn delete(self: *MemTable, key_hash: u64) !void {
-        const result = self.findIndex(key_hash);
-        if (result.found) {
-            self.entries.items[result.idx].value = .tombstone;
-        } else {
-            try self.entries.insert(self.alloc, result.idx, .{
-                .key_hash = key_hash,
-                .value = .tombstone,
-            });
-            self.size_bytes += ENTRY_OVERHEAD;
-        }
+        const gop = try self.map.getOrPut(self.alloc, key_hash);
+        if (!gop.found_existing) self.size_bytes += ENTRY_OVERHEAD;
+        gop.value_ptr.* = .tombstone;
+    }
+
+    pub fn isEmpty(self: *const MemTable) bool {
+        return self.map.count() == 0;
+    }
+
+    pub fn count(self: *const MemTable) usize {
+        return self.map.count();
     }
 
     pub fn isFull(self: *const MemTable) bool {
         return self.size_bytes >= LSMTree.MEMTABLE_SIZE;
     }
 
+    /// Build a sorted-by-key_hash snapshot of all entries. Caller owns the
+    /// returned slice and must free it via `alloc`. Used on flush — the
+    /// O(n log n) sort cost is paid once per memtable rotation, not per
+    /// put.
+    pub fn sortedSnapshot(self: *const MemTable, alloc: std.mem.Allocator) ![]KVEntry {
+        const n = self.map.count();
+        var out = try alloc.alloc(KVEntry, n);
+        errdefer alloc.free(out);
+        var it = self.map.iterator();
+        var i: usize = 0;
+        while (it.next()) |e| : (i += 1) {
+            out[i] = .{ .key_hash = e.key_ptr.*, .value = e.value_ptr.* };
+        }
+        std.mem.sort(KVEntry, out, {}, KVEntry.orderByKey);
+        return out;
+    }
+
     pub const Iterator = struct {
         items: []const KVEntry,
         pos: usize,
+        owned_alloc: ?std.mem.Allocator,
 
         pub fn next(self: *Iterator) ?KVEntry {
             if (self.pos >= self.items.len) return null;
@@ -171,10 +174,17 @@ pub const MemTable = struct {
             self.pos += 1;
             return e;
         }
+
+        pub fn deinit(self: *Iterator) void {
+            if (self.owned_alloc) |a| a.free(self.items);
+        }
     };
 
-    pub fn iterator(self: *const MemTable) Iterator {
-        return .{ .items = self.entries.items, .pos = 0 };
+    /// Yields entries in ascending key_hash order. The iterator owns an
+    /// allocated sorted snapshot; callers must call `deinit` on it.
+    pub fn iterator(self: *const MemTable, alloc: std.mem.Allocator) !Iterator {
+        const snap = try self.sortedSnapshot(alloc);
+        return .{ .items = snap, .pos = 0, .owned_alloc = alloc };
     }
 };
 
@@ -495,15 +505,17 @@ pub const LSMTree = struct {
     }
 
     pub fn get(self: *const LSMTree, key_hash: u64) ?BTreeEntry {
-        // 1. Check active memtable.
-        if (memtableSearch(self.active_mem.entries.items, key_hash)) |result| return result.entry;
-
-        // 2. Check immutable memtable.
-        if (self.immutable_mem) |imm| {
-            if (memtableSearch(imm.entries.items, key_hash)) |result| return result.entry;
+        // 1. Active memtable — hit OR tombstone stops the descent.
+        if (self.active_mem.probe(key_hash)) |v| {
+            return switch (v) { .live => |e| e, .tombstone => null };
         }
-
-        // 3. Check SSTables level by level, newest first.
+        // 2. Immutable memtable (rotating into L0).
+        if (self.immutable_mem) |imm| {
+            if (imm.probe(key_hash)) |v| {
+                return switch (v) { .live => |e| e, .tombstone => null };
+            }
+        }
+        // 3. SSTables level by level, newest first.
         for (self.levels) |lvl| {
             // Iterate in reverse (newest SSTable first within a level).
             var i = lvl.items.len;
@@ -518,31 +530,6 @@ pub const LSMTree = struct {
         return null;
     }
 
-    /// Search helper for const memtable slices. Returns the BTreeEntry (or null
-    /// for tombstones). The outer ?FoundEntry is null when the key isn't present
-    /// at all — distinguishing "not here" from "deleted here".
-    const FoundEntry = struct { entry: ?BTreeEntry };
-
-    fn memtableSearch(items: []const KVEntry, key_hash: u64) ?FoundEntry {
-        var lo: usize = 0;
-        var hi: usize = items.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (items[mid].key_hash < key_hash) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        if (lo < items.len and items[lo].key_hash == key_hash) {
-            return .{ .entry = switch (items[lo].value) {
-                .live => |e| e,
-                .tombstone => null,
-            } };
-        }
-        return null;
-    }
-
     pub fn delete(self: *LSMTree, key_hash: u64) !void {
         try self.active_mem.delete(key_hash);
     }
@@ -552,7 +539,7 @@ pub const LSMTree = struct {
         self.flush_mu.lockUncancelable(runtime.io);
         defer self.flush_mu.unlock(runtime.io);
 
-        if (self.active_mem.entries.items.len == 0) return;
+        if (self.active_mem.isEmpty()) return;
 
         // Rotate: move active → immutable.
         var old = self.active_mem;
@@ -564,11 +551,16 @@ pub const LSMTree = struct {
         }
         self.immutable_mem = old;
 
-        // Create L0 SSTable.
+        // Materialize a sorted snapshot once for the SSTable writer — the
+        // memtable is unsorted (hashmap), but SSTable.create needs entries
+        // in ascending key_hash order for the sparse index + scan path.
+        const snap = try old.sortedSnapshot(self.alloc);
+        defer self.alloc.free(snap);
+
         const id = self.next_sst_id;
         self.next_sst_id += 1;
         const sst = try SSTable.create(
-            old.entries.items,
+            snap,
             0,
             id,
             self.data_dir[0..self.data_dir_len],
@@ -711,7 +703,8 @@ test "MemTable iterator order" {
     try mt.put(100, testEntry(100, 1));
     try mt.put(200, testEntry(200, 2));
 
-    var it = mt.iterator();
+    var it = try mt.iterator(std.testing.allocator);
+    defer it.deinit();
     const first = it.next().?;
     try std.testing.expectEqual(@as(u64, 100), first.key_hash);
     const second = it.next().?;
@@ -824,13 +817,12 @@ test "LSMTree flush" {
     try lsm.flush();
 
     // Active memtable should be empty after flush.
-    try std.testing.expectEqual(@as(usize, 0), lsm.active_mem.entries.items.len);
+    try std.testing.expectEqual(@as(usize, 0), lsm.active_mem.count());
     // L0 should have one SSTable.
     try std.testing.expectEqual(@as(usize, 1), lsm.levels[0].items.len);
     // Data still readable.
     try std.testing.expectEqual(@as(u64, 10), lsm.get(1).?.doc_id);
 }
-
 test "Tombstone handling" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
