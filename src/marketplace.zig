@@ -2,6 +2,7 @@ const std = @import("std");
 const branching = @import("branching.zig");
 const collection = @import("collection.zig");
 const doc_mod = @import("doc.zig");
+const compat = @import("compat");
 
 pub const Release = struct {
     dataset_name: []const u8,
@@ -203,7 +204,7 @@ fn ensureDir(path: []const u8) !void {
         const rel = std.mem.trimLeft(u8, path, "/");
         if (rel.len > 0) try root.makePath(rel);
     } else {
-        try std.fs.cwd().makePath(path);
+        try compat.fs.cwdMakePath(path);
     }
 }
 
@@ -252,14 +253,14 @@ test "marketplace publish and install keeps snapshot immutable" {
     const tmp_dir = "/tmp/turbodb_marketplace_publish";
     const market_dir = "/tmp/turbodb_marketplace_catalog";
     const install_dir = "/tmp/turbodb_marketplace_install";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    std.fs.cwd().deleteTree(market_dir) catch {};
-    std.fs.cwd().deleteTree(install_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(market_dir) catch {};
+    compat.fs.cwdDeleteTree(install_dir) catch {};
     try ensureDir(tmp_dir);
     try ensureDir(market_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(market_dir) catch {};
-    defer std.fs.cwd().deleteTree(install_dir) catch {};
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    defer compat.fs.cwdDeleteTree(market_dir) catch {};
+    defer compat.fs.cwdDeleteTree(install_dir) catch {};
 
     const base = try collection.Database.open(alloc, tmp_dir);
     defer base.close();
@@ -300,16 +301,16 @@ test "marketplace keeps multiple release versions installable" {
     const market_dir = "/tmp/turbodb_marketplace_versions_catalog";
     const install_v1_dir = "/tmp/turbodb_marketplace_versions_install_v1";
     const install_v2_dir = "/tmp/turbodb_marketplace_versions_install_v2";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    std.fs.cwd().deleteTree(market_dir) catch {};
-    std.fs.cwd().deleteTree(install_v1_dir) catch {};
-    std.fs.cwd().deleteTree(install_v2_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(market_dir) catch {};
+    compat.fs.cwdDeleteTree(install_v1_dir) catch {};
+    compat.fs.cwdDeleteTree(install_v2_dir) catch {};
     try ensureDir(tmp_dir);
     try ensureDir(market_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(market_dir) catch {};
-    defer std.fs.cwd().deleteTree(install_v1_dir) catch {};
-    defer std.fs.cwd().deleteTree(install_v2_dir) catch {};
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    defer compat.fs.cwdDeleteTree(market_dir) catch {};
+    defer compat.fs.cwdDeleteTree(install_v1_dir) catch {};
+    defer compat.fs.cwdDeleteTree(install_v2_dir) catch {};
 
     const base = try collection.Database.open(alloc, tmp_dir);
     defer base.close();
@@ -354,11 +355,11 @@ test "marketplace rejects missing releases" {
     const alloc = std.testing.allocator;
     const market_dir = "/tmp/turbodb_marketplace_missing_catalog";
     const install_dir = "/tmp/turbodb_marketplace_missing_install";
-    std.fs.cwd().deleteTree(market_dir) catch {};
-    std.fs.cwd().deleteTree(install_dir) catch {};
+    compat.fs.cwdDeleteTree(market_dir) catch {};
+    compat.fs.cwdDeleteTree(install_dir) catch {};
     try ensureDir(market_dir);
-    defer std.fs.cwd().deleteTree(market_dir) catch {};
-    defer std.fs.cwd().deleteTree(install_dir) catch {};
+    defer compat.fs.cwdDeleteTree(market_dir) catch {};
+    defer compat.fs.cwdDeleteTree(install_dir) catch {};
 
     var marketplace = try Marketplace.init(alloc, market_dir);
     defer marketplace.deinit();

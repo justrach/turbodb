@@ -106,7 +106,7 @@ fn cmdInit(alloc: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     // Check if zag.json already exists
-    std.fs.cwd().access("zag.json", .{}) catch |e| {
+    compat.fs.cwdAccess("zag.json", .{}) catch |e| {
         if (e == error.FileNotFound) {
             var buf: [2048]u8 = undefined;
             var fbs = std.io.fixedBufferStream(&buf);
@@ -127,7 +127,7 @@ fn cmdInit(alloc: std.mem.Allocator, args: []const []const u8) !void {
             try w.writeAll("}");
 
             const content = fbs.getWritten();
-            const file = try std.fs.cwd().createFile("zag.json", .{});
+            const file = try compat.fs.cwdCreateFile("zag.json", .{});
             defer file.close();
             try file.writeAll(content);
 
@@ -191,7 +191,7 @@ fn cmdSearch(alloc: std.mem.Allocator, args: []const []const u8) !void {
 
 fn cmdPublish(alloc: std.mem.Allocator) !void {
     // Read zag.json
-    const manifest_content = std.fs.cwd().readFileAlloc(alloc, "zag.json", 64 * 1024) catch {
+    const manifest_content = compat.fs.cwdReadFileAlloc(alloc, "zag.json", 64 * 1024) catch {
         std.debug.print("No zag.json found. Run 'zag init' first.\n", .{});
         return;
     };
@@ -218,7 +218,7 @@ fn cmdPublish(alloc: std.mem.Allocator) !void {
 
 fn cmdAudit(alloc: std.mem.Allocator) !void {
     // Read lockfile
-    const lockfile = std.fs.cwd().readFileAlloc(alloc, ".zag/lock.json", 1024 * 1024) catch {
+    const lockfile = compat.fs.cwdReadFileAlloc(alloc, ".zag/lock.json", 1024 * 1024) catch {
         std.debug.print("No .zag/lock.json found. Run 'zag install' first.\n", .{});
         return;
     };

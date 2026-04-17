@@ -86,10 +86,10 @@ fn benchPartitionCount(n_partitions: u16) !void {
     const data_dir = std.fmt.bufPrint(&dir_buf, "/tmp/turbodb_partition_bench_{d}", .{n_partitions}) catch return;
 
     // Cleanup any previous run
-    std.fs.cwd().deleteTree(data_dir) catch {};
+    compat.fs.cwdDeleteTree(data_dir) catch {};
 
     // Create data dir
-    std.fs.cwd().makeDir(data_dir) catch |e| switch (e) {
+    compat.fs.cwdMakeDir(data_dir) catch |e| switch (e) {
         error.PathAlreadyExists => {},
         else => return e,
     };
@@ -183,7 +183,7 @@ fn benchPartitionCount(n_partitions: u16) !void {
     pc.close();
     wal_log.close();
     epochs.deinit();
-    std.fs.cwd().deleteTree(data_dir) catch {};
+    compat.fs.cwdDeleteTree(data_dir) catch {};
 }
 
 // ─── JSON emitter ───────────────────────────────────────────────────────────
@@ -226,7 +226,7 @@ fn emitJSON() void {
 
     // Also write to a JSON file for CI consumption
     const json_path = "/tmp/turbodb_shard_bench.json";
-    const file = std.fs.cwd().createFile(json_path, .{}) catch return;
+    const file = compat.fs.cwdCreateFile(json_path, .{}) catch return;
     defer file.close();
 
     var buf: [16384]u8 = undefined;
@@ -287,6 +287,6 @@ pub fn main() !void {
     for (partition_counts) |n| {
         var dir_buf: [128]u8 = undefined;
         const data_dir = std.fmt.bufPrint(&dir_buf, "/tmp/turbodb_partition_bench_{d}", .{n}) catch continue;
-        std.fs.cwd().deleteTree(data_dir) catch {};
+        compat.fs.cwdDeleteTree(data_dir) catch {};
     }
 }

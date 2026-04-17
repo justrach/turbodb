@@ -95,12 +95,12 @@ pub fn main(init: std.process.Init) !void {
     runtime.setIo(init.io);
 
     // Clean up any previous test data
-    std.fs.cwd().deleteTree("/tmp/calvin_test_leader") catch {};
-    std.fs.cwd().deleteTree("/tmp/calvin_test_replica") catch {};
+    compat.fs.cwdDeleteTree("/tmp/calvin_test_leader") catch {};
+    compat.fs.cwdDeleteTree("/tmp/calvin_test_replica") catch {};
 
     // Create data directories
-    std.fs.makeDirAbsolute("/tmp/calvin_test_leader") catch {};
-    std.fs.makeDirAbsolute("/tmp/calvin_test_replica") catch {};
+    compat.fs.makeDirAbsolute("/tmp/calvin_test_leader") catch {};
+    compat.fs.makeDirAbsolute("/tmp/calvin_test_replica") catch {};
 
     // ── Step 1: Open two separate databases ──────────────────────────────
     std.debug.print("\n=== TurboDB Calvin Replication E2E Test ===\n\n", .{});
@@ -237,6 +237,6 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Cleanup
-    std.fs.cwd().deleteTree("/tmp/calvin_test_leader") catch {};
-    std.fs.cwd().deleteTree("/tmp/calvin_test_replica") catch {};
+    compat.fs.cwdDeleteTree("/tmp/calvin_test_leader") catch {};
+    compat.fs.cwdDeleteTree("/tmp/calvin_test_replica") catch {};
 }

@@ -68,8 +68,44 @@ pub const fs = struct {
     pub fn cwdReadFileAlloc(gpa: std.mem.Allocator, sub_path: []const u8, max_bytes: usize) ![]u8 {
         return Dir.cwd().readFileAlloc(runtime.io, sub_path, gpa, .limited(max_bytes));
     }
-};
 
+    // Absolute-path helpers.
+    pub fn openDirAbsolute(absolute_path: []const u8, options: Dir.OpenOptions) !Dir {
+        return Dir.openDirAbsolute(runtime.io, absolute_path, options);
+    }
+
+    pub fn makeDirAbsolute(absolute_path: []const u8) !void {
+        return Dir.createDirAbsolute(runtime.io, absolute_path, .default_dir);
+    }
+
+    /// Canonicalize `sub_path` relative to cwd. Returns a sentinel-terminated
+    /// allocation owned by the caller.
+    pub fn cwdRealpathAlloc(gpa: std.mem.Allocator, sub_path: []const u8) ![:0]u8 {
+        return Dir.cwd().realPathFileAlloc(runtime.io, sub_path, gpa);
+    }
+
+    // Dir / File method wrappers that inject runtime.io (saves threading it
+    // through bench and profile call sites).
+    pub fn dirClose(dir: Dir) void {
+        dir.close(runtime.io);
+    }
+
+    pub fn dirOpenFile(dir: Dir, sub_path: []const u8, options: Dir.OpenFileOptions) !File {
+        return dir.openFile(runtime.io, sub_path, options);
+    }
+
+    pub fn fileClose(file: File) void {
+        file.close(runtime.io);
+    }
+
+    /// Single-shot blocking read of up to `buffer.len` bytes into `buffer`.
+    /// Returns the number of bytes read (0 on EOF).
+    pub fn fileReadAll(file: File, buffer: []u8) !usize {
+        const bufs = [_][]u8{buffer};
+        return file.readStreaming(runtime.io, &bufs);
+    }
+
+};
 // ─── Time ─────────────────────────────────────────────────────────────────
 // `std.time.{timestamp, milliTimestamp, nanoTimestamp}` are all gone in 0.16.
 

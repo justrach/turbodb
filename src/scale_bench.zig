@@ -58,19 +58,19 @@ pub fn main(init: std.process.Init) !void {
         files.deinit(alloc);
     }
 
-    var dir = try std.fs.cwd().openDir(src_dir, .{ .iterate = true });
-    defer dir.close();
+    var dir = try compat.fs.cwdOpenDir(src_dir, .{ .iterate = true });
+    defer compat.fs.dirClose(dir);
     var walker = try dir.walk(alloc);
     defer walker.deinit();
 
-    while (try walker.next()) |entry| {
+    while (try walker.next(runtime.io)) |entry| {
         if (entry.kind != .file) continue;
         if (!hasValidExt(entry.basename)) continue;
 
-        var file = dir.openFile(entry.path, .{}) catch continue;
-        defer file.close();
+        const file = compat.fs.dirOpenFile(dir, entry.path, .{}) catch continue;
+        defer compat.fs.fileClose(file);
         var buf: [8192]u8 = undefined;
-        const n = file.read(&buf) catch continue;
+        const n = compat.fs.fileReadAll(file, &buf) catch continue;
         if (n < 3) continue;
 
         try files.append(alloc, .{
@@ -87,11 +87,11 @@ pub fn main(init: std.process.Init) !void {
     std.debug.print("Phase 1: Indexing {d} files...\n", .{base_files * COPIES});
 
     const data_dir = "/tmp/turbodb_scale_bench";
-    std.fs.cwd().makeDir(data_dir) catch |e| switch (e) {
+    compat.fs.cwdMakeDir(data_dir) catch |e| switch (e) {
         error.PathAlreadyExists => {
             // Clean it
-            std.fs.cwd().deleteTree(data_dir) catch {};
-            std.fs.cwd().makeDir(data_dir) catch {};
+            compat.fs.cwdDeleteTree(data_dir) catch {};
+            compat.fs.cwdMakeDir(data_dir) catch {};
         },
         else => return e,
     };

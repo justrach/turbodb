@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 
 // ── Inverted word index ─────────────────────────────────────
 // Maps word → list of (path, line) hits. O(1) word lookup.
@@ -747,7 +748,7 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
         defer self.allocator.free(postings_final);
 
         {
-            const file = try std.fs.cwd().createFile(postings_tmp, .{});
+            const file = try compat.fs.cwdCreateFile(postings_tmp, .{});
             defer file.close();
 
             // Header v3: magic(4) + version(2) + file_count(4) + head_len(1) + head(40) = 51 bytes
@@ -779,7 +780,7 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
             const postings_bytes = std.mem.sliceAsBytes(postings_buf.items);
             try file.writeAll(postings_bytes);
         }
-        try std.fs.cwd().rename(postings_tmp, postings_final);
+        try compat.fs.cwdRename(postings_tmp, postings_final);
 
         // Step 5: Write lookup file atomically (random suffix prevents collisions)
         const lk_rand = std.crypto.random.int(u64);
@@ -789,7 +790,7 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
         defer self.allocator.free(lookup_final);
 
         {
-            const file = try std.fs.cwd().createFile(lookup_tmp, .{});
+            const file = try compat.fs.cwdCreateFile(lookup_tmp, .{});
             defer file.close();
 
             // Header: magic(4) + version(2) + pad(2) + entry_count(4) = 12 bytes
@@ -807,7 +808,7 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
             const entry_bytes = std.mem.sliceAsBytes(lookup_entries.items);
             try file.writeAll(entry_bytes);
         }
-        try std.fs.cwd().rename(lookup_tmp, lookup_final);
+        try compat.fs.cwdRename(lookup_tmp, lookup_final);
     }
 
     /// Load index from disk files into a fresh TrigramIndex.
@@ -823,9 +824,9 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
         defer allocator.free(lookup_path);
 
         // Read both files
-        const postings_data = std.fs.cwd().readFileAlloc(allocator, postings_path, 64 * 1024 * 1024) catch return null;
+        const postings_data = compat.fs.cwdReadFileAlloc(allocator, postings_path, 64 * 1024 * 1024) catch return null;
         defer allocator.free(postings_data);
-        const lookup_data = std.fs.cwd().readFileAlloc(allocator, lookup_path, 64 * 1024 * 1024) catch return null;
+        const lookup_data = compat.fs.cwdReadFileAlloc(allocator, lookup_path, 64 * 1024 * 1024) catch return null;
         defer allocator.free(lookup_data);
 
         // Validate postings header (v1: 8 bytes, v2: 49 bytes, v3: 51 bytes)
@@ -965,7 +966,7 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
         const postings_path = try std.fmt.allocPrint(allocator, "{s}/trigram.postings", .{dir_path});
         defer allocator.free(postings_path);
 
-        const file = std.fs.cwd().openFile(postings_path, .{}) catch return null;
+        const file = compat.fs.cwdOpenFile(postings_path, .{}) catch return null;
         defer file.close();
 
         var buf: [51]u8 = undefined;
@@ -1414,7 +1415,7 @@ fn finishFrequencyTable(counts: *const [256][256]u64) [256][256]u16 {
 /// Persist a frequency table as a raw binary blob to `<dir_path>/pair_freq.bin`.
 /// Uses tmp+rename for atomic writes.
 pub fn writeFrequencyTable(table: *const [256][256]u16, dir_path: []const u8) !void {
-    var dir = try std.fs.cwd().openDir(dir_path, .{});
+    var dir = try compat.fs.cwdOpenDir(dir_path, .{});
     defer dir.close();
     {
         const tmp = try dir.createFile("pair_freq.bin.tmp", .{});
@@ -1436,7 +1437,7 @@ pub fn writeFrequencyTable(table: *const [256][256]u16, dir_path: []const u8) !v
 pub fn readFrequencyTable(dir_path: []const u8, allocator: std.mem.Allocator) !?*[256][256]u16 {
     const path = try std.fmt.allocPrint(allocator, "{s}/pair_freq.bin", .{dir_path});
     defer allocator.free(path);
-    const file = std.fs.cwd().openFile(path, .{}) catch |err| switch (err) {
+    const file = compat.fs.cwdOpenFile(path, .{}) catch |err| switch (err) {
         error.FileNotFound => return null,
         else => return err,
     };

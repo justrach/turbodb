@@ -8,7 +8,7 @@ pub fn main() !void {
     runtime.init(alloc);
     defer runtime.deinit();
     const data_dir = "/tmp/turbodb_native_bench";
-    std.fs.cwd().deleteTree(data_dir) catch {};
+    compat.fs.cwdDeleteTree(data_dir) catch {};
 
     var db = try client.Db.open(alloc, data_dir);
     defer db.close();
@@ -63,5 +63,5 @@ pub fn main() !void {
     std.debug.print("  SEARCH : {d:.0} ops/s  ({d:.1}us/op)\n", .{ search_ops, search_ns / 1000.0 / 1000.0 });
     std.debug.print("\n", .{});
 
-    std.fs.cwd().deleteTree(data_dir) catch {};
+    compat.fs.cwdDeleteTree(data_dir) catch {};
 }

@@ -1,6 +1,7 @@
 const std = @import("std");
 const collection_mod = @import("collection.zig");
 const doc_mod = @import("doc.zig");
+const compat = @import("compat");
 
 pub const Database = collection_mod.Database;
 pub const Collection = collection_mod.Collection;
@@ -15,7 +16,7 @@ pub const Db = struct {
     /// Open a TurboDB database at the given directory.
     pub fn open(alloc: std.mem.Allocator, data_dir: []const u8) !Db {
         // Ensure directory exists
-        std.fs.cwd().makeDir(data_dir) catch |e| switch (e) {
+        compat.fs.cwdMakeDir(data_dir) catch |e| switch (e) {
             error.PathAlreadyExists => {},
             else => return e,
         };
@@ -107,7 +108,7 @@ test "embedded client: open, insert, get, search" {
 
     // Use a temp dir
     const tmp_dir = "/tmp/turbodb_client_test";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     var db = try Db.open(alloc, tmp_dir);
     defer db.close();
@@ -133,17 +134,17 @@ test "embedded client: open, insert, get, search" {
     try std.testing.expect(gone == null);
 
     // Cleanup
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
 }
 
 test "embedded client isolates tenants" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_client_tenants";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     var db = try Db.open(alloc, tmp_dir);
     defer db.close();
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     _ = try db.insertForTenant("tenant-a", "users", "u1", "{\"name\":\"alice\"}");
     _ = try db.insertForTenant("tenant-b", "users", "u1", "{\"name\":\"bob\"}");

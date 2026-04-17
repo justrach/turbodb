@@ -12,6 +12,7 @@
 ///   "default_org": null
 /// }
 const std = @import("std");
+const compat = @import("compat");
 
 pub const RegistryEntry = struct {
     name: []const u8,
@@ -89,7 +90,7 @@ pub fn globalConfigPath(buf: []u8) ![]const u8 {
 pub fn saveGlobalConfig(config: Config) !void {
     var dir_buf: [512]u8 = undefined;
     const dir = try globalConfigDir(&dir_buf);
-    std.fs.cwd().makePath(dir) catch {};
+    compat.fs.cwdMakePath(dir) catch {};
 
     var path_buf: [512]u8 = undefined;
     const path = try globalConfigPath(&path_buf);
@@ -97,7 +98,7 @@ pub fn saveGlobalConfig(config: Config) !void {
     var json_buf: [4096]u8 = undefined;
     const json = try config.toJson(&json_buf);
 
-    const file = try std.fs.cwd().createFile(path, .{});
+    const file = try compat.fs.cwdCreateFile(path, .{});
     defer file.close();
     try file.writeAll(json);
     try file.writeAll("\n");

@@ -86,20 +86,20 @@ pub fn main(init: std.process.Init) !void {
         files.deinit(alloc);
     }
 
-    var dir = try std.fs.cwd().openDir(args[1], .{ .iterate = true });
-    defer dir.close();
+    var dir = try compat.fs.cwdOpenDir(args[1], .{ .iterate = true });
+    defer compat.fs.dirClose(dir);
     var walker = try dir.walk(alloc);
     defer walker.deinit();
 
     var total_bytes: u64 = 0;
-    while (try walker.next()) |entry| {
+    while (try walker.next(runtime.io)) |entry| {
         if (entry.kind != .file) continue;
         if (!hasValidExt(entry.basename)) continue;
 
-        var file = dir.openFile(entry.path, .{}) catch continue;
-        defer file.close();
+        const file = compat.fs.dirOpenFile(dir, entry.path, .{}) catch continue;
+        defer compat.fs.fileClose(file);
         var buf: [8192]u8 = undefined;
-        const n = file.read(&buf) catch continue;
+        const n = compat.fs.fileReadAll(file, &buf) catch continue;
         if (n < 3) continue;
 
         try files.append(alloc, .{
@@ -211,14 +211,14 @@ pub fn main(init: std.process.Init) !void {
         t_build.end();
 
         const tmp = "/tmp/tdb_profile_disk";
-        std.fs.cwd().makeDir(tmp) catch |e| switch (e) {
+        compat.fs.cwdMakeDir(tmp) catch |e| switch (e) {
             error.PathAlreadyExists => {
-                std.fs.cwd().deleteTree(tmp) catch {};
-                std.fs.cwd().makeDir(tmp) catch {};
+                compat.fs.cwdDeleteTree(tmp) catch {};
+                compat.fs.cwdMakeDir(tmp) catch {};
             },
             else => return e,
         };
-        defer std.fs.cwd().deleteTree(tmp) catch {};
+        defer compat.fs.cwdDeleteTree(tmp) catch {};
 
         t_write.begin();
         const stats = try builder.writeToDisk(tmp);

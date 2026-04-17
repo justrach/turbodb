@@ -1,5 +1,6 @@
 const std = @import("std");
 const btree = @import("btree.zig");
+const compat = @import("compat");
 const BTreeEntry = btree.BTreeEntry;
 
 // ─── BloomFilter ─────────────────────────────────────────────────────────────
@@ -269,11 +270,11 @@ pub const SSTable = struct {
         }
 
         // Write data file.
-        const data_file = try std.fs.cwd().createFile(dp, .{});
+        const data_file = try compat.fs.cwdCreateFile(dp, .{});
         defer data_file.close();
 
         // Write index file.
-        const idx_file = try std.fs.cwd().createFile(ip, .{});
+        const idx_file = try compat.fs.cwdCreateFile(ip, .{});
         defer idx_file.close();
 
         var data_offset: u64 = 0;
@@ -322,14 +323,14 @@ pub const SSTable = struct {
         // Range check.
         if (key_hash < self.min_key or key_hash > self.max_key) return null;
 
-        const data_file = try std.fs.cwd().openFile(
+        const data_file = try compat.fs.cwdOpenFile(
             self.data_path[0..self.data_path_len],
             .{},
         );
         defer data_file.close();
 
         // Load sparse index to find starting offset.
-        const idx_file = try std.fs.cwd().openFile(
+        const idx_file = try compat.fs.cwdOpenFile(
             self.index_path[0..self.index_path_len],
             .{},
         );
@@ -417,7 +418,7 @@ pub const SSTable = struct {
 
     pub fn iterator(self: *const SSTable, alloc: std.mem.Allocator) !Iterator {
         _ = alloc;
-        const f = try std.fs.cwd().openFile(
+        const f = try compat.fs.cwdOpenFile(
             self.data_path[0..self.data_path_len],
             .{},
         );
@@ -467,7 +468,7 @@ pub const LSMTree = struct {
         }
 
         // Ensure data directory exists.
-        std.fs.cwd().makeDir(data_dir) catch |err| switch (err) {
+        compat.fs.cwdMakeDir(data_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -639,8 +640,8 @@ pub const LSMTree = struct {
         // Close and remove old SSTables at this level.
         for (src.items) |*sst| {
             // Delete files.
-            std.fs.cwd().deleteFile(sst.data_path[0..sst.data_path_len]) catch {};
-            std.fs.cwd().deleteFile(sst.index_path[0..sst.index_path_len]) catch {};
+            compat.fs.cwdDeleteFile(sst.data_path[0..sst.data_path_len]) catch {};
+            compat.fs.cwdDeleteFile(sst.index_path[0..sst.index_path_len]) catch {};
             sst.close();
         }
         src.clearRetainingCapacity();

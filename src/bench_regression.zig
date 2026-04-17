@@ -65,7 +65,7 @@ inline fn now() i128 {
 // ─── Benchmark: Core Path (INSERT / GET / UPDATE / DELETE) ──────────────────
 
 fn benchCorePath() !void {
-    std.fs.cwd().deleteTree(DATA_DIR) catch {};
+    compat.fs.cwdDeleteTree(DATA_DIR) catch {};
     var db = try client.Db.open(alloc, DATA_DIR);
     defer db.close();
 
@@ -116,7 +116,7 @@ fn benchCorePath() !void {
         record("Core DELETE", "core_delete_ops_sec", N, now() - t0);
     }
 
-    std.fs.cwd().deleteTree(DATA_DIR) catch {};
+    compat.fs.cwdDeleteTree(DATA_DIR) catch {};
 }
 
 // ─── Benchmark: Compression ─────────────────────────────────────────────────
@@ -253,11 +253,11 @@ fn benchQuery() void {
 fn benchLSM() !void {
     const N: usize = 100_000;
 
-    std.fs.cwd().deleteTree(LSM_DIR) catch {};
+    compat.fs.cwdDeleteTree(LSM_DIR) catch {};
     var lsm = try lsm_mod.LSMTree.init(alloc, LSM_DIR);
     defer {
         lsm.deinit();
-        std.fs.cwd().deleteTree(LSM_DIR) catch {};
+        compat.fs.cwdDeleteTree(LSM_DIR) catch {};
     }
 
     // Put
@@ -290,7 +290,7 @@ fn benchLSM() !void {
     {
         // Re-init with fresh data for flush timing
         lsm.deinit();
-        std.fs.cwd().deleteTree(LSM_DIR) catch {};
+        compat.fs.cwdDeleteTree(LSM_DIR) catch {};
         lsm = try lsm_mod.LSMTree.init(alloc, LSM_DIR);
 
         // Fill memtable to ~4MB
@@ -438,7 +438,7 @@ fn emitJSON() void {
 
     // Also write to a JSON file for CI consumption using fmt.bufPrint + writeAll
     const json_path = "/tmp/turbodb_regression_bench.json";
-    const file = std.fs.cwd().createFile(json_path, .{}) catch return;
+    const file = compat.fs.cwdCreateFile(json_path, .{}) catch return;
     defer file.close();
 
     var buf: [8192]u8 = undefined;
@@ -506,6 +506,6 @@ pub fn main() !void {
     emitJSON();
 
     // Cleanup
-    std.fs.cwd().deleteTree(DATA_DIR) catch {};
-    std.fs.cwd().deleteTree(LSM_DIR) catch {};
+    compat.fs.cwdDeleteTree(DATA_DIR) catch {};
+    compat.fs.cwdDeleteTree(LSM_DIR) catch {};
 }

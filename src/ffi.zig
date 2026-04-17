@@ -11,6 +11,7 @@ const collection = @import("collection.zig");
 const doc_mod = @import("doc.zig");
 const crypto = @import("crypto.zig");
 const vector = @import("vector.zig");
+const compat = @import("compat");
 const Database = collection.Database;
 const Collection = collection.Collection;
 const Doc = doc_mod.Doc;
@@ -43,7 +44,7 @@ pub const TurboScanHandle = extern struct {
 export fn turbodb_open(dir: [*]const u8, dir_len: usize) ?*anyopaque {
     // Ensure data directory exists.
     const dir_slice = dir[0..dir_len];
-    std.fs.cwd().makeDir(dir_slice) catch |e| switch (e) {
+    compat.fs.cwdMakeDir(dir_slice) catch |e| switch (e) {
         error.PathAlreadyExists => {},
         else => return null,
     };

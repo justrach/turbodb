@@ -63,7 +63,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Ensure data dir
-    std.fs.cwd().makeDir(data_dir) catch |e| switch (e) {
+    compat.fs.cwdMakeDir(data_dir) catch |e| switch (e) {
         error.PathAlreadyExists => {},
         else => return e,
     };
@@ -120,7 +120,7 @@ pub fn main(init: std.process.Init) !void {
 fn cmdIndex(db: *Database, col_name: []const u8, dir_path: []const u8, alloc: std.mem.Allocator) !void {
     const col = try db.collection(col_name);
 
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |e| {
+    var dir = compat.fs.cwdOpenDir(dir_path, .{ .iterate = true }) catch |e| {
         std.debug.print("Cannot open directory: {any}\n", .{e});
         return;
     };

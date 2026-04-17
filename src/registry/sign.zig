@@ -4,6 +4,7 @@
 /// The signing target is the BLAKE3 hash of the source tarball.
 /// Keypairs are stored at ~/.zag/keys/
 const std = @import("std");
+const compat = @import("compat");
 const Ed25519 = std.crypto.sign.Ed25519;
 
 pub const KeyPair = struct {
@@ -98,9 +99,9 @@ fn hexDecode64(hex: []const u8) ![64]u8 {
 /// Creates: <dir>/default.pub (64 hex chars) and <dir>/default.sec (128 hex chars)
 pub fn saveKeyPair(kp: KeyPair, dir_path: []const u8) !void {
     // Ensure directory exists
-    std.fs.cwd().makePath(dir_path) catch {};
+    compat.fs.cwdMakePath(dir_path) catch {};
 
-    var dir = try std.fs.cwd().openDir(dir_path, .{});
+    var dir = try compat.fs.cwdOpenDir(dir_path, .{});
     defer dir.close();
 
     // Write public key
@@ -126,7 +127,7 @@ pub fn saveKeyPair(kp: KeyPair, dir_path: []const u8) !void {
 
 /// Load keypair from directory.
 pub fn loadKeyPair(dir_path: []const u8) !KeyPair {
-    var dir = try std.fs.cwd().openDir(dir_path, .{});
+    var dir = try compat.fs.cwdOpenDir(dir_path, .{});
     defer dir.close();
 
     // Read public key
@@ -207,7 +208,7 @@ test "save and load keypair" {
     const tmp_dir = "/tmp/zag-test-keys";
 
     // Clean up from previous runs
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     try saveKeyPair(kp, tmp_dir);
     const loaded = try loadKeyPair(tmp_dir);
@@ -220,7 +221,7 @@ test "save and load keypair" {
     try std.testing.expect(verify("test", sig, loaded.public_key));
 
     // Clean up
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
 }
 
 test "pubkey and signature hex" {

@@ -18,6 +18,7 @@ const sign_mod = @import("sign.zig");
 const manifest_mod = @import("manifest.zig");
 const store_mod = @import("store.zig");
 const auth_mod = @import("auth.zig");
+const compat = @import("compat");
 const Visibility = auth_mod.Visibility;
 const AuthContext = auth_mod.AuthContext;
 
@@ -59,7 +60,7 @@ pub const Registry = struct {
 
     pub fn init(alloc: std.mem.Allocator, data_dir: []const u8) !Registry {
         // Ensure data directory exists
-        std.fs.cwd().makePath(data_dir) catch {};
+        compat.fs.cwdMakePath(data_dir) catch {};
 
         return .{
             .store = try store_mod.BlobStore.init(alloc, data_dir),
@@ -413,8 +414,8 @@ fn jsonGetField(json: []const u8, key: []const u8) ?[]const u8 {
 test "publish and search" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/zagdb-registry-test";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     var reg = try Registry.init(alloc, tmp_dir);
     defer reg.deinit();
@@ -451,8 +452,8 @@ test "publish and search" {
 test "publish duplicate version fails" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/zagdb-registry-dup";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     var reg = try Registry.init(alloc, tmp_dir);
     defer reg.deinit();
@@ -475,8 +476,8 @@ test "publish duplicate version fails" {
 test "invalid signature rejected" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/zagdb-registry-badsig";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     var reg = try Registry.init(alloc, tmp_dir);
     defer reg.deinit();
@@ -498,8 +499,8 @@ test "invalid signature rejected" {
 test "yank version" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/zagdb-registry-yank";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     var reg = try Registry.init(alloc, tmp_dir);
     defer reg.deinit();
@@ -528,8 +529,8 @@ test "yank version" {
 test "download after publish" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/zagdb-registry-dl";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     var reg = try Registry.init(alloc, tmp_dir);
     defer reg.deinit();
@@ -554,8 +555,8 @@ test "download after publish" {
 test "register and lookup identity" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/zagdb-registry-id";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     var reg = try Registry.init(alloc, tmp_dir);
     defer reg.deinit();
@@ -572,8 +573,8 @@ test "register and lookup identity" {
 test "private package hidden from anonymous search" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/zagdb-registry-priv-search";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     var reg = try Registry.init(alloc, tmp_dir);
     defer reg.deinit();
@@ -609,8 +610,8 @@ test "private package hidden from anonymous search" {
 test "getPackageAuth visibility" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/zagdb-registry-pkg-auth";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     var reg = try Registry.init(alloc, tmp_dir);
     defer reg.deinit();
@@ -654,8 +655,8 @@ test "getPackageAuth visibility" {
 test "grantAccess and visibility" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/zagdb-registry-grant";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     var reg = try Registry.init(alloc, tmp_dir);
     defer reg.deinit();
@@ -692,8 +693,8 @@ test "grantAccess and visibility" {
 test "org-scoped package" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/zagdb-registry-org";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     var reg = try Registry.init(alloc, tmp_dir);
     defer reg.deinit();

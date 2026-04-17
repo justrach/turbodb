@@ -12,6 +12,8 @@ const cdc_mod = @import("cdc.zig");
 const vector = @import("vector.zig");
 const branch_mod = @import("branch.zig");
 const turboquant = @import("turboquant.zig");
+const compat = @import("compat");
+const runtime = @import("runtime");
 const Doc = doc_mod.Doc;
 const DocHeader = doc_mod.DocHeader;
 const PageFile = page_mod.PageFile;
@@ -1768,20 +1770,20 @@ fn appendSanitizedComponent(writer: anytype, input: []const u8) !void {
 
 fn ensureDataDir(alloc: std.mem.Allocator, data_dir: []const u8) ![]u8 {
     try ensureDirPath(data_dir);
-    return try std.fs.realpathAlloc(alloc, data_dir);
+    return try compat.fs.cwdRealpathAlloc(alloc, data_dir);
 }
 
 fn ensureDirPath(data_dir: []const u8) !void {
     if (std.fs.path.isAbsolute(data_dir)) {
-        var root = try std.fs.openDirAbsolute("/", .{});
-        defer root.close();
-        const rel = std.mem.trimLeft(u8, data_dir, "/");
-        if (rel.len > 0) root.makePath(rel) catch |err| switch (err) {
+        var root = try compat.fs.openDirAbsolute("/", .{});
+        defer root.close(runtime.io);
+        const rel = std.mem.trimStart(u8, data_dir, "/");
+        if (rel.len > 0) root.createDirPath(runtime.io, rel) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
     } else {
-        std.fs.cwd().makePath(data_dir) catch |err| switch (err) {
+        compat.fs.cwdMakePath(data_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -1791,9 +1793,9 @@ fn ensureDirPath(data_dir: []const u8) !void {
 test "tenant collections are isolated" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_multi_tenant_test";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    try compat.fs.cwdMakePath(tmp_dir);
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1813,9 +1815,9 @@ test "tenant collections are isolated" {
 test "tenant collection quota limits new collections" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_tenant_quota_test";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    try compat.fs.cwdMakePath(tmp_dir);
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1828,9 +1830,9 @@ test "tenant collection quota limits new collections" {
 test "tenant ops quota is enforced per second" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_tenant_ops_test";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    try compat.fs.cwdMakePath(tmp_dir);
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1844,9 +1846,9 @@ test "tenant ops quota is enforced per second" {
 test "time travel get returns historical version after update" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_time_travel_update";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    try compat.fs.cwdMakePath(tmp_dir);
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1864,9 +1866,9 @@ test "time travel get returns historical version after update" {
 test "time travel get survives delete" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_time_travel_delete";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    try compat.fs.cwdMakePath(tmp_dir);
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1883,9 +1885,9 @@ test "time travel get survives delete" {
 test "time travel scan uses historical snapshot" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_time_travel_scan";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    try compat.fs.cwdMakePath(tmp_dir);
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1905,9 +1907,9 @@ test "time travel scan uses historical snapshot" {
 test "cdc emits signed ordered deliveries for tenant mutations" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_cdc_integration";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    try compat.fs.cwdMakePath(tmp_dir);
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1932,9 +1934,9 @@ test "cdc emits signed ordered deliveries for tenant mutations" {
 test "tenant collections isolate keys and listings" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_tenant_isolation";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    try compat.fs.cwdMakePath(tmp_dir);
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1962,9 +1964,9 @@ test "tenant collections isolate keys and listings" {
 test "tenant quotas apply per tenant" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_tenant_quotas";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    try compat.fs.cwdMakePath(tmp_dir);
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();

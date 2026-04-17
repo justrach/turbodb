@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const Allocator = std.mem.Allocator;
 
 /// Operation types for WAL entries.
@@ -29,7 +30,7 @@ pub const WALSegment = struct {
         var path_buf: [512]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "{s}/wal_seg_{d:0>4}", .{ data_dir, id }) catch return error.PathTooLong;
 
-        const fd = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        const fd = try compat.fs.cwdCreateFile(path, .{ .truncate = true });
 
         const buf = try alloc.alignedAlloc(u8, .fromByteUnits(4096), BUF_SIZE);
         @memset(buf, 0);

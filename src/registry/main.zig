@@ -57,7 +57,7 @@ pub fn main(init: std.process.Init) !void {
     }
 
     // Ensure data directory exists
-    std.fs.cwd().makeDir(data_dir) catch |e| switch (e) {
+    compat.fs.cwdMakeDir(data_dir) catch |e| switch (e) {
         error.PathAlreadyExists => {},
         else => return e,
     };

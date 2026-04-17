@@ -14,6 +14,7 @@
 ///   files.tdb  — file ID → path mapping: [n_files: u32][(offset: u32, len: u16)...][paths...]
 ///
 const std = @import("std");
+const compat = @import("compat");
 
 // ─── Types ──────────────────────────────────────────────────────────────────
 
@@ -151,7 +152,7 @@ pub const DiskIndexBuilder = struct {
         var posts_path_buf: [512]u8 = undefined;
         const posts_path = try std.fmt.bufPrint(&posts_path_buf, "{s}/posts.tdb", .{dir_path});
 
-        const posts_file = try std.fs.cwd().createFile(posts_path, .{});
+        const posts_file = try compat.fs.cwdCreateFile(posts_path, .{});
         defer posts_file.close();
 
         var offset: u32 = 0;
@@ -173,7 +174,7 @@ pub const DiskIndexBuilder = struct {
         var idx_path_buf: [512]u8 = undefined;
         const idx_path = try std.fmt.bufPrint(&idx_path_buf, "{s}/index.tdb", .{dir_path});
 
-        const idx_file = try std.fs.cwd().createFile(idx_path, .{});
+        const idx_file = try compat.fs.cwdCreateFile(idx_path, .{});
         defer idx_file.close();
 
         // Header: entry count
@@ -190,7 +191,7 @@ pub const DiskIndexBuilder = struct {
         var files_path_buf: [512]u8 = undefined;
         const files_path = try std.fmt.bufPrint(&files_path_buf, "{s}/files.tdb", .{dir_path});
 
-        const files_file = try std.fs.cwd().createFile(files_path, .{});
+        const files_file = try compat.fs.cwdCreateFile(files_path, .{});
         defer files_file.close();
 
         const n_files: u32 = @intCast(self.file_paths.items.len);
@@ -215,7 +216,7 @@ pub const DiskIndexBuilder = struct {
         // ── 5. Write frequency table ────────────────────────────────────
         var freq_path_buf: [512]u8 = undefined;
         const freq_path = try std.fmt.bufPrint(&freq_path_buf, "{s}/freq.tdb", .{dir_path});
-        const freq_file = try std.fs.cwd().createFile(freq_path, .{});
+        const freq_file = try compat.fs.cwdCreateFile(freq_path, .{});
         defer freq_file.close();
         try freq_file.writeAll(std.mem.asBytes(&self.freq.counts));
         stats.freq_bytes = 256 * 256 * 4;
@@ -257,7 +258,7 @@ pub const DiskIndex = struct {
 
         // mmap lookup table
         const idx_path = try std.fmt.bufPrint(&buf, "{s}/index.tdb", .{dir_path});
-        const idx_file = try std.fs.cwd().openFile(idx_path, .{});
+        const idx_file = try compat.fs.cwdOpenFile(idx_path, .{});
         defer idx_file.close();
         const idx_stat = try idx_file.stat();
         const idx_mmap = try std.posix.mmap(null, idx_stat.size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, idx_file.handle, 0);
@@ -269,11 +270,11 @@ pub const DiskIndex = struct {
 
         // Open postings file for pread
         const posts_path = try std.fmt.bufPrint(&buf, "{s}/posts.tdb", .{dir_path});
-        const posts_fd = try std.fs.cwd().openFile(posts_path, .{});
+        const posts_fd = try compat.fs.cwdOpenFile(posts_path, .{});
 
         // mmap files table
         const files_path = try std.fmt.bufPrint(&buf, "{s}/files.tdb", .{dir_path});
-        const files_file = try std.fs.cwd().openFile(files_path, .{});
+        const files_file = try compat.fs.cwdOpenFile(files_path, .{});
         defer files_file.close();
         const files_stat = try files_file.stat();
         const files_mmap = try std.posix.mmap(null, files_stat.size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, files_file.handle, 0);
@@ -281,7 +282,7 @@ pub const DiskIndex = struct {
 
         // mmap frequency table
         const freq_path = try std.fmt.bufPrint(&buf, "{s}/freq.tdb", .{dir_path});
-        const freq_file = try std.fs.cwd().openFile(freq_path, .{});
+        const freq_file = try compat.fs.cwdOpenFile(freq_path, .{});
         defer freq_file.close();
         const freq_stat = try freq_file.stat();
         const freq_mmap = try std.posix.mmap(null, freq_stat.size, std.posix.PROT.READ, .{ .TYPE = .PRIVATE }, freq_file.handle, 0);
@@ -519,8 +520,8 @@ test "DiskIndexBuilder roundtrip" {
 
     // Write to temp dir
     const tmp = "/tmp/tdb_disk_test";
-    std.fs.cwd().makeDir(tmp) catch {};
-    defer std.fs.cwd().deleteTree(tmp) catch {};
+    compat.fs.cwdMakeDir(tmp) catch {};
+    defer compat.fs.cwdDeleteTree(tmp) catch {};
 
     const stats = try builder.writeToDisk(tmp);
     try std.testing.expect(stats.n_trigrams > 0);
