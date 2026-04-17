@@ -40,26 +40,25 @@ pub const Config = struct {
 
     /// Serialize config to JSON.
     pub fn toJson(self: Config, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w = std.Io.Writer.fixed(buf);
 
         try w.writeAll("{\"registries\":{");
         for (self.registries, 0..) |reg, i| {
             if (i > 0) try w.writeAll(",");
-            try std.fmt.format(w, "\"{s}\":{{\"url\":\"{s}\"", .{ reg.name, reg.url });
+            try w.print("\"{s}\":{{\"url\":\"{s}\"", .{ reg.name, reg.url });
             if (reg.pubkey_hex) |pk| {
-                try std.fmt.format(w, ",\"pubkey\":\"{s}\"", .{pk});
+                try w.print(",\"pubkey\":\"{s}\"", .{pk});
             }
             try w.writeAll("}");
         }
-        try std.fmt.format(w, "}},\"default_registry\":\"{s}\"", .{self.default_registry});
+        try w.print("}},\"default_registry\":\"{s}\"", .{self.default_registry});
         if (self.default_org) |org| {
-            try std.fmt.format(w, ",\"default_org\":\"{s}\"", .{org});
+            try w.print(",\"default_org\":\"{s}\"", .{org});
         } else {
             try w.writeAll(",\"default_org\":null");
         }
         try w.writeAll("}");
-        return fbs.getWritten();
+        return w.buffered();
     }
 };
 

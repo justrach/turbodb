@@ -109,16 +109,15 @@ fn cmdInit(alloc: std.mem.Allocator, args: []const []const u8) !void {
     compat.fs.cwdAccess("zag.json", .{}) catch |e| {
         if (e == error.FileNotFound) {
             var buf: [2048]u8 = undefined;
-            var fbs = std.io.fixedBufferStream(&buf);
-            const w = fbs.writer();
+            var w = std.Io.Writer.fixed(&buf);
 
             try w.writeAll("{\n");
-            try std.fmt.format(w, "  \"name\": \"{s}\",\n", .{name});
+            try w.print("  \"name\": \"{s}\",\n", .{name});
             try w.writeAll("  \"version\": \"0.1.0\",\n");
             try w.writeAll("  \"description\": \"\",\n");
-            try std.fmt.format(w, "  \"visibility\": \"{s}\",\n", .{if (private) "private" else "public"});
+            try w.print("  \"visibility\": \"{s}\",\n", .{if (private) "private" else "public"});
             if (org) |o| {
-                try std.fmt.format(w, "  \"org\": \"{s}\",\n", .{o});
+                try w.print("  \"org\": \"{s}\",\n", .{o});
             }
             try w.writeAll("  \"license\": \"MIT\",\n");
             try w.writeAll("  \"zig_version\": \"0.15.0\",\n");
@@ -126,10 +125,10 @@ fn cmdInit(alloc: std.mem.Allocator, args: []const []const u8) !void {
             try w.writeAll("  \"dev_dependencies\": {}\n");
             try w.writeAll("}");
 
-            const content = fbs.getWritten();
+            const content = w.buffered();
             const file = try compat.fs.cwdCreateFile("zag.json", .{});
-            defer file.close();
-            try file.writeAll(content);
+            defer file.close(runtime.io);
+            try file.writeStreamingAll(runtime.io, content);
 
             if (org) |o| {
                 std.debug.print("Created zag.json for @{s}/{s} ({s})\n", .{ o, name, if (private) "private" else "public" });

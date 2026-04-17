@@ -55,14 +55,13 @@ pub const Permissions = struct {
 
     /// Serialize to JSON-friendly string: "read,publish,yank,admin"
     pub fn toStr(self: Permissions, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w = std.Io.Writer.fixed(buf);
         var first = true;
         if (self.read) { if (!first) try w.writeAll(","); try w.writeAll("read"); first = false; }
         if (self.publish) { if (!first) try w.writeAll(","); try w.writeAll("publish"); first = false; }
         if (self.yank) { if (!first) try w.writeAll(","); try w.writeAll("yank"); first = false; }
         if (self.admin) { if (!first) try w.writeAll(","); try w.writeAll("admin"); first = false; }
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     /// Parse from comma-separated string
