@@ -60,7 +60,9 @@ pub const Server = struct {
     query_bytes_read: std.atomic.Value(u64),
     query_cpu_us: std.atomic.Value(u64),
     query_cost_nanos_usd: std.atomic.Value(u64),
-    billing_log: std.ArrayList(QueryCost),
+    billing_ring: [1024]QueryCost = undefined,
+    billing_head: u32 = 0, // next write slot (mod 1024)
+    billing_len: u32 = 0,  // items stored, capped at 1024
     billing_mu: std.Io.Mutex,
     activity: activity.ActivityTracker,
 
@@ -77,7 +79,6 @@ pub const Server = struct {
             .query_bytes_read = std.atomic.Value(u64).init(0),
             .query_cpu_us = std.atomic.Value(u64).init(0),
             .query_cost_nanos_usd = std.atomic.Value(u64).init(0),
-            .billing_log = .empty,
             .billing_mu = .init,
             .activity = activity.ActivityTracker.init(),
         };
@@ -143,10 +144,9 @@ pub const Server = struct {
 
         self.billing_mu.lockUncancelable(runtime.io);
         defer self.billing_mu.unlock(runtime.io);
-        self.billing_log.append(self.alloc, entry) catch return;
-        if (self.billing_log.items.len > 1024) {
-            _ = self.billing_log.orderedRemove(0);
-        }
+        self.billing_ring[self.billing_head] = entry;
+        self.billing_head = (self.billing_head + 1) % 1024;
+        if (self.billing_len < 1024) self.billing_len += 1;
     }
 };
 
@@ -625,8 +625,15 @@ fn handleBillingLog(srv: *Server) usize {
     w.writeAll("{\"queries\":[") catch {};
     srv.billing_mu.lockUncancelable(runtime.io);
     defer srv.billing_mu.unlock(runtime.io);
-    const start = if (srv.billing_log.items.len > 100) srv.billing_log.items.len - 100 else 0;
-    for (srv.billing_log.items[start..], 0..) |entry, i| {
+    // Iterate ring in logical order: newest entries are the most recent `min(len, 100)`.
+    const shown: u32 = @min(srv.billing_len, 100);
+    const first_slot: u32 = (srv.billing_head + 1024 - srv.billing_len) % 1024;
+    const start_offset: u32 = srv.billing_len - shown;
+    var idx: u32 = 0;
+    while (idx < shown) : (idx += 1) {
+        const slot = (first_slot + start_offset + idx) % 1024;
+        const entry = srv.billing_ring[slot];
+        const i = idx;
         if (i > 0) w.writeByte(',') catch {};
         w.print("{{\"tenant\":\"{s}\",\"op\":\"{s}\",\"rows_scanned\":{d},\"bytes_read\":{d},\"cpu_us\":{d},\"cost_nanos_usd\":{d}}}",
             .{
