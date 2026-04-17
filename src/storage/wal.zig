@@ -111,8 +111,8 @@ pub const WAL = struct {
     allocator:    std.mem.Allocator,
 
     // Group commit state — guarded by mu
-    mu:           std.Thread.Mutex,
-    cond:         std.Thread.Condition,
+    mu:           std.Io.Mutex,
+    cond:         std.Io.Condition,
     synced_lsn:   u64,
     flushing:     bool,
 
@@ -132,8 +132,8 @@ pub const WAL = struct {
             .next_lsn      = std.atomic.Value(u64).init(1),
             .checkpoint_lsn = 0,
             .allocator     = allocator,
-            .mu            = .{},
-            .cond          = .{},
+            .mu = .init,
+            .cond = .init,
             .synced_lsn    = 0,
             .flushing      = false,
             .flush_thread  = null,
@@ -162,30 +162,30 @@ pub const WAL = struct {
 
     /// Flush any pending WAL entries to disk (non-blocking for callers).
     pub fn flushPending(self: *WAL) void {
-        self.mu.lock();
+        self.mu.lockUncancelable(runtime.io);
         if (self.write_buf.items.len == 0) {
-            self.mu.unlock();
+            self.mu.unlock(runtime.io);
             return;
         }
         if (self.flushing) {
-            self.mu.unlock();
+            self.mu.unlock(runtime.io);
             return;
         }
         self.flushing = true;
         var to_write = self.write_buf;
         const target = self.next_lsn.load(.monotonic) -| 1;
         self.write_buf = .empty;
-        self.mu.unlock();
+        self.mu.unlock(runtime.io);
 
         self.file.writeStreamingAll(runtime.io, to_write.items) catch {};
         to_write.deinit(self.allocator);
         self.file.sync(runtime.io) catch {};
 
-        self.mu.lock();
+        self.mu.lockUncancelable(runtime.io);
         self.synced_lsn = target;
         self.flushing = false;
-        self.cond.broadcast();
-        self.mu.unlock();
+        self.cond.broadcast(runtime.io);
+        self.mu.unlock(runtime.io);
     }
 
     pub fn close(self: *WAL) void {
@@ -227,8 +227,8 @@ pub const WAL = struct {
         const hdr_bytes = std.mem.asBytes(&hdr);
         hdr.crc32 = entryChecksum(hdr_bytes, payload);
 
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
         try self.write_buf.appendSlice(self.allocator, std.mem.asBytes(&hdr));
         try self.write_buf.appendSlice(self.allocator, payload);
         if (pad > 0) try self.write_buf.appendNTimes(self.allocator, 0, pad);
@@ -245,17 +245,17 @@ pub const WAL = struct {
         const lsn = try self.write(txn_id, .txn_commit, db_tag, FLAG_COMMIT, &commit_payload);
 
         // Group commit: become flusher or wait
-        self.mu.lock();
+        self.mu.lockUncancelable(runtime.io);
 
         if (self.synced_lsn >= lsn) {
-            self.mu.unlock();
+            self.mu.unlock(runtime.io);
             return;
         }
 
         if (self.flushing) {
             // Wait for current flusher
-            while (self.synced_lsn < lsn) self.cond.wait(&self.mu);
-            self.mu.unlock();
+            while (self.synced_lsn < lsn) self.cond.waitUncancelable(runtime.io, &self.mu);
+            self.mu.unlock(runtime.io);
             return;
         }
 
@@ -265,7 +265,7 @@ pub const WAL = struct {
         var to_write:   std.ArrayList(u8) = self.write_buf;
         const target = self.next_lsn.load(.monotonic) - 1;
         self.write_buf = .empty;
-        self.mu.unlock();
+        self.mu.unlock(runtime.io);
 
         // ── I/O outside lock ──────────────────────────────────────────────────
         var io_err: ?anyerror = null;
@@ -274,11 +274,11 @@ pub const WAL = struct {
         if (io_err == null) self.file.sync(runtime.io) catch |e| { io_err = e; };
         // ─────────────────────────────────────────────────────────────────────
 
-        self.mu.lock();
+        self.mu.lockUncancelable(runtime.io);
         if (io_err == null) self.synced_lsn = target;
         self.flushing = false;
-        self.cond.broadcast();
-        self.mu.unlock();
+        self.cond.broadcast(runtime.io);
+        self.mu.unlock(runtime.io);
 
         if (io_err) |e| return e;
     }
@@ -292,19 +292,19 @@ pub const WAL = struct {
         const lsn = try self.write(0, .checkpoint, db_tag, FLAG_COMMIT, &p);
         self.checkpoint_lsn = lsn;
         // Force flush
-        self.mu.lock();
+        self.mu.lockUncancelable(runtime.io);
         self.flushing = true;
         var to_write = self.write_buf;
         self.write_buf = .empty;
-        self.mu.unlock();
+        self.mu.unlock(runtime.io);
         self.file.writeStreamingAll(runtime.io, to_write.items) catch {};
         to_write.deinit(self.allocator);
         try self.file.sync(runtime.io);
-        self.mu.lock();
+        self.mu.lockUncancelable(runtime.io);
         self.synced_lsn = lsn;
         self.flushing = false;
-        self.cond.broadcast();
-        self.mu.unlock();
+        self.cond.broadcast(runtime.io);
+        self.mu.unlock(runtime.io);
     }
 
     // ── Recovery ──────────────────────────────────────────────────────────────

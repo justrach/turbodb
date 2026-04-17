@@ -178,7 +178,7 @@ pub const Collection = struct {
     next_doc_id: std.atomic.Value(u64),
     // Record-level latching: 1024 stripe locks replace single write_mu.
     // Two writers to different keys proceed in parallel; same-key writes serialize.
-    stripe_locks: [STRIPE_COUNT]std.Thread.Mutex,
+    stripe_locks: [STRIPE_COUNT]std.Io.Mutex,
     hash_idx: std.AutoHashMap(u64, BTreeEntry),
     key_doc_ids: std.AutoHashMap(u64, u64),
     /// Per-key modification epoch — tracks when each key was last written on main.
@@ -241,7 +241,7 @@ pub const Collection = struct {
         col.next_doc_id = std.atomic.Value(u64).init(1);
         // Initialize all stripe locks.
         for (&col.stripe_locks) |*lock| {
-            lock.* = .{};
+            lock.* = .init;
         }
         col.hash_idx = std.AutoHashMap(u64, BTreeEntry).init(alloc);
         col.key_doc_ids = std.AutoHashMap(u64, u64).init(alloc);
@@ -277,7 +277,7 @@ pub const Collection = struct {
         // Signal background indexers to stop, then join both threads.
         self.index_stop.store(true, .release);
         // Wake sleeping index workers so they observe the stop flag.
-        std.Thread.Futex.wake(&self.index_wake, std.math.maxInt(u32));
+        runtime.io.futexWake(u32, &self.index_wake.raw, std.math.maxInt(u32));
         if (self.index_thread) |t| t.join();
         if (self.index_thread2) |t| t.join();
         // Drain any leftover entries from both queues (free owned slices).
@@ -368,8 +368,8 @@ pub const Collection = struct {
     pub fn insert(self: *Collection, key: []const u8, value: []const u8) !u64 {
         const key_hash = doc_mod.fnv1a(key);
         const stripe = stripeIndex(key_hash);
-        self.stripe_locks[stripe].lock();
-        defer self.stripe_locks[stripe].unlock();
+        self.stripe_locks[stripe].lockUncancelable(runtime.io);
+        defer self.stripe_locks[stripe].unlock(runtime.io);
 
         const doc_id = self.next_doc_id.fetchAdd(1, .monotonic);
         const hdr = doc_mod.newHeader(doc_id, key, value);
@@ -439,7 +439,7 @@ pub const Collection = struct {
                     }
                     // Wake sleeping index worker to process the new entry.
                     _ = self.index_wake.fetchAdd(1, .release);
-                    std.Thread.Futex.wake(&self.index_wake, 1);
+                    runtime.io.futexWake(u32, &self.index_wake.raw, 1);
                 }
             }
         }
@@ -559,8 +559,8 @@ pub const Collection = struct {
     pub fn update(self: *Collection, key: []const u8, new_value: []const u8) !bool {
         const key_hash = doc_mod.fnv1a(key);
         const stripe = stripeIndex(key_hash);
-        self.stripe_locks[stripe].lock();
-        defer self.stripe_locks[stripe].unlock();
+        self.stripe_locks[stripe].lockUncancelable(runtime.io);
+        defer self.stripe_locks[stripe].unlock(runtime.io);
 
         const old_entry = self.idx.search(key_hash) orelse return false;
         const old_doc = self.readEntry(old_entry) orelse return false;
@@ -603,8 +603,8 @@ pub const Collection = struct {
     pub fn delete(self: *Collection, key: []const u8) !bool {
         const key_hash = doc_mod.fnv1a(key);
         const stripe = stripeIndex(key_hash);
-        self.stripe_locks[stripe].lock();
-        defer self.stripe_locks[stripe].unlock();
+        self.stripe_locks[stripe].lockUncancelable(runtime.io);
+        defer self.stripe_locks[stripe].unlock(runtime.io);
 
         const entry = self.idx.search(key_hash) orelse return false;
 
@@ -1452,7 +1452,7 @@ fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
             // Sleep on futex instead of spinning — woken by index push path.
             const cur = col.index_wake.load(.acquire);
             if (!col.index_stop.load(.acquire))
-                std.Thread.Futex.timedWait(&col.index_wake, cur, 50_000_000) catch {};
+                runtime.io.futexWaitTimeout(u32, &col.index_wake.raw, cur, .{ .duration = .fromNanoseconds(50_000_000) }) catch {};
             continue;
         }
         // Batch trigram indexing (single lock acquisition for all docs).
@@ -1488,7 +1488,7 @@ pub const Database = struct {
     data_dir_buf: [256]u8,
     data_dir_len: usize,
     alloc: std.mem.Allocator,
-    mu: std.Thread.RwLock,
+    mu: std.Io.RwLock,
     auth: @import("auth.zig").AuthStore,
 
     pub const TenantQuota = struct {
@@ -1571,16 +1571,16 @@ pub const Database = struct {
         defer self.alloc.free(tenant_key);
 
         // Fast path: read lock
-        self.mu.lockShared();
+        self.mu.lockSharedUncancelable(runtime.io);
         if (self.collections.get(tenant_key)) |c| {
-            self.mu.unlockShared();
+            self.mu.unlockShared(runtime.io);
             return c;
         }
-        self.mu.unlockShared();
+        self.mu.unlockShared(runtime.io);
 
         // Slow path: write lock for creation
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
         // Double-check after acquiring write lock
         if (self.collections.get(tenant_key)) |c| return c;
         try self.enforceCollectionQuotaLocked(tenant_id);
@@ -1609,8 +1609,8 @@ pub const Database = struct {
     pub fn dropCollectionForTenant(self: *Database, tenant_id: []const u8, name: []const u8) void {
         const tenant_key = self.tenantCollectionKey(tenant_id, name) catch return;
         defer self.alloc.free(tenant_key);
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
         if (self.collections.fetchRemove(tenant_key)) |kv| {
             kv.value.close();
             self.alloc.free(kv.key);
@@ -1623,8 +1623,8 @@ pub const Database = struct {
         defer alloc.free(prefix);
 
         var result: std.ArrayList([]const u8) = .empty;
-        self.mu.lockShared();
-        defer self.mu.unlockShared();
+        self.mu.lockSharedUncancelable(runtime.io);
+        defer self.mu.unlockShared(runtime.io);
 
         var it = self.collections.keyIterator();
         while (it.next()) |k| {
@@ -1637,8 +1637,8 @@ pub const Database = struct {
 
     pub fn configureTenantQuota(self: *Database, tenant_id: []const u8, quota: TenantQuota) !void {
         try validateTenantComponent(tenant_id);
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
         const gop = try self.tenant_quotas.getOrPut(tenant_id);
         if (!gop.found_existing) {
             gop.key_ptr.* = try self.alloc.dupe(u8, tenant_id);
@@ -1658,8 +1658,8 @@ pub const Database = struct {
 
     pub fn recordTenantOperation(self: *Database, tenant_id: []const u8) !void {
         try validateTenantComponent(tenant_id);
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
 
         const quota = self.tenant_quotas.get(tenant_id) orelse return;
         if (quota.max_ops_per_second == std.math.maxInt(u32)) return;
@@ -1677,8 +1677,8 @@ pub const Database = struct {
 
     pub fn ensureTenantStorageAvailable(self: *Database, tenant_id: []const u8, extra_bytes: usize) !void {
         try validateTenantComponent(tenant_id);
-        self.mu.lockShared();
-        defer self.mu.unlockShared();
+        self.mu.lockSharedUncancelable(runtime.io);
+        defer self.mu.unlockShared(runtime.io);
 
         const quota = self.tenant_quotas.get(tenant_id) orelse return;
         if (quota.max_storage_bytes == std.math.maxInt(usize)) return;
@@ -1748,14 +1748,13 @@ fn validateCollectionComponent(name: []const u8) !void {
         if (c == '/' or c == '\\') return error.InvalidCollectionName;
     }
 }
-
 fn makeStorageName(buf: []u8, tenant_id: []const u8, collection_name: []const u8) ![]const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
-    try appendSanitizedComponent(w, tenant_id);
+    var w = std.Io.Writer.fixed(buf);
+    try appendSanitizedComponent(&w, tenant_id);
     try w.writeAll("__");
-    try appendSanitizedComponent(w, collection_name);
-    return buf[0..fbs.pos];
+    try appendSanitizedComponent(&w, collection_name);
+    return w.buffered();
+}
 }
 
 fn appendSanitizedComponent(writer: anytype, input: []const u8) !void {

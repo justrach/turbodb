@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime = @import("runtime");
 
 pub const NodeId = u16;
 pub const PartitionId = u16;
@@ -137,7 +138,7 @@ pub const ShardManager = struct {
     ring: HashRing,
     local_node_id: NodeId,
     alloc: std.mem.Allocator,
-    mu: std.Thread.RwLock,
+    mu: std.Io.RwLock,
     migrations: std.ArrayListUnmanaged(Migration),
 
     pub fn init(alloc: std.mem.Allocator, local_node_id: NodeId) ShardManager {
@@ -159,29 +160,29 @@ pub const ShardManager = struct {
 
     /// Register a partition on a node.
     pub fn registerPartition(self: *ShardManager, entry: ShardEntry) !void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
         try self.shard_map.put(self.alloc, entry.partition_id, entry);
     }
 
     /// Look up which node owns a partition.
     pub fn getOwner(self: *ShardManager, partition_id: PartitionId) ?ShardEntry {
-        self.mu.lockShared();
-        defer self.mu.unlockShared();
+        self.mu.lockSharedUncancelable(runtime.io);
+        defer self.mu.unlockShared(runtime.io);
         return self.shard_map.get(partition_id);
     }
 
     /// Look up which node should own a key (via consistent hashing).
     pub fn routeKey(self: *ShardManager, key_hash: u64) ?NodeId {
-        self.mu.lockShared();
-        defer self.mu.unlockShared();
+        self.mu.lockSharedUncancelable(runtime.io);
+        defer self.mu.unlockShared(runtime.io);
         return self.ring.getNode(key_hash);
     }
 
     /// Check if a partition is local.
     pub fn isLocal(self: *ShardManager, partition_id: PartitionId) bool {
-        self.mu.lockShared();
-        defer self.mu.unlockShared();
+        self.mu.lockSharedUncancelable(runtime.io);
+        defer self.mu.unlockShared(runtime.io);
         if (self.shard_map.get(partition_id)) |entry| {
             return entry.node_id == self.local_node_id;
         }
@@ -190,8 +191,8 @@ pub const ShardManager = struct {
 
     /// Get all local partition IDs.
     pub fn localPartitions(self: *ShardManager, alloc_: std.mem.Allocator) ![]PartitionId {
-        self.mu.lockShared();
-        defer self.mu.unlockShared();
+        self.mu.lockSharedUncancelable(runtime.io);
+        defer self.mu.unlockShared(runtime.io);
 
         var list: std.ArrayListUnmanaged(PartitionId) = .empty;
         var it = self.shard_map.iterator();
@@ -205,8 +206,8 @@ pub const ShardManager = struct {
 
     /// Initiate migration of a partition to a target node.
     pub fn migratePartition(self: *ShardManager, partition_id: PartitionId, target_node: NodeId) !void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
 
         const entry = self.shard_map.get(partition_id) orelse return error.PartitionNotFound;
         const migration = Migration{
@@ -222,8 +223,8 @@ pub const ShardManager = struct {
 
     /// Get shard map snapshot for serialization.
     pub fn snapshot(self: *ShardManager, alloc_: std.mem.Allocator) ![]ShardEntry {
-        self.mu.lockShared();
-        defer self.mu.unlockShared();
+        self.mu.lockSharedUncancelable(runtime.io);
+        defer self.mu.unlockShared(runtime.io);
 
         var list: std.ArrayListUnmanaged(ShardEntry) = .empty;
         var it = self.shard_map.iterator();

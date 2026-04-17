@@ -136,7 +136,7 @@ pub const Resolver = struct {
 
     /// Generate a deterministic lockfile JSON.
     pub fn toLockfile(resolved: []const ResolvedDep, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
+        var fbs = std.Io.Writer.fixed(buf);
         const w = fbs.writer();
 
         try w.writeAll("{\"locked\":[");

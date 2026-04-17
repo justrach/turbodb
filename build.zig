@@ -39,6 +39,13 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // Storage modules that now import runtime/compat need those wired too.
+    mmap_mod.addImport("runtime", runtime_mod);
+    mmap_mod.addImport("compat", compat_mod);
+    epoch_mod.addImport("runtime", runtime_mod);
+    epoch_mod.addImport("compat", compat_mod);
+    wal_mod.addImport("runtime", runtime_mod);
+    wal_mod.addImport("compat", compat_mod);
 
     // ── Helper: wire storage imports into a module ──────────────────────────
     const wireStorage = struct {

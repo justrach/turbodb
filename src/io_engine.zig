@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const runtime = @import("runtime");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
@@ -485,7 +486,7 @@ pub const EventLoop = struct {
             self.running.store(false, .release);
         }
         // Wake all workers so they can observe running=false and exit.
-        std.Thread.Futex.wake(&self.wake_signal, @intCast(self.worker_count));
+        runtime.io.futexWake(u32, &self.wake_signal.raw, @intCast(self.worker_count));
         if (self.listen_fd >= 0) {
             posix.close(self.listen_fd);
         }
@@ -548,7 +549,7 @@ pub const EventLoop = struct {
     pub fn stop(self: *EventLoop) void {
         self.running.store(false, .release);
         // Wake all sleeping workers so they see running=false.
-        std.Thread.Futex.wake(&self.wake_signal, @intCast(self.worker_count));
+        runtime.io.futexWake(u32, &self.wake_signal.raw, @intCast(self.worker_count));
     }
 
     // ── Internal completion handlers ──
@@ -619,7 +620,7 @@ pub const EventLoop = struct {
         } else {
             // Wake one sleeping worker to process this item.
             _ = self.wake_signal.fetchAdd(1, .release);
-            std.Thread.Futex.wake(&self.wake_signal, 1);
+            runtime.io.futexWake(u32, &self.wake_signal.raw, 1);
         }
     }
 
@@ -666,7 +667,7 @@ pub const EventLoop = struct {
                 const cur = self.wake_signal.load(.acquire);
                 // Re-check running before sleeping (avoid missed wake on shutdown).
                 if (!self.running.load(.acquire)) break;
-                std.Thread.Futex.timedWait(&self.wake_signal, cur, 50_000_000) catch {};
+                runtime.io.futexWaitTimeout(u32, &self.wake_signal.raw, cur, .{ .duration = .fromNanoseconds(50_000_000) }) catch {};
                 continue;
             };
 

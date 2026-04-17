@@ -1,5 +1,6 @@
 const std = @import("std");
 const sequencer = @import("sequencer.zig");
+const runtime = @import("runtime");
 
 pub const NodeId = u16;
 
@@ -48,7 +49,7 @@ pub const CalvinExecutor = struct {
 
     // Execution state
     last_executed_epoch: u64,
-    execute_mu: std.Thread.Mutex,
+    execute_mu: std.Io.Mutex,
 
     pub fn init(alloc: std.mem.Allocator, node_id: NodeId) CalvinExecutor {
         return .{
@@ -86,8 +87,8 @@ pub const CalvinExecutor = struct {
         batch: *const sequencer.Batch,
         executor_fn: *const fn (txn: *const sequencer.Transaction) anyerror!void,
     ) !void {
-        self.execute_mu.lock();
-        defer self.execute_mu.unlock();
+        self.execute_mu.lockUncancelable(runtime.io);
+        defer self.execute_mu.unlock(runtime.io);
 
         // Deterministic execution: iterate in batch order.
         for (batch.transactions) |*txn| {

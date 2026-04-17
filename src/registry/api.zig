@@ -132,7 +132,7 @@ fn dispatch(srv: *RegistryServer, raw: []const u8) usize {
     // ─── /metrics ───────────────────────────────────────────────────────
     if (std.mem.eql(u8, path, "/metrics")) {
         var fbs = std.io.fixedBufferStream(getBodyBuf());
-        std.fmt.format(fbs.writer(), "{{\"requests\":{d},\"errors\":{d}}}", .{
+        fbs.print("{{\"requests\":{d},\"errors\":{d}}}", .{
             srv.req_count.load(.acquire),
             srv.err_count.load(.acquire),
         }) catch {};
@@ -256,7 +256,7 @@ fn handlePublish(srv: *RegistryServer, body: []const u8) usize {
     };
 
     var fbs = std.io.fixedBufferStream(getBodyBuf());
-    std.fmt.format(fbs.writer(), "{{\"ok\":true,\"name\":\"{s}\",\"version\":\"{s}\",\"hash\":\"{s}\"}}", .{
+    fbs.print("{{\"ok\":true,\"name\":\"{s}\",\"version\":\"{s}\",\"hash\":\"{s}\"}}", .{
         result.package_name,
         result.version,
         result.source_hash_hex,
@@ -319,7 +319,7 @@ fn handleDownload(srv: *RegistryServer, hash_hex: []const u8) usize {
     if (data.len > MAX_RESP - 256) return err(413, "blob too large for response buffer");
 
     var fbs = std.io.fixedBufferStream(getRespBuf());
-    std.fmt.format(fbs.writer(), "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n", .{data.len}) catch {};
+    fbs.print("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n", .{data.len}) catch {};
     const header_len = fbs.pos;
     if (header_len + data.len <= MAX_RESP) {
         @memcpy(getRespBuf()[header_len..][0..data.len], data);
@@ -362,7 +362,7 @@ fn err(code: u16, msg: []const u8) usize {
 
 fn respond(code: u16, status: []const u8, body: []const u8) usize {
     var fbs = std.io.fixedBufferStream(getRespBuf());
-    std.fmt.format(fbs.writer(), "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}", .{ code, status, body.len, body }) catch {};
+    fbs.print("HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}", .{ code, status, body.len, body }) catch {};
     return fbs.pos;
 }
 

@@ -1,5 +1,6 @@
 const std = @import("std");
 const compat = @import("compat");
+const runtime = @import("runtime");
 
 // ── Inverted word index ─────────────────────────────────────
 // Maps word → list of (path, line) hits. O(1) word lookup.
@@ -154,7 +155,7 @@ pub fn searchDeduped(self: *WordIndex, word: []const u8, allocator: std.mem.Allo
     defer seen.deinit();
     try seen.ensureTotalCapacity(@intCast(hits.len));
 
-    var result: std.ArrayList(WordHit) = .{};
+    var result: std.ArrayList(WordHit) = .empty;
     errdefer result.deinit(allocator);
     try result.ensureTotalCapacity(allocator, hits.len);
 
@@ -264,14 +265,14 @@ pub const TrigramIndex = struct {
     /// When true, deinit frees the path strings in id_to_path (set by readFromDisk).
     owns_paths: bool = false,
     /// Mutex for concurrent access (background indexer writes, search reads).
-    mu: std.Thread.Mutex = .{},
+    mu: std.Io.Mutex = .init,
 
     pub fn init(allocator: std.mem.Allocator) TrigramIndex {
         return .{
             .index = std.AutoHashMap(Trigram, PostingList).init(allocator),
             .file_trigrams = std.AutoHashMap(u32, std.ArrayList(Trigram)).init(allocator),
             .path_to_id = std.StringHashMap(u32).init(allocator),
-            .id_to_path = .{},
+            .id_to_path = .empty,
             .allocator = allocator,
         };
     }
@@ -359,8 +360,8 @@ pub const TrigramIndex = struct {
         }
 
         // ── Pass 2 (locked): update the global index once per unique trigram ──
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
 
         const file_id = try self.getOrCreateFileId(path);
 
@@ -369,7 +370,7 @@ pub const TrigramIndex = struct {
             self.removeFileById(file_id);
         }
 
-        var tri_list: std.ArrayList(Trigram) = .{};
+        var tri_list: std.ArrayList(Trigram) = .empty;
         errdefer tri_list.deinit(self.allocator);
         try tri_list.ensureTotalCapacity(self.allocator, unique_tris.count());
 
@@ -433,8 +434,8 @@ pub const TrigramIndex = struct {
         }
 
         // Single lock acquisition for all docs
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
 
         for (paths, contents, 0..) |path, _, di| {
             const tris = batch[di].tris;
@@ -447,7 +448,7 @@ pub const TrigramIndex = struct {
                 self.removeFileById(file_id);
             }
 
-            var tri_list: std.ArrayList(Trigram) = .{};
+            var tri_list: std.ArrayList(Trigram) = .empty;
             tri_list.ensureTotalCapacity(self.allocator, tris.len) catch continue;
 
             for (tris) |tri| {
@@ -464,8 +465,8 @@ pub const TrigramIndex = struct {
         }
     }
 pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.Allocator) ?[]const []const u8 {
-    self.mu.lock();
-    defer self.mu.unlock();
+    self.mu.lockUncancelable(runtime.io);
+    defer self.mu.unlock(runtime.io);
 
     if (query.len < 3) return null;
     const tri_count = query.len - 2;
@@ -483,7 +484,7 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
         _ = unique.getOrPut(tri) catch return null;
     }
 
-    var sets: std.ArrayList(*PostingList) = .{};
+    var sets: std.ArrayList(*PostingList) = .empty;
     defer sets.deinit(allocator);
     sets.ensureTotalCapacity(allocator, unique.count()) catch return null;
 
@@ -510,7 +511,7 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
         }
     }
 
-    var result: std.ArrayList([]const u8) = .{};
+    var result: std.ArrayList([]const u8) = .empty;
     errdefer result.deinit(allocator);
     result.ensureTotalCapacity(allocator, min_count) catch return null;
 
@@ -598,7 +599,7 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
                         result_set.?.put(pe.file_id, {}) catch return null;
                     }
                 } else {
-                    var to_remove: std.ArrayList(u32) = .{};
+                    var to_remove: std.ArrayList(u32) = .empty;
                     defer to_remove.deinit(allocator);
                     var it = result_set.?.keyIterator();
                     while (it.next()) |key| {
@@ -633,7 +634,7 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
                     result_set.?.put(key.*, {}) catch return null;
                 }
             } else {
-                var to_remove: std.ArrayList(u32) = .{};
+                var to_remove: std.ArrayList(u32) = .empty;
                 defer to_remove.deinit(allocator);
                 var it = result_set.?.keyIterator();
                 while (it.next()) |key| {
@@ -650,7 +651,7 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
         if (result_set == null) return null;
 
         // Convert file_ids to paths
-        var result: std.ArrayList([]const u8) = .{};
+        var result: std.ArrayList([]const u8) = .empty;
         errdefer result.deinit(allocator);
         result.ensureTotalCapacity(allocator, result_set.?.count()) catch return null;
         var it = result_set.?.keyIterator();
@@ -701,7 +702,7 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
         const file_count: u32 = @intCast(self.id_to_path.items.len);
 
         // Step 2: Collect all trigrams, sort them, serialize postings contiguously
-        var trigrams_sorted: std.ArrayList(Trigram) = .{};
+        var trigrams_sorted: std.ArrayList(Trigram) = .empty;
         defer trigrams_sorted.deinit(self.allocator);
         {
             var tri_iter = self.index.keyIterator();
@@ -716,9 +717,9 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
         }.lt);
 
         // Step 3: Build postings blob and lookup entries
-        var postings_buf: std.ArrayList(DiskPosting) = .{};
+        var postings_buf: std.ArrayList(DiskPosting) = .empty;
         defer postings_buf.deinit(self.allocator);
-        var lookup_entries: std.ArrayList(LookupEntry) = .{};
+        var lookup_entries: std.ArrayList(LookupEntry) = .empty;
         defer lookup_entries.deinit(self.allocator);
 
         for (trigrams_sorted.items) |tri| {
@@ -1032,7 +1033,7 @@ pub const RegexQuery = struct {
 pub fn decomposeRegex(pattern: []const u8, allocator: std.mem.Allocator) !RegexQuery {
     // First check if this is an alternation at the top level
     // We need to respect grouping: only split on | outside of [...] and (...)
-    var top_pipes: std.ArrayList(usize) = .{};
+    var top_pipes: std.ArrayList(usize) = .empty;
     defer top_pipes.deinit(allocator);
 
     {
@@ -1060,7 +1061,7 @@ pub fn decomposeRegex(pattern: []const u8, allocator: std.mem.Allocator) !RegexQ
     if (top_pipes.items.len > 0) {
         // Top-level alternation: merge all branch trigrams into a single OR group.
         // A file matching ANY branch's trigrams is a valid candidate.
-        var all_tris: std.ArrayList(Trigram) = .{};
+        var all_tris: std.ArrayList(Trigram) = .empty;
         errdefer all_tris.deinit(allocator);
 
         var start: usize = 0;
@@ -1082,7 +1083,7 @@ pub fn decomposeRegex(pattern: []const u8, allocator: std.mem.Allocator) !RegexQ
         }
 
         const empty_and = try allocator.alloc(Trigram, 0);
-        var or_groups: std.ArrayList([]Trigram) = .{};
+        var or_groups: std.ArrayList([]Trigram) = .empty;
         errdefer or_groups.deinit(allocator);
         if (all_tris.items.len > 0) {
             try or_groups.append(allocator, try all_tris.toOwnedSlice(allocator));
@@ -1106,10 +1107,10 @@ pub fn decomposeRegex(pattern: []const u8, allocator: std.mem.Allocator) !RegexQ
 
 /// Extract trigrams from literal runs in a regex fragment (no top-level |).
 fn extractLiteralTrigrams(pattern: []const u8, allocator: std.mem.Allocator) ![]Trigram {
-    var literals: std.ArrayList(u8) = .{};
+    var literals: std.ArrayList(u8) = .empty;
     defer literals.deinit(allocator);
 
-    var trigrams_list: std.ArrayList(Trigram) = .{};
+    var trigrams_list: std.ArrayList(Trigram) = .empty;
     errdefer trigrams_list.deinit(allocator);
 
     // Deduplicate trigrams
@@ -1501,7 +1502,7 @@ pub fn extractSparseNgrams(content: []const u8, allocator: std.mem.Allocator) ![
 
     // Collect boundary pair-positions: always include 0 and pair_count-1,
     // plus any interior strict local maximum.
-    var bounds: std.ArrayList(usize) = .{};
+    var bounds: std.ArrayList(usize) = .empty;
     defer bounds.deinit(allocator);
 
     try bounds.append(allocator, 0);
@@ -1516,7 +1517,7 @@ pub fn extractSparseNgrams(content: []const u8, allocator: std.mem.Allocator) ![
 
     // Emit n-grams spanning consecutive boundary positions.
     // N-gram for boundary pair at position p covers content[p .. p+2].
-    var result: std.ArrayList(SparseNgram) = .{};
+    var result: std.ArrayList(SparseNgram) = .empty;
     errdefer result.deinit(allocator);
 
     var b: usize = 0;
@@ -1563,7 +1564,7 @@ pub fn buildCoveringSet(query: []const u8, allocator: std.mem.Allocator) ![]Spar
     const MIN_LEN = 3;
     if (query.len < MIN_LEN) return try allocator.alloc(SparseNgram, 0);
 
-    var result: std.ArrayList(SparseNgram) = .{};
+    var result: std.ArrayList(SparseNgram) = .empty;
     errdefer result.deinit(allocator);
 
     // Slide a window of every length [MIN_LEN, MAX_NGRAM_LEN] across the query.
@@ -1645,7 +1646,7 @@ pub const SparseNgramIndex = struct {
             _ = try seen.getOrPut(ng.hash);
         }
 
-        var hash_list: std.ArrayList(u64) = .{};
+        var hash_list: std.ArrayList(u64) = .empty;
         errdefer hash_list.deinit(self.allocator);
         var seen_iter = seen.keyIterator();
         while (seen_iter.next()) |h| {
@@ -1682,7 +1683,7 @@ pub const SparseNgramIndex = struct {
             return allocator.alloc([]const u8, 0) catch null;
         }
 
-        var result: std.ArrayList([]const u8) = .{};
+        var result: std.ArrayList([]const u8) = .empty;
         errdefer result.deinit(allocator);
         result.ensureTotalCapacity(allocator, seen_files.count()) catch return null;
 

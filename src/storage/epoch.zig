@@ -15,6 +15,7 @@
 //! slot to avoid false sharing.
 const std = @import("std");
 const compat = @import("compat");
+const runtime = @import("runtime");
 
 pub const MAX_READERS:    usize = 1024;
 pub const EPOCH_INACTIVE: u64   = std.math.maxInt(u64);
@@ -38,7 +39,7 @@ pub const EpochManager = struct {
     slots: []Slot,
     allocator: std.mem.Allocator,
     timeline: std.ArrayList(EpochPoint),
-    timeline_mu: std.Thread.Mutex,
+    timeline_mu: std.Io.Mutex,
 
     pub fn init(allocator: std.mem.Allocator) !EpochManager {
         const slots = try allocator.alloc(Slot, MAX_READERS);
@@ -48,7 +49,7 @@ pub const EpochManager = struct {
             .slots     = slots,
             .allocator = allocator,
             .timeline = .empty,
-            .timeline_mu = .{},
+            .timeline_mu = .init,
         };
     }
 
@@ -66,8 +67,8 @@ pub const EpochManager = struct {
 
     pub fn advanceAt(self: *EpochManager, ts_ms: i64) u64 {
         const epoch = self.global_ts.fetchAdd(1, .acq_rel) + 1;
-        self.timeline_mu.lock();
-        defer self.timeline_mu.unlock();
+        self.timeline_mu.lockUncancelable(runtime.io);
+        defer self.timeline_mu.unlock(runtime.io);
         self.timeline.append(self.allocator, .{ .epoch = epoch, .ts_ms = ts_ms }) catch {};
         return epoch;
     }
@@ -79,8 +80,8 @@ pub const EpochManager = struct {
 
     pub fn epochForTimestamp(self: *const EpochManager, ts_ms: i64) ?u64 {
         const mutable: *EpochManager = @constCast(self);
-        mutable.timeline_mu.lock();
-        defer mutable.timeline_mu.unlock();
+        mutable.timeline_mu.lockUncancelable(runtime.io);
+        defer mutable.timeline_mu.unlock(runtime.io);
 
         var best: ?u64 = null;
         for (mutable.timeline.items) |entry| {

@@ -15,6 +15,7 @@ const activity = @import("activity.zig");
 const auth = @import("auth.zig");
 const collection = @import("collection.zig");
 const compat = @import("compat");
+const runtime = @import("runtime");
 const Database = collection.Database;
 
 const MAX_REQ  = 65536;  // 64 KiB (initial read)
@@ -60,7 +61,7 @@ pub const Server = struct {
     query_cpu_us: std.atomic.Value(u64),
     query_cost_nanos_usd: std.atomic.Value(u64),
     billing_log: std.ArrayList(QueryCost),
-    billing_mu: std.Thread.Mutex,
+    billing_mu: std.Io.Mutex,
     activity: activity.ActivityTracker,
 
     pub fn init(alloc: std.mem.Allocator, db: *Database, port: u16) Server {
@@ -163,8 +164,8 @@ pub const Server = struct {
         @memcpy(entry.tenant_id[0..entry.tenant_id_len], tenant_id[0..entry.tenant_id_len]);
         @memcpy(entry.op[0..entry.op_len], op[0..entry.op_len]);
 
-        self.billing_mu.lock();
-        defer self.billing_mu.unlock();
+        self.billing_mu.lockUncancelable(runtime.io);
+        defer self.billing_mu.unlock(runtime.io);
         self.billing_log.append(self.alloc, entry) catch return;
         if (self.billing_log.items.len > 1024) {
             _ = self.billing_log.orderedRemove(0);
@@ -478,7 +479,7 @@ fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []c
         // Write JSON body directly into resp_buf at offset 256 (reserve space for headers)
         const HEADER_RESERVE = 256;
         var resp = getRespBuf();
-        var fbs = std.io.fixedBufferStream(resp[HEADER_RESERVE..]);
+        var fbs = std.Io.Writer.fixed(resp[HEADER_RESERVE..]);
         std.fmt.format(fbs.writer(),
             "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}",
             .{ d.header.doc_id, d.key, d.header.version,
@@ -486,7 +487,7 @@ fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []c
         const body_len = fbs.pos;
 
         // Now write headers into the reserved space at the front
-        var hdr_fbs = std.io.fixedBufferStream(resp[0..HEADER_RESERVE]);
+        var hdr_fbs = std.Io.Writer.fixed(resp[0..HEADER_RESERVE]);
         std.fmt.format(hdr_fbs.writer(),
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
             .{body_len}) catch {};
@@ -653,8 +654,8 @@ fn handleBillingLog(srv: *Server) usize {
     var fbs = std.io.fixedBufferStream(getBodyBuf());
     const w = fbs.writer();
     w.writeAll("{\"queries\":[") catch {};
-    srv.billing_mu.lock();
-    defer srv.billing_mu.unlock();
+    srv.billing_mu.lockUncancelable(runtime.io);
+    defer srv.billing_mu.unlock(runtime.io);
     const start = if (srv.billing_log.items.len > 100) srv.billing_log.items.len - 100 else 0;
     for (srv.billing_log.items[start..], 0..) |entry, i| {
         if (i > 0) w.writeByte(',') catch {};
@@ -691,7 +692,7 @@ fn handleWebhookRegistration(srv: *Server, body: []const u8) usize {
     const collection_name = jsonStr(body, "collection") orelse "";
     const id = srv.db.registerWebhook(tenant, collection_name, webhook, secret) catch return err(500, "register webhook failed");
     var fbs = std.io.fixedBufferStream(getBodyBuf());
-    std.fmt.format(fbs.writer(), "{{\"subscription_id\":{d}}}", .{id}) catch {};
+    fbs.print("{{\"subscription_id\":{d}}}", .{id}) catch {};
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 
@@ -745,7 +746,7 @@ fn handleBranchRead(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
     const val = col.getOnBranch(br, key) orelse return err(404, "not found");
     // Write response with raw value
     var fbs = std.io.fixedBufferStream(getBodyBuf());
-    std.fmt.format(fbs.writer(), "{{\"key\":\"{s}\",\"value\":{s}}}", .{
+    fbs.print("{{\"key\":\"{s}\",\"value\":{s}}}", .{
         key, if (val.len > 0) val else "{}",
     }) catch {};
     return ok(getBodyBuf()[0..fbs.pos]);
@@ -760,11 +761,11 @@ fn handleBranchMerge(srv: *Server, tenant_id: []const u8, col_name: []const u8, 
     if (result.conflicts.len > 0) {
         // Return conflict count
         var fbs = std.io.fixedBufferStream(getBodyBuf());
-        std.fmt.format(fbs.writer(), "{{\"merged\":false,\"conflicts\":{d}}}", .{result.conflicts.len}) catch {};
+        fbs.print("{{\"merged\":false,\"conflicts\":{d}}}", .{result.conflicts.len}) catch {};
         return respond(409, "Conflict", getBodyBuf()[0..fbs.pos]);
     }
     var fbs = std.io.fixedBufferStream(getBodyBuf());
-    std.fmt.format(fbs.writer(), "{{\"merged\":true,\"applied\":{d}}}", .{result.applied}) catch {};
+    fbs.print("{{\"merged\":true,\"applied\":{d}}}", .{result.applied}) catch {};
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 

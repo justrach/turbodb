@@ -9,6 +9,7 @@
 /// DocHeader format.
 const std = @import("std");
 const compat = @import("compat");
+const runtime = @import("runtime");
 const Allocator = std.mem.Allocator;
 
 /// A TTL entry: document ID → expiry timestamp.
@@ -20,7 +21,7 @@ const TTLEntry = struct {
 /// TTL index for a single collection.
 pub const TTLIndex = struct {
     entries: std.ArrayListUnmanaged(TTLEntry) = .empty,
-    lock: std.Thread.RwLock = .{},
+    lock: std.Io.RwLock = .init,
 
     pub fn deinit(self: *TTLIndex, alloc: Allocator) void {
         self.entries.deinit(alloc);
@@ -31,8 +32,8 @@ pub const TTLIndex = struct {
         const now: u64 = @intCast(@divFloor(compat.milliTimestamp(), 1000));
         const expires_at = now + ttl_seconds;
 
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(runtime.io);
+        defer self.lock.unlock(runtime.io);
 
         // Check if entry already exists for this doc_id
         for (self.entries.items) |*entry| {
@@ -46,8 +47,8 @@ pub const TTLIndex = struct {
 
     /// Set TTL with absolute timestamp.
     pub fn setExpiry(self: *TTLIndex, alloc: Allocator, doc_id: u64, expires_at: u64) !void {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(runtime.io);
+        defer self.lock.unlock(runtime.io);
 
         for (self.entries.items) |*entry| {
             if (entry.doc_id == doc_id) {
@@ -60,8 +61,8 @@ pub const TTLIndex = struct {
 
     /// Remove TTL for a document (make it permanent).
     pub fn removeTTL(self: *TTLIndex, doc_id: u64) void {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(runtime.io);
+        defer self.lock.unlock(runtime.io);
 
         var i: usize = 0;
         while (i < self.entries.items.len) {
@@ -78,8 +79,8 @@ pub const TTLIndex = struct {
         const now: u64 = @intCast(@divFloor(compat.milliTimestamp(), 1000));
         var expired: std.ArrayListUnmanaged(u64) = .empty;
 
-        self.lock.lockShared();
-        defer self.lock.unlockShared();
+        self.lock.lockSharedUncancelable(runtime.io);
+        defer self.lock.unlockShared(runtime.io);
 
         for (self.entries.items) |entry| {
             if (entry.expires_at <= now) {
@@ -93,8 +94,8 @@ pub const TTLIndex = struct {
     pub fn purgeExpired(self: *TTLIndex) void {
         const now: u64 = @intCast(@divFloor(compat.milliTimestamp(), 1000));
 
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(runtime.io);
+        defer self.lock.unlock(runtime.io);
 
         var i: usize = 0;
         while (i < self.entries.items.len) {
@@ -108,8 +109,8 @@ pub const TTLIndex = struct {
 
     /// Number of active TTL entries.
     pub fn count(self: *TTLIndex) usize {
-        self.lock.lockShared();
-        defer self.lock.unlockShared();
+        self.lock.lockSharedUncancelable(runtime.io);
+        defer self.lock.unlockShared(runtime.io);
         return self.entries.items.len;
     }
 };

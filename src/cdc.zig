@@ -1,5 +1,6 @@
 const std = @import("std");
 const crypto = @import("crypto.zig");
+const runtime = @import("runtime");
 
 pub const Op = enum(u8) {
     insert,
@@ -102,8 +103,8 @@ pub const CDCManager = struct {
     deliveries: std.ArrayList(Delivery),
     next_subscription_id: std.atomic.Value(u64),
     next_seq: std.atomic.Value(u64),
-    mu: std.Thread.Mutex,
-    cond: std.Thread.Condition,
+    mu: std.Io.Mutex,
+    cond: std.Io.Condition,
     running: std.atomic.Value(bool),
     worker: ?std.Thread,
 
@@ -138,7 +139,7 @@ pub const CDCManager = struct {
     pub fn stop(self: *CDCManager) void {
         if (!self.running.load(.acquire)) return;
         self.running.store(false, .release);
-        self.cond.broadcast();
+        self.cond.broadcast(runtime.io);
         if (self.worker) |t| t.join();
         self.worker = null;
     }
@@ -151,8 +152,8 @@ pub const CDCManager = struct {
         fillU16(&sub.webhook_url, &sub.webhook_url_len, webhook_url);
         fill(&sub.secret, &sub.secret_len, secret);
 
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
         try self.subscriptions.append(self.allocator, sub);
         return sub.id;
     }
@@ -167,15 +168,15 @@ pub const CDCManager = struct {
         fill(&ev.key, &ev.key_len, key);
         fillU16(&ev.value, &ev.value_len, value);
 
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
         self.pending.append(self.allocator, ev) catch return;
-        self.cond.signal();
+        self.cond.signal(runtime.io);
     }
 
     pub fn listDeliveries(self: *CDCManager, alloc: std.mem.Allocator, tenant_filter: ?[]const u8) ![]Delivery {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
         var out: std.ArrayList(Delivery) = .empty;
         errdefer out.deinit(alloc);
         for (self.deliveries.items) |entry| {
@@ -189,27 +190,27 @@ pub const CDCManager = struct {
 
     fn workerMain(self: *CDCManager) void {
         while (true) {
-            self.mu.lock();
+            self.mu.lockUncancelable(runtime.io);
             while (self.pending.items.len == 0 and self.running.load(.acquire)) {
-                self.cond.wait(&self.mu);
+                self.cond.waitUncancelable(runtime.io, &self.mu);
             }
             if (self.pending.items.len == 0 and !self.running.load(.acquire)) {
-                self.mu.unlock();
+                self.mu.unlock(runtime.io);
                 return;
             }
             const ev = self.pending.orderedRemove(0);
             const subs = self.subscriptions.items;
-            self.mu.unlock();
+            self.mu.unlock(runtime.io);
 
             for (subs) |sub| {
                 if (!matches(sub, ev)) continue;
                 const delivery = makeDelivery(sub, ev);
-                self.mu.lock();
+                self.mu.lockUncancelable(runtime.io);
                 self.deliveries.append(self.allocator, delivery) catch {};
                 if (self.deliveries.items.len > 4096) {
                     _ = self.deliveries.orderedRemove(0);
                 }
-                self.mu.unlock();
+                self.mu.unlock(runtime.io);
             }
         }
     }

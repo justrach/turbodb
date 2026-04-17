@@ -1,5 +1,6 @@
 const std = @import("std");
 const btree = @import("btree.zig");
+const runtime = @import("runtime");
 pub const BTreeEntry = btree.BTreeEntry;
 
 // ─── Adaptive Radix Tree (Leis et al., ICDE 2013) ────────────────────────────
@@ -1113,7 +1114,7 @@ test "ART: concurrent insert and search" {
 
     // Serialize all writes with a mutex. ART's optimistic lock coupling
     // provides safe concurrent reads alongside a single writer.
-    var write_mu = std.Thread.Mutex{};
+    var write_mu = std.Io.Mutex{};
 
     // Pre-insert keys under mutex (single-threaded here, but same pattern)
     for (0..keys_per_thread) |i| {
@@ -1128,16 +1129,16 @@ test "ART: concurrent insert and search" {
     const Context = struct {
         tree: *ART,
         thread_id: usize,
-        mu: *std.Thread.Mutex,
+        mu: *std.Io.Mutex,
 
         fn insertWork(ctx: @This()) void {
             const base = (ctx.thread_id + 1) * 10000;
             for (0..keys_per_thread) |i| {
                 var key_buf: [32]u8 = undefined;
                 const key_slice = std.fmt.bufPrint(&key_buf, "thr_{d:0>4}", .{base + i}) catch continue;
-                ctx.mu.lock();
+                ctx.mu.lockUncancelable(runtime.io);
                 ctx.tree.insert(key_slice, makeEntry(base + i)) catch {};
-                ctx.mu.unlock();
+                ctx.mu.unlock(runtime.io);
             }
         }
 

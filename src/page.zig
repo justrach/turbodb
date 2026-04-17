@@ -1,6 +1,7 @@
 /// TurboDB — 4KB page allocator
 const std = @import("std");
 const mmap = @import("mmap");
+const runtime = @import("runtime");
 pub const PAGE_SIZE: usize = 65536; // 64KB — supports code files up to ~65KB per doc
 pub const PAGE_HEADER_SIZE: usize = 32;
 pub const PAGE_USABLE: usize = PAGE_SIZE - PAGE_HEADER_SIZE;
@@ -34,7 +35,7 @@ pub const PageFile = struct {
     mm: mmap.MmapFile,
     free_head: std.atomic.Value(u32),  // head of free-list (0 = empty)
     next_alloc: std.atomic.Value(u32), // next never-allocated page
-    mu: std.Thread.Mutex,
+    mu: std.Io.Mutex,
 
     pub fn open(path: []const u8) !PageFile {
         var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;
@@ -59,8 +60,8 @@ pub const PageFile = struct {
 
     /// Allocate a fresh page. Returns the page number.
     pub fn allocPage(self: *PageFile, ptype: PageType) !u32 {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
 
         // Try to reclaim from free list first.
         const fhead = self.free_head.load(.acquire);
@@ -88,8 +89,8 @@ pub const PageFile = struct {
     /// Return a page to the free list.
     pub fn freePage(self: *PageFile, pno: u32) void {
         if (pno == 0) return;
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
         const ph = self.pageHeader(pno);
         ph.* = std.mem.zeroes(PageHeader);
         ph.page_type = @intFromEnum(PageType.free);

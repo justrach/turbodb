@@ -1,6 +1,7 @@
 const std = @import("std");
 const btree = @import("btree.zig");
 const compat = @import("compat");
+const runtime = @import("runtime");
 const BTreeEntry = btree.BTreeEntry;
 
 // ─── BloomFilter ─────────────────────────────────────────────────────────────
@@ -443,7 +444,7 @@ pub const LSMTree = struct {
     data_dir: [256]u8,
     data_dir_len: usize,
     alloc: std.mem.Allocator,
-    flush_mu: std.Thread.Mutex,
+    flush_mu: std.Io.Mutex,
 
     pub const MAX_LEVELS = 7;
     pub const MEMTABLE_SIZE = 4 * 1024 * 1024; // 4MB
@@ -548,8 +549,8 @@ pub const LSMTree = struct {
 
     /// Flush the active memtable to an L0 SSTable.
     pub fn flush(self: *LSMTree) !void {
-        self.flush_mu.lock();
-        defer self.flush_mu.unlock();
+        self.flush_mu.lockUncancelable(runtime.io);
+        defer self.flush_mu.unlock(runtime.io);
 
         if (self.active_mem.entries.items.len == 0) return;
 
