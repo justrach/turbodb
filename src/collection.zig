@@ -1761,7 +1761,7 @@ fn appendSanitizedComponent(writer: anytype, input: []const u8) !void {
     }
 }
 
-fn ensureDataDir(alloc: std.mem.Allocator, data_dir: []const u8) ![]u8 {
+fn ensureDataDir(alloc: std.mem.Allocator, data_dir: []const u8) ![:0]u8 {
     try ensureDirPath(data_dir);
     return try compat.fs.cwdRealpathAlloc(alloc, data_dir);
 }

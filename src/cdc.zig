@@ -139,8 +139,8 @@ pub const Delivery = struct {
 pub const CDCManager = struct {
     allocator: std.mem.Allocator,
     subscriptions: std.ArrayList(Subscription),
-    pending: Ring(Event, 16384),
-    deliveries: Ring(Delivery, 4096),
+    pending: Ring(Event, 1024),
+    deliveries: Ring(Delivery, 512),
     next_subscription_id: std.atomic.Value(u64),
     next_seq: std.atomic.Value(u64),
     mu: std.Io.Mutex,
