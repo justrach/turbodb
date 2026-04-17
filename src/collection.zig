@@ -235,10 +235,9 @@ pub const Collection = struct {
     // Two writers to different keys proceed in parallel; same-key writes serialize.
     stripe_locks: [STRIPE_COUNT]std.Io.Mutex,
     hash_idx: std.AutoHashMap(u64, BTreeEntry),
+    /// Per-key monotonic doc_id — serves both as the live key→doc_id index and
+    /// as the modification epoch for branch conflict detection.
     key_doc_ids: std.AutoHashMap(u64, u64),
-    /// Per-key modification epoch — tracks when each key was last written on main.
-    /// Used by mergeBranch to detect conflicts (key modified after branch was created).
-    key_epochs: std.AutoHashMap(u64, u64),
     alloc: std.mem.Allocator,
     cache: hot_cache.HotCache,
     // MVCC version chain — append-only, no vacuum.
@@ -300,7 +299,6 @@ pub const Collection = struct {
         }
         col.hash_idx = std.AutoHashMap(u64, BTreeEntry).init(alloc);
         col.key_doc_ids = std.AutoHashMap(u64, u64).init(alloc);
-        col.key_epochs = std.AutoHashMap(u64, u64).init(alloc);
         col.alloc = alloc;
         col.cache = hot_cache.HotCache.init();
         col.versions = mvcc_mod.VersionChain.init(alloc);
@@ -350,7 +348,6 @@ pub const Collection = struct {
         self.words.deinit();
         self.hash_idx.deinit();
         self.key_doc_ids.deinit();
-        self.key_epochs.deinit();
         self.versions.deinit(self.alloc);
         if (self.vectors) |vc| {
             vc.deinit(self.alloc);
@@ -465,8 +462,9 @@ pub const Collection = struct {
         // MVCC: register version in the version chain.
         const epoch = self.epochs.advance();
         self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
+        // key_doc_ids doubles as the per-key modification epoch for branch
+        // conflict detection (doc_id is monotonic across the collection).
         self.key_doc_ids.put(hdr.key_hash, doc_id) catch {};
-        self.key_epochs.put(hdr.key_hash, doc_id) catch {}; // epoch = doc_id (monotonic)
 
         // Async trigram + word indexing — push to background queue, sync fallback if full or no worker.
         if (value.len >= 3) {
@@ -1233,8 +1231,7 @@ pub const Collection = struct {
 
             const key_hash = doc_mod.fnv1a(w.key);
 
-            // CONFLICT DETECTION: check if main modified this key after branch was created
-            if (self.key_epochs.get(key_hash)) |main_epoch| {
+            if (self.key_doc_ids.get(key_hash)) |main_epoch| {
                 if (main_epoch > br.base_epoch) {
                     // Main was modified after branch fork — this is a real conflict
                     const main_doc = self.get(w.key);
