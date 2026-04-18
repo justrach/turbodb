@@ -262,9 +262,7 @@ pub const DiskIndex = struct {
         const idx_path = try std.fmt.bufPrint(&buf, "{s}/index.tdb", .{dir_path});
         const idx_file = try compat.fs.cwdOpenFile(idx_path, .{});
         defer idx_file.close(runtime.io);
-        var idx_stat_buf: std.c.Stat = undefined;
-        if (std.c.fstat(idx_file.handle, &idx_stat_buf) != 0) return error.FstatFailed;
-        const idx_stat_size: usize = @intCast(idx_stat_buf.size);
+        const idx_stat_size: usize = @intCast(try compat.fs.fileSize(idx_file.handle));
         const idx_mmap = try std.posix.mmap(null, idx_stat_size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, idx_file.handle, 0);
 
         const n_entries = std.mem.bytesToValue(u32, idx_mmap[0..4]);
@@ -280,9 +278,7 @@ pub const DiskIndex = struct {
         const files_path = try std.fmt.bufPrint(&buf, "{s}/files.tdb", .{dir_path});
         const files_file = try compat.fs.cwdOpenFile(files_path, .{});
         defer files_file.close(runtime.io);
-        var files_stat_buf: std.c.Stat = undefined;
-        if (std.c.fstat(files_file.handle, &files_stat_buf) != 0) return error.FstatFailed;
-        const files_stat_size: usize = @intCast(files_stat_buf.size);
+        const files_stat_size: usize = @intCast(try compat.fs.fileSize(files_file.handle));
         const files_mmap = try std.posix.mmap(null, files_stat_size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, files_file.handle, 0);
         const n_files = std.mem.bytesToValue(u32, files_mmap[0..4]);
 
@@ -290,9 +286,7 @@ pub const DiskIndex = struct {
         const freq_path = try std.fmt.bufPrint(&buf, "{s}/freq.tdb", .{dir_path});
         const freq_file = try compat.fs.cwdOpenFile(freq_path, .{});
         defer freq_file.close(runtime.io);
-        var freq_stat_buf: std.c.Stat = undefined;
-        if (std.c.fstat(freq_file.handle, &freq_stat_buf) != 0) return error.FstatFailed;
-        const freq_stat_size: usize = @intCast(freq_stat_buf.size);
+        const freq_stat_size: usize = @intCast(try compat.fs.fileSize(freq_file.handle));
         const freq_mmap = try std.posix.mmap(null, freq_stat_size, .{ .READ = true }, .{ .TYPE = .PRIVATE }, freq_file.handle, 0);
 
         return .{
