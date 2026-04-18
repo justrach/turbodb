@@ -1,5 +1,7 @@
 const std = @import("std");
 const sequencer = @import("sequencer.zig");
+const runtime = @import("runtime");
+const compat = @import("compat");
 
 pub const NodeId = u16;
 
@@ -48,7 +50,7 @@ pub const CalvinExecutor = struct {
 
     // Execution state
     last_executed_epoch: u64,
-    execute_mu: std.Thread.Mutex,
+    execute_mu: std.Io.Mutex,
 
     pub fn init(alloc: std.mem.Allocator, node_id: NodeId) CalvinExecutor {
         return .{
@@ -57,7 +59,7 @@ pub const CalvinExecutor = struct {
             .local_partitions = .empty,
             .alloc = alloc,
             .last_executed_epoch = 0,
-            .execute_mu = .{},
+            .execute_mu = .init,
         };
     }
 
@@ -86,8 +88,8 @@ pub const CalvinExecutor = struct {
         batch: *const sequencer.Batch,
         executor_fn: *const fn (txn: *const sequencer.Transaction) anyerror!void,
     ) !void {
-        self.execute_mu.lock();
-        defer self.execute_mu.unlock();
+        self.execute_mu.lockUncancelable(runtime.io);
+        defer self.execute_mu.unlock(runtime.io);
 
         // Deterministic execution: iterate in batch order.
         for (batch.transactions) |*txn| {
@@ -112,8 +114,7 @@ pub const CalvinExecutor = struct {
     /// Each txn: [txn_id:u64][type:u8][partition:u16][key_hash:u64]
     ///           [data_len:u32][data...][rs_len:u32][rs...][ws_len:u32][ws...]
     pub fn serializeBatch(batch: *const sequencer.Batch, buf: []u8) !usize {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w = std.Io.Writer.fixed(buf);
 
         try w.writeInt(u64, batch.epoch, .little);
         try w.writeInt(u64, batch.sequence_start, .little);
@@ -138,53 +139,51 @@ pub const CalvinExecutor = struct {
             for (txn.write_set) |h| try w.writeInt(u64, h, .little);
         }
 
-        return fbs.pos;
+        return w.buffered().len;
     }
 
     /// Deserialize a batch from network bytes.
     pub fn deserializeBatch(data: []const u8, alloc: std.mem.Allocator) !sequencer.Batch {
-        var fbs = std.io.fixedBufferStream(data);
-        const r = fbs.reader();
+        var r = std.Io.Reader.fixed(data);
 
-        const epoch = try r.readInt(u64, .little);
-        const seq_start = try r.readInt(u64, .little);
-        const count = try r.readInt(u32, .little);
+        const epoch = try r.takeInt(u64, .little);
+        const seq_start = try r.takeInt(u64, .little);
+        const count = try r.takeInt(u32, .little);
 
         const txns = try alloc.alloc(sequencer.Transaction, count);
         errdefer alloc.free(txns);
 
         for (txns) |*txn| {
-            txn.txn_id = try r.readInt(u64, .little);
-            txn.txn_type = @enumFromInt(try r.readByte());
-            txn.partition_id = try r.readInt(u16, .little);
-            txn.key_hash = try r.readInt(u64, .little);
+            txn.txn_id = try r.takeInt(u64, .little);
+            txn.txn_type = @enumFromInt(try r.takeByte());
+            txn.partition_id = try r.takeInt(u16, .little);
+            txn.key_hash = try r.takeInt(u64, .little);
 
             // data
-            const data_len = try r.readInt(u32, .little);
+            const data_len = try r.takeInt(u32, .little);
             if (data_len > 0) {
                 const d = try alloc.alloc(u8, data_len);
-                const bytes_read = try r.readAll(d);
-                if (bytes_read != data_len) return error.UnexpectedEof;
+                try r.readSliceAll(d);
                 txn.data = d;
             } else {
                 txn.data = &.{};
             }
 
             // read_set
-            const rs_len = try r.readInt(u32, .little);
+            const rs_len = try r.takeInt(u32, .little);
             if (rs_len > 0) {
                 const rs = try alloc.alloc(u64, rs_len);
-                for (rs) |*h| h.* = try r.readInt(u64, .little);
+                for (rs) |*h| h.* = try r.takeInt(u64, .little);
                 txn.read_set = rs;
             } else {
                 txn.read_set = &.{};
             }
 
             // write_set
-            const ws_len = try r.readInt(u32, .little);
+            const ws_len = try r.takeInt(u32, .little);
             if (ws_len > 0) {
                 const ws = try alloc.alloc(u64, ws_len);
-                for (ws) |*h| h.* = try r.readInt(u64, .little);
+                for (ws) |*h| h.* = try r.takeInt(u64, .little);
                 txn.write_set = ws;
             } else {
                 txn.write_set = &.{};

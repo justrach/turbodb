@@ -1,11 +1,52 @@
 const std = @import("std");
 const crypto = @import("crypto.zig");
+const runtime = @import("runtime");
 
 pub const Op = enum(u8) {
     insert,
     update,
     delete,
 };
+
+/// Fixed-capacity ring buffer with O(1) push/pop-front. Bounded.
+/// On push when full, oldest entry is overwritten (lossy).
+fn Ring(comptime T: type, comptime CAP: usize) type {
+    return struct {
+        const Self = @This();
+        buf: [CAP]T = undefined,
+        head: usize = 0,  // next write slot
+        len: usize = 0,   // items stored (<= CAP)
+
+        pub fn push(self: *Self, item: T) void {
+            self.buf[self.head] = item;
+            self.head = (self.head + 1) % CAP;
+            if (self.len < CAP) self.len += 1;
+        }
+
+        /// Pop and return the oldest item, or null if empty.
+        pub fn popFront(self: *Self) ?T {
+            if (self.len == 0) return null;
+            const tail = (self.head + CAP - self.len) % CAP;
+            const item = self.buf[tail];
+            self.len -= 1;
+            return item;
+        }
+
+        pub fn items(self: *const Self) usize {
+            return self.len;
+        }
+
+        /// Iterate in logical order (oldest → newest) via callback.
+        pub fn forEach(self: *const Self, ctx: anytype, comptime f: fn (@TypeOf(ctx), T) void) void {
+            if (self.len == 0) return;
+            const tail = (self.head + CAP - self.len) % CAP;
+            var i: usize = 0;
+            while (i < self.len) : (i += 1) {
+                f(ctx, self.buf[(tail + i) % CAP]);
+            }
+        }
+    };
+}
 
 pub const Event = struct {
     seq: u64,
@@ -99,11 +140,11 @@ pub const CDCManager = struct {
     allocator: std.mem.Allocator,
     subscriptions: std.ArrayList(Subscription),
     pending: std.ArrayList(Event),
-    deliveries: std.ArrayList(Delivery),
+    deliveries: Ring(Delivery, 512),
     next_subscription_id: std.atomic.Value(u64),
     next_seq: std.atomic.Value(u64),
-    mu: std.Thread.Mutex,
-    cond: std.Thread.Condition,
+    mu: std.Io.Mutex,
+    cond: std.Io.Condition,
     running: std.atomic.Value(bool),
     worker: ?std.Thread,
 
@@ -112,11 +153,11 @@ pub const CDCManager = struct {
             .allocator = allocator,
             .subscriptions = .empty,
             .pending = .empty,
-            .deliveries = .empty,
+            .deliveries = .{},
             .next_subscription_id = std.atomic.Value(u64).init(1),
             .next_seq = std.atomic.Value(u64).init(1),
-            .mu = .{},
-            .cond = .{},
+            .mu = .init,
+            .cond = .init,
             .running = std.atomic.Value(bool).init(false),
             .worker = null,
         };
@@ -126,7 +167,6 @@ pub const CDCManager = struct {
         self.stop();
         self.subscriptions.deinit(self.allocator);
         self.pending.deinit(self.allocator);
-        self.deliveries.deinit(self.allocator);
     }
 
     pub fn start(self: *CDCManager) !void {
@@ -138,7 +178,7 @@ pub const CDCManager = struct {
     pub fn stop(self: *CDCManager) void {
         if (!self.running.load(.acquire)) return;
         self.running.store(false, .release);
-        self.cond.broadcast();
+        self.cond.broadcast(runtime.io);
         if (self.worker) |t| t.join();
         self.worker = null;
     }
@@ -151,8 +191,8 @@ pub const CDCManager = struct {
         fillU16(&sub.webhook_url, &sub.webhook_url_len, webhook_url);
         fill(&sub.secret, &sub.secret_len, secret);
 
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
         try self.subscriptions.append(self.allocator, sub);
         return sub.id;
     }
@@ -166,19 +206,23 @@ pub const CDCManager = struct {
         fill(&ev.collection, &ev.collection_len, collection);
         fill(&ev.key, &ev.key_len, key);
         fillU16(&ev.value, &ev.value_len, value);
-
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
         self.pending.append(self.allocator, ev) catch return;
-        self.cond.signal();
+        self.cond.signal(runtime.io);
     }
 
     pub fn listDeliveries(self: *CDCManager, alloc: std.mem.Allocator, tenant_filter: ?[]const u8) ![]Delivery {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
         var out: std.ArrayList(Delivery) = .empty;
         errdefer out.deinit(alloc);
-        for (self.deliveries.items) |entry| {
+        const r = &self.deliveries;
+        if (r.len == 0) return out.toOwnedSlice(alloc);
+        const tail = (r.head + r.buf.len - r.len) % r.buf.len;
+        var i: usize = 0;
+        while (i < r.len) : (i += 1) {
+            const entry = r.buf[(tail + i) % r.buf.len];
             if (tenant_filter) |tenant| {
                 if (!std.mem.eql(u8, entry.tenant(), tenant)) continue;
             }
@@ -189,27 +233,24 @@ pub const CDCManager = struct {
 
     fn workerMain(self: *CDCManager) void {
         while (true) {
-            self.mu.lock();
+            self.mu.lockUncancelable(runtime.io);
             while (self.pending.items.len == 0 and self.running.load(.acquire)) {
-                self.cond.wait(&self.mu);
+                self.cond.waitUncancelable(runtime.io, &self.mu);
             }
             if (self.pending.items.len == 0 and !self.running.load(.acquire)) {
-                self.mu.unlock();
+                self.mu.unlock(runtime.io);
                 return;
             }
             const ev = self.pending.orderedRemove(0);
             const subs = self.subscriptions.items;
-            self.mu.unlock();
+            self.mu.unlock(runtime.io);
 
             for (subs) |sub| {
                 if (!matches(sub, ev)) continue;
                 const delivery = makeDelivery(sub, ev);
-                self.mu.lock();
-                self.deliveries.append(self.allocator, delivery) catch {};
-                if (self.deliveries.items.len > 4096) {
-                    _ = self.deliveries.orderedRemove(0);
-                }
-                self.mu.unlock();
+                self.mu.lockUncancelable(runtime.io);
+                self.deliveries.push(delivery);
+                self.mu.unlock(runtime.io);
             }
         }
     }

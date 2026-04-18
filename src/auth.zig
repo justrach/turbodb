@@ -9,6 +9,7 @@
 /// No auth configured → open access (dev mode).
 const std = @import("std");
 const crypto = @import("crypto.zig");
+const runtime = @import("runtime");
 const Allocator = std.mem.Allocator;
 
 pub const MAX_KEYS = 64;
@@ -45,7 +46,7 @@ pub const AuthStore = struct {
     keys: [MAX_KEYS]KeyEntry = undefined,
     count: u32 = 0,
     enabled: bool = false,
-    lock: std.Thread.RwLock = .{},
+    lock: std.Io.RwLock = .init,
 
     /// Add an API key. Returns the BLAKE3 hash for storage.
     pub fn addKey(self: *AuthStore, raw_key: []const u8, name: []const u8, perm: Permission) [32]u8 {
@@ -53,8 +54,8 @@ pub const AuthStore = struct {
     }
 
     pub fn addKeyForTenant(self: *AuthStore, raw_key: []const u8, name: []const u8, tenant_id: []const u8, perm: Permission) [32]u8 {
-        self.lock.lock();
-        defer self.lock.unlock();
+        self.lock.lockUncancelable(runtime.io);
+        defer self.lock.unlock(runtime.io);
 
         const hash = crypto.blake3(raw_key);
         if (self.count < MAX_KEYS) {
@@ -91,8 +92,8 @@ pub const AuthStore = struct {
         }
         const hash = crypto.blake3(raw_key);
 
-        self.lock.lockShared();
-        defer self.lock.unlockShared();
+        self.lock.lockSharedUncancelable(runtime.io);
+        defer self.lock.unlockShared(runtime.io);
 
         for (self.keys[0..self.count]) |*entry| {
             if (std.mem.eql(u8, &entry.hash, &hash)) {

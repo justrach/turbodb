@@ -9,6 +9,8 @@
 const std = @import("std");
 const collection_mod = @import("collection.zig");
 const codeindex = @import("codeindex.zig");
+const runtime = @import("runtime");
+const compat = @import("compat");
 const Database = collection_mod.Database;
 const Collection = collection_mod.Collection;
 
@@ -27,13 +29,12 @@ fn hasValidExt(name_: []const u8) bool {
     return false;
 }
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
+    runtime.setIo(init.io);
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const args = try compat.argsAlloc(alloc, init.minimal.args);
+    defer compat.argsFree(alloc, args);
 
     if (args.len < 2) {
         std.debug.print("Usage: scale-bench <codebase-dir>\n", .{});
@@ -57,19 +58,19 @@ pub fn main() !void {
         files.deinit(alloc);
     }
 
-    var dir = try std.fs.cwd().openDir(src_dir, .{ .iterate = true });
-    defer dir.close();
+    var dir = try compat.fs.cwdOpenDir(src_dir, .{ .iterate = true });
+    defer compat.fs.dirClose(dir);
     var walker = try dir.walk(alloc);
     defer walker.deinit();
 
-    while (try walker.next()) |entry| {
+    while (try walker.next(runtime.io)) |entry| {
         if (entry.kind != .file) continue;
         if (!hasValidExt(entry.basename)) continue;
 
-        var file = dir.openFile(entry.path, .{}) catch continue;
-        defer file.close();
+        const file = compat.fs.dirOpenFile(dir, entry.path, .{}) catch continue;
+        defer compat.fs.fileClose(file);
         var buf: [8192]u8 = undefined;
-        const n = file.read(&buf) catch continue;
+        const n = compat.fs.fileReadAll(file, &buf) catch continue;
         if (n < 3) continue;
 
         try files.append(alloc, .{
@@ -86,11 +87,11 @@ pub fn main() !void {
     std.debug.print("Phase 1: Indexing {d} files...\n", .{base_files * COPIES});
 
     const data_dir = "/tmp/turbodb_scale_bench";
-    std.fs.cwd().makeDir(data_dir) catch |e| switch (e) {
+    compat.fs.cwdMakeDir(data_dir) catch |e| switch (e) {
         error.PathAlreadyExists => {
             // Clean it
-            std.fs.cwd().deleteTree(data_dir) catch {};
-            std.fs.cwd().makeDir(data_dir) catch {};
+            compat.fs.cwdDeleteTree(data_dir) catch {};
+            compat.fs.cwdMakeDir(data_dir) catch {};
         },
         else => return e,
     };
@@ -101,7 +102,7 @@ pub fn main() !void {
 
     var indexed: u64 = 0;
     var total_bytes: u64 = 0;
-    const t_index_start = std.time.nanoTimestamp();
+    const t_index_start = compat.nanoTimestamp();
 
     var copy: u32 = 0;
     while (copy < COPIES) : (copy += 1) {
@@ -115,7 +116,7 @@ pub fn main() !void {
             indexed += 1;
             total_bytes += f.content.len;
         }
-        const elapsed_ns = std.time.nanoTimestamp() - t_index_start;
+        const elapsed_ns = compat.nanoTimestamp() - t_index_start;
         const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
         const rate = @as(f64, @floatFromInt(indexed)) / elapsed_s;
         std.debug.print("\r  Copy {d}/{d}: {d} files indexed ({d:.0} files/s)  ", .{
@@ -123,7 +124,7 @@ pub fn main() !void {
         });
     }
 
-    const t_index_end = std.time.nanoTimestamp();
+    const t_index_end = compat.nanoTimestamp();
     const index_s = @as(f64, @floatFromInt(t_index_end - t_index_start)) / 1e9;
     const index_rate = @as(f64, @floatFromInt(indexed)) / index_s;
     const total_mb = @as(f64, @floatFromInt(total_bytes)) / (1024.0 * 1024.0);
@@ -171,9 +172,9 @@ pub fn main() !void {
         var run: u32 = 0;
         while (run < 3) : (run += 1) {
             if (last_result) |r| r.deinit();
-            const t0 = std.time.nanoTimestamp();
+            const t0 = compat.nanoTimestamp();
             last_result = try col.searchText(q, 50, alloc);
-            const elapsed_ns = std.time.nanoTimestamp() - t0;
+            const elapsed_ns = compat.nanoTimestamp() - t0;
             times[run] = @as(f64, @floatFromInt(elapsed_ns)) / 1e3;
         }
 
@@ -230,9 +231,9 @@ pub fn main() !void {
         "Promise", "setTimeout", "addEventListener",
     };
 
-    const t_burst_start = std.time.nanoTimestamp();
+    const t_burst_start = compat.nanoTimestamp();
     var burst_count: u32 = 0;
-    var rng = std.Random.DefaultPrng.init(@intCast(std.time.nanoTimestamp()));
+    var rng = std.Random.DefaultPrng.init(@intCast(compat.nanoTimestamp()));
     const random = rng.random();
 
     while (burst_count < 1000) : (burst_count += 1) {
@@ -241,7 +242,7 @@ pub fn main() !void {
         result.deinit();
     }
 
-    const t_burst_end = std.time.nanoTimestamp();
+    const t_burst_end = compat.nanoTimestamp();
     const burst_s = @as(f64, @floatFromInt(t_burst_end - t_burst_start)) / 1e9;
     const burst_qps = 1000.0 / burst_s;
 

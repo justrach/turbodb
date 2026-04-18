@@ -94,22 +94,20 @@ pub const ErrorCode = enum(u16) {
 
 /// Format a JSON error response into a buffer.
 pub fn jsonError(buf: []u8, code: ErrorCode) []const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(buf);
     w.print("{{\"error\":{{\"code\":{d},\"message\":\"{s}\"}}}}", .{
         @intFromEnum(code), code.message(),
     }) catch return "{}";
-    return buf[0..fbs.pos];
+    return w.buffered();
 }
 
 /// Format a JSON error with custom detail message.
 pub fn jsonErrorDetail(buf: []u8, code: ErrorCode, detail: []const u8) []const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(buf);
     w.print("{{\"error\":{{\"code\":{d},\"message\":\"{s}\",\"detail\":\"{s}\"}}}}", .{
         @intFromEnum(code), code.message(), detail,
     }) catch return "{}";
-    return buf[0..fbs.pos];
+    return w.buffered();
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

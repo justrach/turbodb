@@ -5,6 +5,8 @@ const doc_mod = @import("doc.zig");
 const wal_mod = @import("wal");
 const epoch_mod = @import("epoch");
 const cdc_mod = @import("cdc.zig");
+const runtime = @import("runtime");
+const compat = @import("compat");
 
 const Collection = collection_mod.Collection;
 const Database = collection_mod.Database;
@@ -74,7 +76,7 @@ fn record(name_src: []const u8, json_src: []const u8, ops: usize, elapsed_ns: i1
 // ─── Timing helper ──────────────────────────────────────────────────────────
 
 inline fn now() i128 {
-    return std.time.nanoTimestamp();
+    return compat.nanoTimestamp();
 }
 
 // ─── Partition benchmark for a given partition count ─────────────────────────
@@ -84,10 +86,10 @@ fn benchPartitionCount(n_partitions: u16) !void {
     const data_dir = std.fmt.bufPrint(&dir_buf, "/tmp/turbodb_partition_bench_{d}", .{n_partitions}) catch return;
 
     // Cleanup any previous run
-    std.fs.cwd().deleteTree(data_dir) catch {};
+    compat.fs.cwdDeleteTree(data_dir) catch {};
 
     // Create data dir
-    std.fs.cwd().makeDir(data_dir) catch |e| switch (e) {
+    compat.fs.cwdMakeDir(data_dir) catch |e| switch (e) {
         error.PathAlreadyExists => {},
         else => return e,
     };
@@ -181,14 +183,14 @@ fn benchPartitionCount(n_partitions: u16) !void {
     pc.close();
     wal_log.close();
     epochs.deinit();
-    std.fs.cwd().deleteTree(data_dir) catch {};
+    compat.fs.cwdDeleteTree(data_dir) catch {};
 }
 
 // ─── JSON emitter ───────────────────────────────────────────────────────────
 
 fn emitJSON() void {
     // Timestamp
-    const ts = std.time.timestamp();
+    const ts = compat.timestampSec();
     const epoch_secs: u64 = @intCast(ts);
     const secs_in_day: u64 = 86400;
     const days = epoch_secs / secs_in_day;
@@ -224,8 +226,8 @@ fn emitJSON() void {
 
     // Also write to a JSON file for CI consumption
     const json_path = "/tmp/turbodb_shard_bench.json";
-    const file = std.fs.cwd().createFile(json_path, .{}) catch return;
-    defer file.close();
+    const file = compat.fs.cwdCreateFile(json_path, .{}) catch return;
+    defer compat.fs.fileClose(file);
 
     var buf: [16384]u8 = undefined;
     var pos: usize = 0;
@@ -248,13 +250,16 @@ fn emitJSON() void {
 
     pos += (std.fmt.bufPrint(buf[pos..], "  }}\n}}\n", .{}) catch return).len;
 
-    file.writeAll(buf[0..pos]) catch return;
+    file.writeStreamingAll(runtime.io, buf[0..pos]) catch return;
     std.debug.print("\nJSON results written to: {s}\n", .{json_path});
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
 
 pub fn main() !void {
+    runtime.init(std.heap.c_allocator);
+    defer runtime.deinit();
+
     std.debug.print("\n", .{});
     std.debug.print("TurboDB Partition Scaling Benchmark\n", .{});
     std.debug.print("{s}", .{"\xe2\x95\x90" ** 24 ++ "\n"});
@@ -282,6 +287,6 @@ pub fn main() !void {
     for (partition_counts) |n| {
         var dir_buf: [128]u8 = undefined;
         const data_dir = std.fmt.bufPrint(&dir_buf, "/tmp/turbodb_partition_bench_{d}", .{n}) catch continue;
-        std.fs.cwd().deleteTree(data_dir) catch {};
+        compat.fs.cwdDeleteTree(data_dir) catch {};
     }
 }

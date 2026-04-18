@@ -44,8 +44,7 @@ pub const Manifest = struct {
     /// Serialize manifest to JSON for TurboDB storage.
     /// Returns a slice into buf.
     pub fn toJson(self: Manifest, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w = std.Io.Writer.fixed(buf);
 
         try w.writeAll("{");
         try w.print("\"name\":\"{s}\"", .{self.name});
@@ -98,7 +97,7 @@ pub const Manifest = struct {
         }
 
         try w.writeAll("}");
-        return fbs.getWritten();
+        return w.buffered();
     }
 };
 

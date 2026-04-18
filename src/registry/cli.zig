@@ -20,18 +20,19 @@ const registry_mod = @import("registry.zig");
 const resolver_mod = @import("resolver.zig");
 const config_mod = @import("config.zig");
 const auth_mod = @import("auth.zig");
+const runtime = @import("runtime");
+const compat = @import("compat");
 
 const DEFAULT_REGISTRY = "http://localhost:8080";
 const ZAG_DIR = ".zag";
 const GLOBAL_DIR = ".zag"; // ~/.zag/
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
+    runtime.setIo(init.io);
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const args = try compat.argsAlloc(alloc, init.minimal.args);
+    defer compat.argsFree(alloc, args);
 
     if (args.len < 2) {
         printUsage();
@@ -105,19 +106,18 @@ fn cmdInit(alloc: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     // Check if zag.json already exists
-    std.fs.cwd().access("zag.json", .{}) catch |e| {
+    compat.fs.cwdAccess("zag.json", .{}) catch |e| {
         if (e == error.FileNotFound) {
             var buf: [2048]u8 = undefined;
-            var fbs = std.io.fixedBufferStream(&buf);
-            const w = fbs.writer();
+            var w = std.Io.Writer.fixed(&buf);
 
             try w.writeAll("{\n");
-            try std.fmt.format(w, "  \"name\": \"{s}\",\n", .{name});
+            try w.print("  \"name\": \"{s}\",\n", .{name});
             try w.writeAll("  \"version\": \"0.1.0\",\n");
             try w.writeAll("  \"description\": \"\",\n");
-            try std.fmt.format(w, "  \"visibility\": \"{s}\",\n", .{if (private) "private" else "public"});
+            try w.print("  \"visibility\": \"{s}\",\n", .{if (private) "private" else "public"});
             if (org) |o| {
-                try std.fmt.format(w, "  \"org\": \"{s}\",\n", .{o});
+                try w.print("  \"org\": \"{s}\",\n", .{o});
             }
             try w.writeAll("  \"license\": \"MIT\",\n");
             try w.writeAll("  \"zig_version\": \"0.15.0\",\n");
@@ -125,10 +125,10 @@ fn cmdInit(alloc: std.mem.Allocator, args: []const []const u8) !void {
             try w.writeAll("  \"dev_dependencies\": {}\n");
             try w.writeAll("}");
 
-            const content = fbs.getWritten();
-            const file = try std.fs.cwd().createFile("zag.json", .{});
-            defer file.close();
-            try file.writeAll(content);
+            const content = w.buffered();
+            const file = try compat.fs.cwdCreateFile("zag.json", .{});
+            defer file.close(runtime.io);
+            try file.writeStreamingAll(runtime.io, content);
 
             if (org) |o| {
                 std.debug.print("Created zag.json for @{s}/{s} ({s})\n", .{ o, name, if (private) "private" else "public" });
@@ -143,7 +143,8 @@ fn cmdInit(alloc: std.mem.Allocator, args: []const []const u8) !void {
 }
 
 fn cmdKeygen() !void {
-    const home = std.posix.getenv("HOME") orelse "/tmp";
+    const home_cstr = std.c.getenv("HOME");
+    const home: []const u8 = if (home_cstr) |p| std.mem.span(@as([*:0]const u8, @ptrCast(p))) else "/tmp";
     var path_buf: [512]u8 = undefined;
     const keys_dir = try std.fmt.bufPrint(&path_buf, "{s}/.zag/keys", .{home});
 
@@ -190,7 +191,7 @@ fn cmdSearch(alloc: std.mem.Allocator, args: []const []const u8) !void {
 
 fn cmdPublish(alloc: std.mem.Allocator) !void {
     // Read zag.json
-    const manifest_content = std.fs.cwd().readFileAlloc(alloc, "zag.json", 64 * 1024) catch {
+    const manifest_content = compat.fs.cwdReadFileAlloc(alloc, "zag.json", 64 * 1024) catch {
         std.debug.print("No zag.json found. Run 'zag init' first.\n", .{});
         return;
     };
@@ -217,7 +218,7 @@ fn cmdPublish(alloc: std.mem.Allocator) !void {
 
 fn cmdAudit(alloc: std.mem.Allocator) !void {
     // Read lockfile
-    const lockfile = std.fs.cwd().readFileAlloc(alloc, ".zag/lock.json", 1024 * 1024) catch {
+    const lockfile = compat.fs.cwdReadFileAlloc(alloc, ".zag/lock.json", 1024 * 1024) catch {
         std.debug.print("No .zag/lock.json found. Run 'zag install' first.\n", .{});
         return;
     };

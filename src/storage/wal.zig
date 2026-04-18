@@ -27,6 +27,8 @@
 //!   3. Replays only committed transactions via the caller-supplied apply_fn.
 //!   4. Truncates the tail of any partial (unfinished) entry at the end.
 const std = @import("std");
+const runtime = @import("runtime");
+const compat = @import("compat");
 
 // ── Entry header (32 bytes, cache-line harmless) ──────────────────────────────
 
@@ -102,15 +104,15 @@ fn entryChecksum(header_bytes: []const u8, payload: []const u8) u32 {
 // ── WAL ───────────────────────────────────────────────────────────────────────
 
 pub const WAL = struct {
-    file:         std.fs.File,
+    file:         std.Io.File,
     write_buf:    std.ArrayList(u8),   // pending (not yet flushed)
     next_lsn:     std.atomic.Value(u64),
     checkpoint_lsn: u64,
     allocator:    std.mem.Allocator,
 
     // Group commit state — guarded by mu
-    mu:           std.Thread.Mutex,
-    cond:         std.Thread.Condition,
+    mu:           std.Io.Mutex,
+    cond:         std.Io.Condition,
     synced_lsn:   u64,
     flushing:     bool,
 
@@ -121,24 +123,24 @@ pub const WAL = struct {
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     pub fn open(path: [:0]const u8, allocator: std.mem.Allocator) !WAL {
-        const f = try std.fs.createFileAbsolute(path, .{
+        const f = try std.Io.Dir.createFileAbsolute(runtime.io, path, .{
             .read = true, .truncate = false, .exclusive = false,
         });
-        var wal = WAL{
+        const wal = WAL{
             .file          = f,
             .write_buf     = .empty,
             .next_lsn      = std.atomic.Value(u64).init(1),
             .checkpoint_lsn = 0,
             .allocator     = allocator,
-            .mu            = .{},
-            .cond          = .{},
+            .mu = .init,
+            .cond = .init,
             .synced_lsn    = 0,
             .flushing      = false,
             .flush_thread  = null,
             .flush_running = std.atomic.Value(bool).init(false),
         };
         // Seek to end (append mode)
-        try wal.file.seekFromEnd(0);
+        _ = std.c.lseek(wal.file.handle, 0, std.posix.SEEK.END);
         return wal;
     }
 
@@ -151,7 +153,7 @@ pub const WAL = struct {
 
     fn flushLoop(self: *WAL) void {
         while (self.flush_running.load(.acquire)) {
-            std.Thread.sleep(1_000_000); // 1ms
+            compat.threadSleep(1_000_000); // 1ms
             self.flushPending();
         }
         // Final flush on shutdown
@@ -160,30 +162,30 @@ pub const WAL = struct {
 
     /// Flush any pending WAL entries to disk (non-blocking for callers).
     pub fn flushPending(self: *WAL) void {
-        self.mu.lock();
+        self.mu.lockUncancelable(runtime.io);
         if (self.write_buf.items.len == 0) {
-            self.mu.unlock();
+            self.mu.unlock(runtime.io);
             return;
         }
         if (self.flushing) {
-            self.mu.unlock();
+            self.mu.unlock(runtime.io);
             return;
         }
         self.flushing = true;
         var to_write = self.write_buf;
         const target = self.next_lsn.load(.monotonic) -| 1;
         self.write_buf = .empty;
-        self.mu.unlock();
+        self.mu.unlock(runtime.io);
 
-        self.file.writeAll(to_write.items) catch {};
+        self.file.writeStreamingAll(runtime.io, to_write.items) catch {};
         to_write.deinit(self.allocator);
-        self.file.sync() catch {};
+        self.file.sync(runtime.io) catch {};
 
-        self.mu.lock();
+        self.mu.lockUncancelable(runtime.io);
         self.synced_lsn = target;
         self.flushing = false;
-        self.cond.broadcast();
-        self.mu.unlock();
+        self.cond.broadcast(runtime.io);
+        self.mu.unlock(runtime.io);
     }
 
     pub fn close(self: *WAL) void {
@@ -194,7 +196,7 @@ pub const WAL = struct {
         // Flush any remaining entries
         self.flushPending();
         self.write_buf.deinit(self.allocator);
-        self.file.close();
+        self.file.close(runtime.io);
     }
 
     // ── Write ─────────────────────────────────────────────────────────────────
@@ -225,8 +227,8 @@ pub const WAL = struct {
         const hdr_bytes = std.mem.asBytes(&hdr);
         hdr.crc32 = entryChecksum(hdr_bytes, payload);
 
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
         try self.write_buf.appendSlice(self.allocator, std.mem.asBytes(&hdr));
         try self.write_buf.appendSlice(self.allocator, payload);
         if (pad > 0) try self.write_buf.appendNTimes(self.allocator, 0, pad);
@@ -239,21 +241,21 @@ pub const WAL = struct {
         // Write COMMIT entry to buffer
         var commit_payload: [16]u8 = undefined;
         std.mem.writeInt(u64, commit_payload[0..8], txn_id,          .little);
-        std.mem.writeInt(u64, commit_payload[8..16], @as(u64, @truncate(@as(u128, @bitCast(std.time.nanoTimestamp())))), .little);
+        std.mem.writeInt(u64, commit_payload[8..16], @as(u64, @truncate(@as(u128, @bitCast(compat.nanoTimestamp())))), .little);
         const lsn = try self.write(txn_id, .txn_commit, db_tag, FLAG_COMMIT, &commit_payload);
 
         // Group commit: become flusher or wait
-        self.mu.lock();
+        self.mu.lockUncancelable(runtime.io);
 
         if (self.synced_lsn >= lsn) {
-            self.mu.unlock();
+            self.mu.unlock(runtime.io);
             return;
         }
 
         if (self.flushing) {
             // Wait for current flusher
-            while (self.synced_lsn < lsn) self.cond.wait(&self.mu);
-            self.mu.unlock();
+            while (self.synced_lsn < lsn) self.cond.waitUncancelable(runtime.io, &self.mu);
+            self.mu.unlock(runtime.io);
             return;
         }
 
@@ -263,20 +265,20 @@ pub const WAL = struct {
         var to_write:   std.ArrayList(u8) = self.write_buf;
         const target = self.next_lsn.load(.monotonic) - 1;
         self.write_buf = .empty;
-        self.mu.unlock();
+        self.mu.unlock(runtime.io);
 
         // ── I/O outside lock ──────────────────────────────────────────────────
         var io_err: ?anyerror = null;
-        self.file.writeAll(to_write.items) catch |e| { io_err = e; };
+        self.file.writeStreamingAll(runtime.io, to_write.items) catch |e| { io_err = e; };
         to_write.deinit(self.allocator);
-        if (io_err == null) self.file.sync() catch |e| { io_err = e; };
+        if (io_err == null) self.file.sync(runtime.io) catch |e| { io_err = e; };
         // ─────────────────────────────────────────────────────────────────────
 
-        self.mu.lock();
+        self.mu.lockUncancelable(runtime.io);
         if (io_err == null) self.synced_lsn = target;
         self.flushing = false;
-        self.cond.broadcast();
-        self.mu.unlock();
+        self.cond.broadcast(runtime.io);
+        self.mu.unlock(runtime.io);
 
         if (io_err) |e| return e;
     }
@@ -290,19 +292,19 @@ pub const WAL = struct {
         const lsn = try self.write(0, .checkpoint, db_tag, FLAG_COMMIT, &p);
         self.checkpoint_lsn = lsn;
         // Force flush
-        self.mu.lock();
+        self.mu.lockUncancelable(runtime.io);
         self.flushing = true;
         var to_write = self.write_buf;
         self.write_buf = .empty;
-        self.mu.unlock();
-        self.file.writeAll(to_write.items) catch {};
+        self.mu.unlock(runtime.io);
+        self.file.writeStreamingAll(runtime.io, to_write.items) catch {};
         to_write.deinit(self.allocator);
-        try self.file.sync();
-        self.mu.lock();
+        try self.file.sync(runtime.io);
+        self.mu.lockUncancelable(runtime.io);
         self.synced_lsn = lsn;
         self.flushing = false;
-        self.cond.broadcast();
-        self.mu.unlock();
+        self.cond.broadcast(runtime.io);
+        self.mu.unlock(runtime.io);
     }
 
     // ── Recovery ──────────────────────────────────────────────────────────────
@@ -316,7 +318,7 @@ pub const WAL = struct {
         apply_fn:        *const fn (entry: Entry) anyerror!void,
         allocator:       std.mem.Allocator,
     ) !void {
-        try self.file.seekTo(0);
+        _ = std.c.lseek(self.file.handle, @intCast(0), std.posix.SEEK.SET);
 
         // ── Pass 1: collect all committed txn_ids ─────────────────────────────
         var committed = std.AutoHashMap(u64, void).init(allocator);
@@ -331,7 +333,7 @@ pub const WAL = struct {
         }
 
         // ── Pass 2: replay committed entries ─────────────────────────────────
-        try self.file.seekTo(0);
+        _ = std.c.lseek(self.file.handle, @intCast(0), std.posix.SEEK.SET);
         var max_lsn: u64 = 0;
         {
             var it = EntryIterator.init(self.file, allocator);
@@ -349,7 +351,7 @@ pub const WAL = struct {
         // ── Advance LSN counter and seek to EOF for new writes ────────────────
         self.next_lsn.store(max_lsn + 1, .release);
         self.synced_lsn = max_lsn;
-        try self.file.seekFromEnd(0);
+        _ = std.c.lseek(self.file.handle, 0, std.posix.SEEK.END);
         std.log.info("WAL recovery: replayed up to lsn={d}", .{max_lsn});
     }
 
@@ -363,13 +365,13 @@ pub const WAL = struct {
 // ── Entry iterator (for recovery) ────────────────────────────────────────────
 
 const EntryIterator = struct {
-    reader:  std.io.BufferedReader(4096, std.fs.File.Reader),
-    buf:     []u8,
+    fd:        std.posix.fd_t,
+    buf:       []u8,
     allocator: std.mem.Allocator,
 
-    fn init(file: std.fs.File, allocator: std.mem.Allocator) EntryIterator {
+    fn init(file: std.Io.File, allocator: std.mem.Allocator) EntryIterator {
         return .{
-            .reader    = std.io.bufferedReader(file.reader()),
+            .fd        = file.handle,
             .buf       = &.{},
             .allocator = allocator,
         };
@@ -379,10 +381,21 @@ const EntryIterator = struct {
         if (self.buf.len > 0) self.allocator.free(self.buf);
     }
 
+    /// Read up to `out.len` bytes into `out`. Returns actual bytes read (0 at EOF).
+    fn readAll(fd: std.posix.fd_t, out: []u8) usize {
+        var total: usize = 0;
+        while (total < out.len) {
+            const n = std.posix.read(fd, out[total..]) catch return total;
+            if (n == 0) break;
+            total += n;
+        }
+        return total;
+    }
+
     /// Returns null at EOF or on a corrupt entry.
     fn next(self: *EntryIterator) !?Entry {
         var hdr_buf: [HEADER_SIZE]u8 = undefined;
-        const n = self.reader.reader().readAll(&hdr_buf) catch return null;
+        const n = readAll(self.fd, &hdr_buf);
         if (n < HEADER_SIZE) return null;
 
         const hdr: *const EntryHeader = @ptrCast(&hdr_buf);
@@ -394,7 +407,7 @@ const EntryIterator = struct {
                 if (self.buf.len > 0) self.allocator.free(self.buf);
                 self.buf = try self.allocator.alloc(u8, hdr.length);
             }
-            const p = self.reader.reader().readAll(self.buf[0..hdr.length]) catch return null;
+            const p = readAll(self.fd, self.buf[0..hdr.length]);
             if (p < hdr.length) return null;
         }
 
@@ -408,7 +421,7 @@ const EntryIterator = struct {
         const pad = WAL.paddingTo8(HEADER_SIZE + hdr.length);
         if (pad > 0) {
             var skip: [7]u8 = undefined;
-            _ = self.reader.reader().readAll(skip[0..pad]) catch {};
+            _ = readAll(self.fd, skip[0..pad]);
         }
 
         return Entry{

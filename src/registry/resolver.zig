@@ -15,6 +15,7 @@ const std = @import("std");
 const semver = @import("semver.zig");
 const registry_mod = @import("registry.zig");
 const manifest_mod = @import("manifest.zig");
+const compat = @import("compat");
 
 pub const ResolvedDep = struct {
     name: []const u8,
@@ -135,7 +136,7 @@ pub const Resolver = struct {
 
     /// Generate a deterministic lockfile JSON.
     pub fn toLockfile(resolved: []const ResolvedDep, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
+        var fbs = std.Io.Writer.fixed(buf);
         const w = fbs.writer();
 
         try w.writeAll("{\"locked\":[");
@@ -195,8 +196,8 @@ fn jsonGetField(json: []const u8, key: []const u8) ?[]const u8 {
 test "resolve pinned deps" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/zagdb-resolver-test";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     var reg = try registry_mod.Registry.init(alloc, tmp_dir);
     defer reg.deinit();
@@ -218,8 +219,8 @@ test "resolve pinned deps" {
 test "conflicting versions error" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/zagdb-resolver-conflict";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     var reg = try registry_mod.Registry.init(alloc, tmp_dir);
     defer reg.deinit();
@@ -258,8 +259,8 @@ test "lockfile generation" {
 test "resolve from registry" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/zagdb-resolver-reg";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     var reg = try registry_mod.Registry.init(alloc, tmp_dir);
     defer reg.deinit();

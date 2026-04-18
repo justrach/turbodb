@@ -6,6 +6,7 @@
 const std = @import("std");
 const sign_mod = @import("sign.zig");
 const hash_mod = @import("hash.zig");
+const compat = @import("compat");
 
 pub const Provenance = struct {
     source_hash: []const u8, // blake3 hex of source tree
@@ -28,7 +29,7 @@ pub fn createAttestation(
     buf: *AttestationBuf,
 ) Provenance {
     const pubkey_hex = sign_mod.pubkeyHex(keypair.public_key);
-    const now = std.time.timestamp();
+    const now = compat.timestampSec();
 
     // Build message to sign
     const msg = std.fmt.bufPrint(&buf.msg_buf, "provenance:{s}:{s}:{s}", .{

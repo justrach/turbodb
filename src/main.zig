@@ -3,15 +3,16 @@ const std = @import("std");
 const collection = @import("collection.zig");
 const server = @import("server.zig");
 const wire = @import("wire.zig");
+const runtime = @import("runtime");
+const compat = @import("compat");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
+    runtime.setIo(init.io);
 
     // ── CLI args ──────────────────────────────────────────────────────────
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const args = try compat.argsAlloc(alloc, init.minimal.args);
+    defer compat.argsFree(alloc, args);
 
     var data_dir: []const u8 = "./turbodb_data";
     var port: u16 = 27017;
@@ -99,7 +100,7 @@ pub fn main() !void {
     }
 
     // ── ensure data directory ─────────────────────────────────────────────
-    std.fs.cwd().makeDir(data_dir) catch |e| switch (e) {
+    compat.fs.cwdMakeDir(data_dir) catch |e| switch (e) {
         error.PathAlreadyExists => {},
         else => return e,
     };
@@ -132,7 +133,7 @@ pub fn main() !void {
     const S = struct {
         var g_http: ?*server.Server = null;
         var g_wire: ?*wire.WireServer = null;
-        fn handler(_: c_int) callconv(.c) void {
+        fn handler(_: std.posix.SIG) callconv(.c) void {
             if (g_http) |s| s.stop();
             if (g_wire) |w| w.stop();
         }

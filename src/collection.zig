@@ -12,6 +12,8 @@ const cdc_mod = @import("cdc.zig");
 const vector = @import("vector.zig");
 const branch_mod = @import("branch.zig");
 const turboquant = @import("turboquant.zig");
+const compat = @import("compat");
+const runtime = @import("runtime");
 const Doc = doc_mod.Doc;
 const DocHeader = doc_mod.DocHeader;
 const PageFile = page_mod.PageFile;
@@ -27,14 +29,44 @@ pub const MAX_TENANT_ID_LEN: usize = 64;
 pub const MAX_COLLECTION_NAME_LEN: usize = 64;
 
 // ─── IndexQueue ──────────────────────────────────────────────────────────
-// Lock-free MPSC queue for deferring trigram+word index builds to a background thread.
-// Insert path pushes owned (key, value) pairs; background thread pops and indexes.
+// ─── IndexQueue ──────────────────────────────────────────────────────────
+// Lock-free MPSC queue for deferring trigram+word index builds to a background
+// thread. Previously each push allocated TWICE (dupe(key) + dupe(value)) on
+// every insert, hitting the GPA global mutex on the hot path. Now:
+//   - Docs with (key.len + value.len) <= INLINE_CAP are stored inline in the
+//     entry. Zero heap alloc.
+//   - Larger docs get ONE heap allocation (both key and value in a single
+//     contiguous buffer) instead of two.
 pub const IndexQueue = struct {
     const CAPACITY = 32768; // 32K entries per queue
 
-    const Entry = struct {
-        key: []const u8,
-        value: []const u8,
+    /// Entries under this combined size store key+value inline.
+    /// Tuned to keep Entry close to one cache line (2 × 64 B).
+    const INLINE_CAP: usize = 240;
+
+    pub const Entry = struct {
+        // When `heap` is false, key and value live in `inline_buf`.
+        // When `heap` is true, they live in `heap_ptr[0..total_len]`.
+        inline_buf: [INLINE_CAP]u8,
+        heap_ptr: [*]u8,
+        key_len: u32,
+        total_len: u32,
+        heap: bool,
+
+        pub fn keySlice(self: *const Entry) []const u8 {
+            const base: [*]const u8 = if (self.heap) self.heap_ptr else &self.inline_buf;
+            return base[0..self.key_len];
+        }
+
+        pub fn valueSlice(self: *const Entry) []const u8 {
+            const base: [*]const u8 = if (self.heap) self.heap_ptr else &self.inline_buf;
+            return base[self.key_len..self.total_len];
+        }
+
+        /// Release any heap storage owned by this entry.
+        pub fn deinit(self: *Entry, alloc: std.mem.Allocator) void {
+            if (self.heap) alloc.free(self.heap_ptr[0..self.total_len]);
+        }
     };
 
     buf: []Entry,
@@ -56,27 +88,52 @@ pub const IndexQueue = struct {
     }
 
     /// Push a (key, value) pair. Lock-free MPSC via CAS + per-slot ready flag.
+    /// Returns false if the queue is full — caller keeps ownership of
+    /// key/value and is responsible for falling back to a synchronous index.
     pub fn push(self: *IndexQueue, key: []const u8, value: []const u8) bool {
+        const total = key.len + value.len;
+        // Construct entry payload first so we don't hold a slot while allocating.
+        var new_entry: Entry = .{
+            .inline_buf = undefined,
+            .heap_ptr = undefined,
+            .key_len = @intCast(key.len),
+            .total_len = @intCast(total),
+            .heap = false,
+        };
+        if (total <= INLINE_CAP) {
+            @memcpy(new_entry.inline_buf[0..key.len], key);
+            @memcpy(new_entry.inline_buf[key.len..total], value);
+        } else {
+            const heap = self.alloc.alloc(u8, total) catch return false;
+            @memcpy(heap[0..key.len], key);
+            @memcpy(heap[key.len..], value);
+            new_entry.heap_ptr = heap.ptr;
+            new_entry.heap = true;
+        }
+        errdefer if (new_entry.heap) self.alloc.free(new_entry.heap_ptr[0..total]);
+
         while (true) {
             const h = self.head.load(.acquire);
             const next = (h + 1) % CAPACITY;
-            if (next == self.tail.load(.acquire)) return false; // full
-            // Atomically claim this slot by advancing head.
+            if (next == self.tail.load(.acquire)) {
+                // Queue full — release any heap we allocated before returning.
+                if (new_entry.heap) self.alloc.free(new_entry.heap_ptr[0..total]);
+                return false;
+            }
             if (self.head.cmpxchgWeak(h, next, .acq_rel, .monotonic)) |_| {
                 continue; // CAS failed — another producer won, retry
             }
-            // We own slot h — write data then signal readiness.
-            self.buf[h] = .{ .key = key, .value = value };
+            self.buf[h] = new_entry;
             self.ready[h].store(1, .release);
             return true;
         }
     }
 
     /// Pop one entry. Returns null if empty or next slot not yet ready.
+    /// Caller owns any heap storage and must call `entry.deinit(alloc)`.
     pub fn pop(self: *IndexQueue) ?Entry {
         const t = self.tail.load(.acquire);
-        if (t == self.head.load(.acquire)) return null; // empty
-        // Wait for the producer to finish writing this slot.
+        if (t == self.head.load(.acquire)) return null;
         if (self.ready[t].load(.acquire) == 0) return null;
         const entry = self.buf[t];
         self.ready[t].store(0, .release);
@@ -178,12 +235,11 @@ pub const Collection = struct {
     next_doc_id: std.atomic.Value(u64),
     // Record-level latching: 1024 stripe locks replace single write_mu.
     // Two writers to different keys proceed in parallel; same-key writes serialize.
-    stripe_locks: [STRIPE_COUNT]std.Thread.Mutex,
+    stripe_locks: [STRIPE_COUNT]std.Io.Mutex,
     hash_idx: std.AutoHashMap(u64, BTreeEntry),
+    /// Per-key monotonic doc_id — serves both as the live key→doc_id index and
+    /// as the modification epoch for branch conflict detection.
     key_doc_ids: std.AutoHashMap(u64, u64),
-    /// Per-key modification epoch — tracks when each key was last written on main.
-    /// Used by mergeBranch to detect conflicts (key modified after branch was created).
-    key_epochs: std.AutoHashMap(u64, u64),
     alloc: std.mem.Allocator,
     cache: hot_cache.HotCache,
     // MVCC version chain — append-only, vacuumed periodically via gc_counter.
@@ -195,6 +251,9 @@ pub const Collection = struct {
     index_thread: ?std.Thread,
     index_thread2: ?std.Thread,
     index_stop: std.atomic.Value(bool),
+    /// Futex signal — index workers sleep on this when queues are empty.
+    /// Insert path bumps it + futexWake; workers futexWait when both queues drain.
+    index_wake: std.atomic.Value(u32),
     queue_toggle: std.atomic.Value(u32),
     indexing_count: std.atomic.Value(u32),
 
@@ -238,11 +297,10 @@ pub const Collection = struct {
         col.next_doc_id = std.atomic.Value(u64).init(1);
         // Initialize all stripe locks.
         for (&col.stripe_locks) |*lock| {
-            lock.* = .{};
+            lock.* = .init;
         }
         col.hash_idx = std.AutoHashMap(u64, BTreeEntry).init(alloc);
         col.key_doc_ids = std.AutoHashMap(u64, u64).init(alloc);
-        col.key_epochs = std.AutoHashMap(u64, u64).init(alloc);
         col.alloc = alloc;
         col.cache = hot_cache.HotCache.init();
         col.versions = mvcc_mod.VersionChain.init(alloc);
@@ -251,6 +309,7 @@ pub const Collection = struct {
         col.index_stop = std.atomic.Value(bool).init(false);
         col.queue_toggle = std.atomic.Value(u32).init(0);
         col.indexing_count = std.atomic.Value(u32).init(0);
+        col.index_wake = std.atomic.Value(u32).init(0);
         col.vectors = null;
         col.vector_field_len = 0;
         col.vec_entries = .empty;
@@ -272,16 +331,18 @@ pub const Collection = struct {
     pub fn close(self: *Collection) void {
         // Signal background indexers to stop, then join both threads.
         self.index_stop.store(true, .release);
+        // Wake sleeping index workers so they observe the stop flag.
+        runtime.io.futexWake(u32, &self.index_wake.raw, std.math.maxInt(u32));
         if (self.index_thread) |t| t.join();
         if (self.index_thread2) |t| t.join();
-        // Drain any leftover entries from both queues (free owned slices).
-        while (self.index_queue.pop()) |entry| {
-            self.alloc.free(entry.key);
-            self.alloc.free(entry.value);
+        // Drain any leftover entries from both queues, freeing heap storage.
+        while (self.index_queue.pop()) |popped| {
+            var e = popped;
+            e.deinit(self.alloc);
         }
-        while (self.index_queue2.pop()) |entry| {
-            self.alloc.free(entry.key);
-            self.alloc.free(entry.value);
+        while (self.index_queue2.pop()) |popped| {
+            var e = popped;
+            e.deinit(self.alloc);
         }
         self.index_queue.deinit();
         self.index_queue2.deinit();
@@ -289,7 +350,6 @@ pub const Collection = struct {
         self.words.deinit();
         self.hash_idx.deinit();
         self.key_doc_ids.deinit();
-        self.key_epochs.deinit();
         self.versions.deinit(self.alloc);
         if (self.vectors) |vc| {
             vc.deinit(self.alloc);
@@ -323,9 +383,14 @@ pub const Collection = struct {
     /// Block until the background indexers have drained all pending items
     /// and finished processing the current batch.
     pub fn flushIndex(self: *Collection) void {
-        var waited: u32 = 0;
-        while ((self.index_queue.len() > 0 or self.index_queue2.len() > 0 or self.indexing_count.load(.acquire) > 0) and waited < 300_000) : (waited += 1) {
-            std.Thread.sleep(100_000); // 100µs
+        var sleep_ns: u64 = 100_000; // start at 100µs
+        var total_ns: u64 = 0;
+        const max_ns: u64 = 30_000_000_000; // 30s total cap
+        while ((self.index_queue.len() > 0 or self.index_queue2.len() > 0 or self.indexing_count.load(.acquire) > 0) and total_ns < max_ns) {
+            compat.threadSleep(sleep_ns);
+            total_ns += sleep_ns;
+            // Exponential backoff: 100µs → 200µs → ... → 10ms cap.
+            sleep_ns = @min(sleep_ns * 2, 10_000_000);
         }
     }
 
@@ -357,8 +422,8 @@ pub const Collection = struct {
     pub fn insert(self: *Collection, key: []const u8, value: []const u8) !u64 {
         const key_hash = doc_mod.fnv1a(key);
         const stripe = stripeIndex(key_hash);
-        self.stripe_locks[stripe].lock();
-        defer self.stripe_locks[stripe].unlock();
+        self.stripe_locks[stripe].lockUncancelable(runtime.io);
+        defer self.stripe_locks[stripe].unlock(runtime.io);
 
         const doc_id = self.next_doc_id.fetchAdd(1, .monotonic);
         const hdr = doc_mod.newHeader(doc_id, key, value);
@@ -399,8 +464,9 @@ pub const Collection = struct {
         // MVCC: register version in the version chain.
         const epoch = self.epochs.advance();
         self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
+        // key_doc_ids doubles as the per-key modification epoch for branch
+        // conflict detection (doc_id is monotonic across the collection).
         self.key_doc_ids.put(hdr.key_hash, doc_id) catch {};
-        self.key_epochs.put(hdr.key_hash, doc_id) catch {}; // epoch = doc_id (monotonic)
 
         // Async trigram + word indexing — push to background queue, sync fallback if full or no worker.
         if (value.len >= 3) {
@@ -409,23 +475,16 @@ pub const Collection = struct {
                 self.tri.indexFile(key, value) catch {};
                 self.words.indexFile(key, value) catch {};
             } else {
-                const owned_key = self.alloc.dupe(u8, key) catch null;
-                const owned_val = self.alloc.dupe(u8, value) catch null;
-                if (owned_key != null and owned_val != null) {
-                    const q = &self.index_queue;
-                    var retries: u32 = 0;
-                    while (!q.push(owned_key.?, owned_val.?)) {
-                        retries += 1;
-                        if (retries > 1000) {
-                            // Queue full — fall back to synchronous indexing.
-                            self.tri.indexFile(owned_key.?, owned_val.?) catch {};
-                            self.words.indexFile(owned_key.?, owned_val.?) catch {};
-                            self.alloc.free(owned_key.?);
-                            self.alloc.free(owned_val.?);
-                            break;
-                        }
-                        std.Thread.yield() catch {};
-                    }
+                // Queue's push() now owns storage internally — inline for small
+                // docs, one contiguous heap alloc for large. No dupe per side.
+                const q = &self.index_queue;
+                if (!q.push(key, value)) {
+                    // Queue full — fall back to synchronous indexing.
+                    self.tri.indexFile(key, value) catch {};
+                    self.words.indexFile(key, value) catch {};
+                } else {
+                    _ = self.index_wake.fetchAdd(1, .release);
+                    runtime.io.futexWake(u32, &self.index_wake.raw, 1);
                 }
             }
         }
@@ -462,6 +521,33 @@ pub const Collection = struct {
 
     /// Insert a document with a pre-computed embedding (no JSON parsing needed).
     /// This is the fast path — embedding is passed directly as f32 slice.
+
+    /// Batch insert multiple (key, value) pairs. Each pair goes through the
+    /// same single-insert path (no deeper internal batching yet — the primary
+    /// win is amortizing FFI boundary crossings and syscall-style entry
+    /// overhead across N items). Allocates nothing beyond what per-doc
+    /// `insert` allocates.
+    ///
+    /// On partial failure, returns the error and `out_doc_ids[0..i]` is
+    /// populated for the items that succeeded.
+    pub const BatchItem = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+    pub fn insertBatch(
+        self: *Collection,
+        items: []const BatchItem,
+        /// Optional output. If non-null, must have length >= items.len.
+        out_doc_ids: ?[]u64,
+    ) !usize {
+        var inserted: usize = 0;
+        for (items) |item| {
+            const id = try self.insert(item.key, item.value);
+            if (out_doc_ids) |ids| ids[inserted] = id;
+            inserted += 1;
+        }
+        return inserted;
+    }
     pub fn insertWithEmbedding(self: *Collection, key: []const u8, value: []const u8, embedding: []const f32) !u64 {
         const doc_id = self.insert(key, value) catch |e| return e;
         // insert() already handles vector extraction from JSON, but if embedding
@@ -550,8 +636,8 @@ pub const Collection = struct {
     pub fn update(self: *Collection, key: []const u8, new_value: []const u8) !bool {
         const key_hash = doc_mod.fnv1a(key);
         const stripe = stripeIndex(key_hash);
-        self.stripe_locks[stripe].lock();
-        defer self.stripe_locks[stripe].unlock();
+        self.stripe_locks[stripe].lockUncancelable(runtime.io);
+        defer self.stripe_locks[stripe].unlock(runtime.io);
 
         const old_entry = self.idx.search(key_hash) orelse return false;
         const old_doc = self.readEntry(old_entry) orelse return false;
@@ -594,8 +680,8 @@ pub const Collection = struct {
     pub fn delete(self: *Collection, key: []const u8) !bool {
         const key_hash = doc_mod.fnv1a(key);
         const stripe = stripeIndex(key_hash);
-        self.stripe_locks[stripe].lock();
-        defer self.stripe_locks[stripe].unlock();
+        self.stripe_locks[stripe].lockUncancelable(runtime.io);
+        defer self.stripe_locks[stripe].unlock(runtime.io);
 
         const entry = self.idx.search(key_hash) orelse return false;
 
@@ -1152,8 +1238,7 @@ pub const Collection = struct {
 
             const key_hash = doc_mod.fnv1a(w.key);
 
-            // CONFLICT DETECTION: check if main modified this key after branch was created
-            if (self.key_epochs.get(key_hash)) |main_epoch| {
+            if (self.key_doc_ids.get(key_hash)) |main_epoch| {
                 if (main_epoch > br.base_epoch) {
                     // Main was modified after branch fork — this is a real conflict
                     const main_doc = self.get(w.key);
@@ -1422,45 +1507,45 @@ pub const Collection = struct {
 /// Background thread that drains the index queue and builds trigram indexes.
 fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
     const BATCH = 64;
+    // Store full Entry values — inline storage lives inside them and must
+    // outlive the slice views we hand to indexBatch.
+    var batch: [BATCH]IndexQueue.Entry = undefined;
     var batch_keys: [BATCH][]const u8 = undefined;
     var batch_vals: [BATCH][]const u8 = undefined;
     var reusable_tris = std.AutoHashMap(codeindex.Trigram, void).init(col.alloc);
     defer reusable_tris.deinit();
 
     while (!col.index_stop.load(.acquire)) {
-        // Signal "working" BEFORE popping so flushIndex doesn't see
-        // an empty queue + zero count between pop and processing.
         _ = col.indexing_count.fetchAdd(1, .release);
         var n: usize = 0;
         while (n < BATCH) {
-            const entry = queue.pop() orelse break;
-            batch_keys[n] = entry.key;
-            batch_vals[n] = entry.value;
+            const popped = queue.pop() orelse break;
+            batch[n] = popped;
+            batch_keys[n] = batch[n].keySlice();
+            batch_vals[n] = batch[n].valueSlice();
             n += 1;
         }
         if (n == 0) {
             _ = col.indexing_count.fetchSub(1, .release);
-            std.Thread.yield() catch {};
+            const cur = col.index_wake.load(.acquire);
+            if (!col.index_stop.load(.acquire))
+                runtime.io.futexWaitTimeout(u32, &col.index_wake.raw, cur, .{ .duration = .{ .raw = std.Io.Duration.fromNanoseconds(50_000_000), .clock = .awake } }) catch {};
             continue;
         }
-        // Batch trigram indexing (single lock acquisition for all docs).
         col.tri.indexBatch(batch_keys[0..n], batch_vals[0..n], &reusable_tris) catch {};
-        // Word indexing (per-doc, no batching needed).
         for (0..n) |i| {
             col.words.indexFile(batch_keys[i], batch_vals[i]) catch {};
         }
-        for (0..n) |i| {
-            col.alloc.free(batch_vals[i]);
-            col.alloc.free(batch_keys[i]);
-        }
+        // Release per-entry heap storage (inline entries are no-ops).
+        for (0..n) |i| batch[i].deinit(col.alloc);
         _ = col.indexing_count.fetchSub(1, .release);
     }
     // Final drain on shutdown.
-    while (queue.pop()) |entry| {
-        col.tri.indexFile(entry.key, entry.value) catch {};
-        col.words.indexFile(entry.key, entry.value) catch {};
-        col.alloc.free(entry.value);
-        col.alloc.free(entry.key);
+    while (queue.pop()) |popped| {
+        var e = popped;
+        col.tri.indexFile(e.keySlice(), e.valueSlice()) catch {};
+        col.words.indexFile(e.keySlice(), e.valueSlice()) catch {};
+        e.deinit(col.alloc);
     }
 }
 
@@ -1476,7 +1561,7 @@ pub const Database = struct {
     data_dir_buf: [256]u8,
     data_dir_len: usize,
     alloc: std.mem.Allocator,
-    mu: std.Thread.RwLock,
+    mu: std.Io.RwLock,
     auth: @import("auth.zig").AuthStore,
 
     pub const TenantQuota = struct {
@@ -1509,7 +1594,7 @@ pub const Database = struct {
         db.cdc = cdc_mod.CDCManager.init(alloc);
         try db.cdc.start();
         db.alloc = alloc;
-        db.mu = .{};
+        db.mu = .init;
         db.auth = .{};
 
         const n = @min(resolved_data_dir.len, 255);
@@ -1559,16 +1644,16 @@ pub const Database = struct {
         defer self.alloc.free(tenant_key);
 
         // Fast path: read lock
-        self.mu.lockShared();
+        self.mu.lockSharedUncancelable(runtime.io);
         if (self.collections.get(tenant_key)) |c| {
-            self.mu.unlockShared();
+            self.mu.unlockShared(runtime.io);
             return c;
         }
-        self.mu.unlockShared();
+        self.mu.unlockShared(runtime.io);
 
         // Slow path: write lock for creation
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
         // Double-check after acquiring write lock
         if (self.collections.get(tenant_key)) |c| return c;
         try self.enforceCollectionQuotaLocked(tenant_id);
@@ -1597,8 +1682,8 @@ pub const Database = struct {
     pub fn dropCollectionForTenant(self: *Database, tenant_id: []const u8, name: []const u8) void {
         const tenant_key = self.tenantCollectionKey(tenant_id, name) catch return;
         defer self.alloc.free(tenant_key);
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
         if (self.collections.fetchRemove(tenant_key)) |kv| {
             kv.value.close();
             self.alloc.free(kv.key);
@@ -1611,8 +1696,8 @@ pub const Database = struct {
         defer alloc.free(prefix);
 
         var result: std.ArrayList([]const u8) = .empty;
-        self.mu.lockShared();
-        defer self.mu.unlockShared();
+        self.mu.lockSharedUncancelable(runtime.io);
+        defer self.mu.unlockShared(runtime.io);
 
         var it = self.collections.keyIterator();
         while (it.next()) |k| {
@@ -1625,8 +1710,8 @@ pub const Database = struct {
 
     pub fn configureTenantQuota(self: *Database, tenant_id: []const u8, quota: TenantQuota) !void {
         try validateTenantComponent(tenant_id);
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
         const gop = try self.tenant_quotas.getOrPut(tenant_id);
         if (!gop.found_existing) {
             gop.key_ptr.* = try self.alloc.dupe(u8, tenant_id);
@@ -1646,13 +1731,13 @@ pub const Database = struct {
 
     pub fn recordTenantOperation(self: *Database, tenant_id: []const u8) !void {
         try validateTenantComponent(tenant_id);
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
 
         const quota = self.tenant_quotas.get(tenant_id) orelse return;
         if (quota.max_ops_per_second == std.math.maxInt(u32)) return;
 
-        const now_ms: i64 = std.time.milliTimestamp();
+        const now_ms: i64 = compat.milliTimestamp();
         const window_ms = now_ms - @mod(now_ms, 1000);
         const usage = try self.getOrCreateTenantUsageLocked(tenant_id);
         if (usage.ops_window_ms != window_ms) {
@@ -1665,8 +1750,8 @@ pub const Database = struct {
 
     pub fn ensureTenantStorageAvailable(self: *Database, tenant_id: []const u8, extra_bytes: usize) !void {
         try validateTenantComponent(tenant_id);
-        self.mu.lockShared();
-        defer self.mu.unlockShared();
+        self.mu.lockSharedUncancelable(runtime.io);
+        defer self.mu.unlockShared(runtime.io);
 
         const quota = self.tenant_quotas.get(tenant_id) orelse return;
         if (quota.max_storage_bytes == std.math.maxInt(usize)) return;
@@ -1736,14 +1821,12 @@ fn validateCollectionComponent(name: []const u8) !void {
         if (c == '/' or c == '\\') return error.InvalidCollectionName;
     }
 }
-
 fn makeStorageName(buf: []u8, tenant_id: []const u8, collection_name: []const u8) ![]const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
-    const w = fbs.writer();
-    try appendSanitizedComponent(w, tenant_id);
+    var w = std.Io.Writer.fixed(buf);
+    try appendSanitizedComponent(&w, tenant_id);
     try w.writeAll("__");
-    try appendSanitizedComponent(w, collection_name);
-    return buf[0..fbs.pos];
+    try appendSanitizedComponent(&w, collection_name);
+    return w.buffered();
 }
 
 fn appendSanitizedComponent(writer: anytype, input: []const u8) !void {
@@ -1756,22 +1839,22 @@ fn appendSanitizedComponent(writer: anytype, input: []const u8) !void {
     }
 }
 
-fn ensureDataDir(alloc: std.mem.Allocator, data_dir: []const u8) ![]u8 {
+fn ensureDataDir(alloc: std.mem.Allocator, data_dir: []const u8) ![:0]u8 {
     try ensureDirPath(data_dir);
-    return try std.fs.realpathAlloc(alloc, data_dir);
+    return try compat.fs.cwdRealpathAlloc(alloc, data_dir);
 }
 
 fn ensureDirPath(data_dir: []const u8) !void {
     if (std.fs.path.isAbsolute(data_dir)) {
-        var root = try std.fs.openDirAbsolute("/", .{});
-        defer root.close();
-        const rel = std.mem.trimLeft(u8, data_dir, "/");
-        if (rel.len > 0) root.makePath(rel) catch |err| switch (err) {
+        var root = try compat.fs.openDirAbsolute("/", .{});
+        defer root.close(runtime.io);
+        const rel = std.mem.trimStart(u8, data_dir, "/");
+        if (rel.len > 0) root.createDirPath(runtime.io, rel) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
     } else {
-        std.fs.cwd().makePath(data_dir) catch |err| switch (err) {
+        compat.fs.cwdMakePath(data_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -1781,9 +1864,9 @@ fn ensureDirPath(data_dir: []const u8) !void {
 test "tenant collections are isolated" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_multi_tenant_test";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    try compat.fs.cwdMakePath(tmp_dir);
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1803,9 +1886,9 @@ test "tenant collections are isolated" {
 test "tenant collection quota limits new collections" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_tenant_quota_test";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    try compat.fs.cwdMakePath(tmp_dir);
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1818,9 +1901,9 @@ test "tenant collection quota limits new collections" {
 test "tenant ops quota is enforced per second" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_tenant_ops_test";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    try compat.fs.cwdMakePath(tmp_dir);
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1834,9 +1917,9 @@ test "tenant ops quota is enforced per second" {
 test "time travel get returns historical version after update" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_time_travel_update";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    try compat.fs.cwdMakePath(tmp_dir);
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1854,9 +1937,9 @@ test "time travel get returns historical version after update" {
 test "time travel get survives delete" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_time_travel_delete";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    try compat.fs.cwdMakePath(tmp_dir);
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1873,9 +1956,9 @@ test "time travel get survives delete" {
 test "time travel scan uses historical snapshot" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_time_travel_scan";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    try compat.fs.cwdMakePath(tmp_dir);
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1895,9 +1978,9 @@ test "time travel scan uses historical snapshot" {
 test "cdc emits signed ordered deliveries for tenant mutations" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_cdc_integration";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    try compat.fs.cwdMakePath(tmp_dir);
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1907,7 +1990,7 @@ test "cdc emits signed ordered deliveries for tenant mutations" {
     _ = try col.insert("u1", "{\"name\":\"alice\"}");
     _ = try col.update("u1", "{\"name\":\"alice-2\"}");
     try std.testing.expect(try col.delete("u1"));
-    std.Thread.sleep(20_000_000);
+    compat.threadSleep(20_000_000);
 
     const deliveries = try db.listWebhookDeliveries(alloc, "tenant-a");
     defer alloc.free(deliveries);
@@ -1922,9 +2005,9 @@ test "cdc emits signed ordered deliveries for tenant mutations" {
 test "tenant collections isolate keys and listings" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_tenant_isolation";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    try compat.fs.cwdMakePath(tmp_dir);
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1952,9 +2035,9 @@ test "tenant collections isolate keys and listings" {
 test "tenant quotas apply per tenant" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_tenant_quotas";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    try compat.fs.cwdMakePath(tmp_dir);
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();

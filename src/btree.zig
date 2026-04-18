@@ -12,6 +12,7 @@
 ///   max entries per leaf = (PAGE_USABLE - 2) / 22 = 184
 const std = @import("std");
 const page_mod = @import("page.zig");
+const runtime = @import("runtime");
 const PageFile = page_mod.PageFile;
 const PAGE_USABLE = page_mod.PAGE_USABLE;
 
@@ -37,18 +38,18 @@ const MIN_KEYS: usize = MAX_KEYS_PER_INTERNAL / 2;
 pub const BTree = struct {
     pf: *PageFile,
     root: u32,   // root page number (0 = not yet created)
-    mu: std.Thread.RwLock,
+    mu: std.Io.RwLock,
 
     pub fn init(pf: *PageFile, root_page: u32) BTree {
-        return .{ .pf = pf, .root = root_page, .mu = .{} };
+        return .{ .pf = pf, .root = root_page, .mu = .init };
     }
 
     // ─── search ──────────────────────────────────────────────────────────
 
     /// Find an entry by key_hash. Returns null if not found.
     pub fn search(self: *BTree, key_hash: u64) ?BTreeEntry {
-        self.mu.lockShared();
-        defer self.mu.unlockShared();
+        self.mu.lockSharedUncancelable(runtime.io);
+        defer self.mu.unlockShared(runtime.io);
         if (self.root == 0) return null;
         return self.searchPage(self.root, key_hash);
     }
@@ -69,8 +70,8 @@ pub const BTree = struct {
 
     /// Insert or update an entry. Returns error if allocation fails.
     pub fn insert(self: *BTree, entry: BTreeEntry) !void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
 
         if (self.root == 0) {
             // Create first root leaf (btree_leaf, NOT document leaf).
@@ -174,8 +175,8 @@ pub const BTree = struct {
     // ─── delete ──────────────────────────────────────────────────────────
 
     pub fn delete(self: *BTree, key_hash: u64) void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
         if (self.root == 0) return;
         _ = self.deletePage(self.root, key_hash);
     }

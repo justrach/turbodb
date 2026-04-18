@@ -8,6 +8,7 @@
 //! ftruncate + remap syscalls.  On macOS (no mremap) we munmap and remap.
 const std   = @import("std");
 const posix = std.posix;
+const runtime = @import("runtime");
 
 pub const GROW_CHUNK: usize = 256 * 1024 * 1024; // 256 MiB
 pub const PAGE_SIZE:  usize = 4096;
@@ -19,28 +20,28 @@ pub const MmapFile = struct {
     capacity: usize,        // mapped (file) length; >= len, multiple of PAGE_SIZE
     /// Protects ptr/capacity against concurrent grow+read.
     /// Writers (grow) take exclusive; readers (at/slice) take shared.
-    rw_lock:  std.Thread.RwLock,
+    rw_lock:  std.Io.RwLock,
 
     // ── Open / Close ──────────────────────────────────────────────────────────
 
     pub fn open(path: [:0]const u8, initial_size: usize) !MmapFile {
         const flags = posix.O{ .ACCMODE = .RDWR, .CREAT = true };
-        const fd = try posix.open(path, flags, 0o644);
-        errdefer posix.close(fd);
+        const fd = try posix.openatZ(posix.AT.FDCWD, path, flags, 0o644);
+        errdefer _ = std.c.close(fd);
 
-        const stat = try posix.fstat(fd);
-        const existing: usize = @intCast(stat.size);
+        const file_size = try @import("compat").fs.fileSize(fd);
+        const existing: usize = @intCast(file_size);
         const capacity = alignUp(
             @max(existing, @max(initial_size, GROW_CHUNK)),
             PAGE_SIZE,
         );
 
-        if (@as(usize, @intCast(stat.size)) < capacity)
-            try posix.ftruncate(fd, @intCast(capacity));
+        if (file_size < capacity)
+            if (std.c.ftruncate(fd, @intCast(capacity)) != 0) return error.FtruncateFailed;
 
         const ptr = try posix.mmap(
             null, capacity,
-            posix.PROT.READ | posix.PROT.WRITE,
+            .{ .READ = true, .WRITE = true },
             .{ .TYPE = .SHARED },
             fd, 0,
         );
@@ -50,13 +51,13 @@ pub const MmapFile = struct {
             .ptr      = ptr.ptr,
             .len      = existing,
             .capacity = capacity,
-            .rw_lock  = .{},
+            .rw_lock  = .init,
         };
     }
 
     pub fn close(self: *MmapFile) void {
         posix.munmap(@alignCast(self.ptr[0..self.capacity]));
-        posix.close(self.fd);
+        _ = std.c.close(self.fd);
     }
 
     // ── Sync / Checkpoint ─────────────────────────────────────────────────────
@@ -79,8 +80,8 @@ pub const MmapFile = struct {
             return;
         }
         // Must remap — take exclusive lock to block readers during munmap/mmap.
-        self.rw_lock.lock();
-        defer self.rw_lock.unlock();
+        self.rw_lock.lockUncancelable(runtime.io);
+        defer self.rw_lock.unlock(runtime.io);
         // Re-check after acquiring lock (another thread may have grown).
         if (needed_len <= self.capacity) {
             self.len = needed_len;
@@ -88,12 +89,12 @@ pub const MmapFile = struct {
         }
         const new_cap = alignUp(needed_len + GROW_CHUNK, PAGE_SIZE);
         // Extend file
-        try posix.ftruncate(self.fd, @intCast(new_cap));
+        if (std.c.ftruncate(self.fd, @intCast(new_cap)) != 0) return error.FtruncateFailed;
         // Remap (macOS has no mremap; unmap then remap)
         posix.munmap(@alignCast(self.ptr[0..self.capacity]));
         const ptr = try posix.mmap(
             null, new_cap,
-            posix.PROT.READ | posix.PROT.WRITE,
+            .{ .READ = true, .WRITE = true },
             .{ .TYPE = .SHARED },
             self.fd, 0,
         );
@@ -107,16 +108,16 @@ pub const MmapFile = struct {
     /// Return a pointer to the record at byte offset `off`.
     /// Takes a shared lock so grow() cannot remap underneath us.
     pub fn at(self: *MmapFile, comptime T: type, off: usize) *T {
-        self.rw_lock.lockShared();
-        defer self.rw_lock.unlockShared();
+        self.rw_lock.lockSharedUncancelable(runtime.io);
+        defer self.rw_lock.unlockShared(runtime.io);
         return @alignCast(@ptrCast(&self.ptr[off]));
     }
 
     /// Return a slice of T starting at byte offset `off`, `count` elements.
     /// Takes a shared lock so grow() cannot remap underneath us.
     pub fn slice(self: *MmapFile, comptime T: type, off: usize, count: usize) []T {
-        self.rw_lock.lockShared();
-        defer self.rw_lock.unlockShared();
+        self.rw_lock.lockSharedUncancelable(runtime.io);
+        defer self.rw_lock.unlockShared(runtime.io);
         return @as([*]T, @alignCast(@ptrCast(&self.ptr[off])))[0..count];
     }
 

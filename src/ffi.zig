@@ -11,6 +11,8 @@ const collection = @import("collection.zig");
 const doc_mod = @import("doc.zig");
 const crypto = @import("crypto.zig");
 const vector = @import("vector.zig");
+const compat = @import("compat");
+const runtime = @import("runtime");
 const Database = collection.Database;
 const Collection = collection.Collection;
 const Doc = doc_mod.Doc;
@@ -68,9 +70,13 @@ pub const TurboScanHandle = extern struct {
 /// Open a database at the given directory.
 /// Returns an opaque handle, or null on failure.
 export fn turbodb_open(dir: [*]const u8, dir_len: usize) ?*anyopaque {
+    // FFI consumers don't go through std.process.Init; bootstrap runtime.io
+    // before any compat/Io call. Idempotent, so cheap to call per-open.
+    runtime.init(alloc);
+
     // Ensure data directory exists.
     const dir_slice = dir[0..dir_len];
-    std.fs.cwd().makeDir(dir_slice) catch |e| switch (e) {
+    compat.fs.cwdMakeDir(dir_slice) catch |e| switch (e) {
         error.PathAlreadyExists => {},
         else => return null,
     };
@@ -170,6 +176,51 @@ export fn turbodb_insert_with_embedding(
     const col = validateColHandle(col_handle) orelse return -1;
     const doc_id = col.insertWithEmbedding(key[0..key_len], val[0..val_len], embedding[0..dims]) catch return -1;
     out_id.* = doc_id;
+    return 0;
+}
+
+/// Batch insert from a packed buffer. Wire format (caller packs):
+///   repeated { u32 key_len | key_bytes | u32 val_len | val_bytes }
+/// `count` records must be present. `out_ids` receives the doc_id for each,
+/// in input order. Returns 0 on full success, -1 on any parse/insert failure
+/// (after which `out_ids[0..N]` contains the IDs of the N items that
+/// succeeded before the failure; caller reads `*out_inserted` to know N).
+///
+/// Saves (count - 1) boundary crossings vs looping `turbodb_insert` from the
+/// host language.
+export fn turbodb_insert_many(
+    col_handle: *anyopaque,
+    packed_ptr: [*]const u8,
+    packed_len: usize,
+    count: u32,
+    out_ids: [*]u64,
+    out_inserted: *u32,
+) c_int {
+    const col = validateColHandle(col_handle) orelse return -1;
+    const buf = packed_ptr[0..packed_len];
+
+    var off: usize = 0;
+    var i: u32 = 0;
+    out_inserted.* = 0;
+    while (i < count) : (i += 1) {
+        if (off + 4 > buf.len) return -1;
+        const key_len = std.mem.readInt(u32, buf[off..][0..4], .little);
+        off += 4;
+        if (off + key_len > buf.len) return -1;
+        const key = buf[off..][0..key_len];
+        off += key_len;
+
+        if (off + 4 > buf.len) return -1;
+        const val_len = std.mem.readInt(u32, buf[off..][0..4], .little);
+        off += 4;
+        if (off + val_len > buf.len) return -1;
+        const val = buf[off..][0..val_len];
+        off += val_len;
+
+        const doc_id = col.insert(key, val) catch return -1;
+        out_ids[i] = doc_id;
+        out_inserted.* = i + 1;
+    }
     return 0;
 }
 
@@ -658,8 +709,9 @@ export fn turbodb_branch_diff(
     const br = col.getBranch(branch_name[0..branch_len]) orelse return -1;
     const branch_mod = @import("branch.zig");
 
-    var buf: std.ArrayList(u8) = .empty;
-    const w = buf.writer(alloc);
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    const w = &aw.writer;
     w.writeAll("{\"files\":[") catch return -1;
 
     var first_file = true;
@@ -690,7 +742,7 @@ export fn turbodb_branch_diff(
                 .added => "added",
                 .removed => "removed",
             };
-            std.fmt.format(w, "{{\"no\":{d},\"kind\":\"{s}\",\"text\":\"", .{ d.line_no, kind_str }) catch return -1;
+            w.print("{{\"no\":{d},\"kind\":\"{s}\",\"text\":\"", .{ d.line_no, kind_str }) catch return -1;
             // Escape text for JSON
             for (d.text) |c| {
                 switch (c) {
@@ -708,8 +760,7 @@ export fn turbodb_branch_diff(
     }
 
     w.writeAll("]}") catch return -1;
-
-    const json = buf.toOwnedSlice(alloc) catch return -1;
+    const json = aw.toOwnedSlice() catch return -1;
     out_json.* = json.ptr;
     out_len.* = @intCast(json.len);
     return 0;
@@ -777,28 +828,28 @@ export fn turbodb_discover_context(
     defer result.deinit();
 
     // Format as JSON
-    var buf: std.ArrayList(u8) = .empty;
-    const w = buf.writer(alloc);
+    var aw: std.Io.Writer.Allocating = .init(alloc);
+    defer aw.deinit();
+    const w = &aw.writer;
 
     w.writeAll("{\"matching_files\":[") catch return -1;
     for (result.matching_files, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch return -1;
-        std.fmt.format(w, "{{\"key\":\"{s}\",\"size\":{d}}}", .{ d.key, d.value.len }) catch return -1;
+        w.print("{{\"key\":\"{s}\",\"size\":{d}}}", .{ d.key, d.value.len }) catch return -1;
     }
     w.writeAll("],\"related_files\":[") catch return -1;
     for (result.related_files, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch return -1;
-        std.fmt.format(w, "{{\"key\":\"{s}\"}}", .{d.key}) catch return -1;
+        w.print("{{\"key\":\"{s}\"}}", .{d.key}) catch return -1;
     }
     w.writeAll("],\"test_files\":[") catch return -1;
     for (result.test_files, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch return -1;
-        std.fmt.format(w, "{{\"key\":\"{s}\"}}", .{d.key}) catch return -1;
+        w.print("{{\"key\":\"{s}\"}}", .{d.key}) catch return -1;
     }
-    std.fmt.format(w, "],\"recent_versions\":{d},\"total_files\":{d}}}", .{ result.recent_versions, result.total_files }) catch return -1;
-
+    w.print("],\"recent_versions\":{d},\"total_files\":{d}}}", .{ result.recent_versions, result.total_files }) catch return -1;
+    const json = aw.toOwnedSlice() catch return -1;
     // Copy to output
-    const json = buf.toOwnedSlice(alloc) catch return -1;
     out_json.* = json.ptr;
     out_len.* = @intCast(json.len);
     return 0;

@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime = @import("runtime");
 
 pub const TxnType = enum(u8) { put, delete, read };
 
@@ -45,7 +46,7 @@ pub const Sequencer = struct {
     next_seq: u64,
     current_epoch: u64,
     batch_window_ns: u64, // batching window in nanoseconds (default 5ms)
-    mu: std.Thread.Mutex,
+    mu: std.Io.Mutex,
 
     const default_batch_window_ns: u64 = 5_000_000; // 5ms
 
@@ -55,7 +56,7 @@ pub const Sequencer = struct {
             .next_seq = 0,
             .current_epoch = 0,
             .batch_window_ns = default_batch_window_ns,
-            .mu = .{},
+            .mu = .init,
         };
     }
 
@@ -72,8 +73,8 @@ pub const Sequencer = struct {
 
     /// Submit a transaction for sequencing. Thread-safe.
     pub fn submit(self: *Sequencer, alloc: std.mem.Allocator, txn: Transaction) !void {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
         try self.pending.append(alloc, txn);
     }
 
@@ -81,8 +82,8 @@ pub const Sequencer = struct {
     /// Called periodically by the batch timer. Each batch gets a monotonically
     /// increasing epoch and sequence range so every node applies the same order.
     pub fn drainBatch(self: *Sequencer, alloc: std.mem.Allocator) !?Batch {
-        self.mu.lock();
-        defer self.mu.unlock();
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
 
         if (self.pending.items.len == 0) return null;
 

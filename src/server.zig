@@ -14,6 +14,8 @@ const std = @import("std");
 const activity = @import("activity.zig");
 const auth = @import("auth.zig");
 const collection = @import("collection.zig");
+const compat = @import("compat");
+const runtime = @import("runtime");
 const Database = collection.Database;
 
 const MAX_REQ  = 65536;  // 64 KiB (initial read)
@@ -61,11 +63,10 @@ pub const Server = struct {
     query_bytes_read: std.atomic.Value(u64),
     query_cpu_us: std.atomic.Value(u64),
     query_cost_nanos_usd: std.atomic.Value(u64),
-    // Ring buffer for billing log — avoids O(n) orderedRemove(0).
-    billing_ring: [BILLING_LOG_CAP]QueryCost,
-    billing_ring_head: usize,  // next write position
-    billing_ring_count: usize, // entries currently stored
-    billing_mu: std.Thread.Mutex,
+    billing_ring: [1024]QueryCost = undefined,
+    billing_head: u32 = 0, // next write slot (mod 1024)
+    billing_len: u32 = 0,  // items stored, capped at 1024
+    billing_mu: std.Io.Mutex,
     activity: activity.ActivityTracker,
     // Connection limiter — prevents unbounded thread spawning under flood.
     active_conns: std.atomic.Value(u32),
@@ -83,40 +84,37 @@ pub const Server = struct {
             .query_bytes_read = std.atomic.Value(u64).init(0),
             .query_cpu_us = std.atomic.Value(u64).init(0),
             .query_cost_nanos_usd = std.atomic.Value(u64).init(0),
-            .billing_ring = undefined,
-            .billing_ring_head = 0,
-            .billing_ring_count = 0,
-            .billing_mu = .{},
+            .billing_mu = .init,
             .activity = activity.ActivityTracker.init(),
             .active_conns = std.atomic.Value(u32).init(0),
         };
     }
 
     pub fn run(self: *Server) !void {
-        const addr = try std.net.Address.parseIp("0.0.0.0", self.port);
-        var listener = try addr.listen(.{
+        const addr = try std.Io.net.IpAddress.parse("0.0.0.0", self.port);
+        var listener = try std.Io.net.IpAddress.listen(&addr, runtime.io, .{
             .reuse_address = true,
             .kernel_backlog = 256,
         });
-        defer listener.deinit();
+        defer listener.deinit(runtime.io);
 
         self.running.store(true, .release);
         std.log.info("TurboDB listening on :{d}", .{self.port});
 
         while (self.running.load(.acquire)) {
-            const conn = listener.accept() catch |e| {
-                if (e == error.WouldBlock) continue;
+            const stream = listener.accept(runtime.io) catch |e| {
                 std.log.err("accept: {}", .{e});
                 continue;
             };
-            // Reject if at connection limit to prevent OOM from thread exhaustion.
+            // Reject when at connection cap — bounds thread/FD use under flood.
             if (self.active_conns.load(.monotonic) >= MAX_CONNECTIONS) {
-                conn.stream.close();
+                stream.close(runtime.io);
                 _ = self.err_count.fetchAdd(1, .monotonic);
                 continue;
             }
-            const t = std.Thread.spawn(.{}, handleConnWrapped, .{self, conn}) catch {
-                conn.stream.close();
+            const t = std.Thread.spawn(.{}, handleConnWrapped, .{self, stream}) catch |e| {
+                std.log.err("thread spawn: {} (dropping connection)", .{e});
+                stream.close(runtime.io);
                 _ = self.err_count.fetchAdd(1, .monotonic);
                 continue;
             };
@@ -125,40 +123,11 @@ pub const Server = struct {
     }
 
     pub fn runUnix(self: *Server, path: []const u8) !void {
-        // Remove any existing socket file
-        std.posix.unlink(path) catch {};
-        const fd = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-        defer std.posix.close(fd);
-
-        // Construct sockaddr_un
-        var addr: std.posix.sockaddr.un = .{ .family = std.posix.AF.UNIX, .path = undefined };
-        @memset(&addr.path, 0);
-        if (path.len >= addr.path.len) return error.PathTooLong;
-        @memcpy(addr.path[0..path.len], path);
-
-        try std.posix.bind(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
-        try std.posix.listen(fd, 256);
-
-        self.running.store(true, .release);
-        std.log.info("TurboDB HTTP on unix:{s}", .{path});
-
-        while (self.running.load(.acquire)) {
-            var client_addr: std.posix.sockaddr.un = undefined;
-            var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.un);
-            const client_fd = std.posix.accept(fd, @ptrCast(&client_addr), &addr_len, 0) catch continue;
-            const stream = std.net.Stream{ .handle = client_fd };
-            const conn = std.net.Server.Connection{ .stream = stream, .address = std.net.Address.initUnix(path) catch continue };
-            if (self.active_conns.load(.monotonic) >= MAX_CONNECTIONS) {
-                conn.stream.close();
-                _ = self.err_count.fetchAdd(1, .monotonic);
-                continue;
-            }
-            const t = std.Thread.spawn(.{}, handleConnWrapped, .{ self, conn }) catch {
-                conn.stream.close();
-                continue;
-            };
-            t.detach();
-        }
+        // TODO(0.16): Unix socket support removed during Zig 0.16 migration.
+        // Reimplement on std.Io.net.UnixAddress when time permits.
+        _ = self;
+        _ = path;
+        return error.Unimplemented;
     }
 
     pub fn stop(self: *Server) void {
@@ -166,7 +135,7 @@ pub const Server = struct {
     }
 
     fn recordQueryCost(self: *Server, tenant_id: []const u8, op: []const u8, rows_scanned: usize, bytes_read: usize, start_ns: i128) void {
-        const elapsed_ns = std.time.nanoTimestamp() - start_ns;
+        const elapsed_ns = compat.nanoTimestamp() - start_ns;
         const cpu_us: u64 = @intCast(@max(@divTrunc(elapsed_ns, 1000), 0));
         const cost_nanos_usd: u64 = cpu_us * 5 + @as(u64, @intCast(rows_scanned)) + @as(u64, @intCast(bytes_read / 1024));
 
@@ -190,26 +159,23 @@ pub const Server = struct {
         @memcpy(entry.tenant_id[0..entry.tenant_id_len], tenant_id[0..entry.tenant_id_len]);
         @memcpy(entry.op[0..entry.op_len], op[0..entry.op_len]);
 
-        // O(1) ring buffer append — overwrites oldest entry when full.
-        self.billing_mu.lock();
-        defer self.billing_mu.unlock();
-        self.billing_ring[self.billing_ring_head] = entry;
-        self.billing_ring_head = (self.billing_ring_head + 1) % BILLING_LOG_CAP;
-        if (self.billing_ring_count < BILLING_LOG_CAP) {
-            self.billing_ring_count += 1;
-        }
+        self.billing_mu.lockUncancelable(runtime.io);
+        defer self.billing_mu.unlock(runtime.io);
+        self.billing_ring[self.billing_head] = entry;
+        self.billing_head = (self.billing_head + 1) % 1024;
+        if (self.billing_len < 1024) self.billing_len += 1;
     }
 };
 
 /// Wrapper that tracks active connection count around handleConn.
-fn handleConnWrapped(srv: *Server, conn: std.net.Server.Connection) void {
+fn handleConnWrapped(srv: *Server, stream: std.Io.net.Stream) void {
     _ = srv.active_conns.fetchAdd(1, .monotonic);
     defer _ = srv.active_conns.fetchSub(1, .monotonic);
-    handleConn(srv, conn);
+    handleConn(srv, stream);
 }
 
-fn handleConn(srv: *Server, conn: std.net.Server.Connection) void {
-    defer conn.stream.close();
+fn handleConn(srv: *Server, stream: std.Io.net.Stream) void {
+    defer stream.close(runtime.io);
 
     const bufs = std.heap.page_allocator.create(ConnBufs) catch {
         return;
@@ -219,7 +185,7 @@ fn handleConn(srv: *Server, conn: std.net.Server.Connection) void {
     defer tl_bufs = null;
 
     while (true) {
-        var n = conn.stream.read(&bufs.req) catch return;
+        var n = compat.streamRead(stream, &bufs.req) catch return;
         if (n == 0) return;
         _ = srv.req_count.fetchAdd(1, .monotonic);
 
@@ -239,32 +205,32 @@ fn handleConn(srv: *Server, conn: std.net.Server.Connection) void {
                 if (total_size <= MAX_BULK) {
                     const big_buf = std.heap.page_allocator.alloc(u8, total_size) catch {
                         const resp_len = dispatch(srv, initial, std.heap.page_allocator);
-                        conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
+                        compat.streamWriteAll(stream, bufs.resp[0..resp_len]) catch return;
                         continue;
                     };
                     defer std.heap.page_allocator.free(big_buf);
                     @memcpy(big_buf[0..n], initial);
                     // Read remaining bytes
                     while (n < total_size) {
-                        const r = conn.stream.read(big_buf[n..total_size]) catch break;
+                        const r = compat.streamRead(stream, big_buf[n..total_size]) catch break;
                         if (r == 0) break;
                         n += r;
                     }
                     const resp_len = dispatch(srv, big_buf[0..n], std.heap.page_allocator);
-                    conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
+                    compat.streamWriteAll(stream, bufs.resp[0..resp_len]) catch return;
                     continue;
                 }
             }
         }
 
         const resp_len = dispatch(srv, initial, std.heap.page_allocator);
-        conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
+        compat.streamWriteAll(stream, bufs.resp[0..resp_len]) catch return;
     }
 }
 fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
     // Parse request line.
     const nl = std.mem.indexOfScalar(u8, raw, '\n') orelse return err(400, "bad request");
-    const req_line = std.mem.trimRight(u8, raw[0..nl], "\r");
+    const req_line = std.mem.trimEnd(u8, raw[0..nl], "\r");
     var parts = std.mem.splitScalar(u8, req_line, ' ');
     const method = parts.next() orelse return err(400, "bad request");
     const full_path = parts.next() orelse return err(400, "bad request");
@@ -291,8 +257,8 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
 
     // Route: /metrics
     if (std.mem.eql(u8, path, "/metrics")) {
-        var fbs = std.io.fixedBufferStream(getBodyBuf());
-        std.fmt.format(fbs.writer(),
+        var w = std.Io.Writer.fixed(getBodyBuf());
+        w.print(
             "{{\"requests\":{d},\"errors\":{d},\"queries\":{d},\"rows_scanned\":{d},\"bytes_read\":{d},\"cpu_us\":{d},\"cost_nanos_usd\":{d}}}",
             .{
                 srv.req_count.load(.acquire),
@@ -303,7 +269,7 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
                 srv.query_cpu_us.load(.acquire),
                 srv.query_cost_nanos_usd.load(.acquire),
             }) catch {};
-        return ok(getBodyBuf()[0..fbs.pos]);
+        return ok(getBodyBuf()[0..w.end]);
     }
 
     // ── Auth gate — public endpoints above, protected endpoints below ────
@@ -439,7 +405,7 @@ fn handleInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, body:
     const key_raw = jsonStr(body, "key") orelse {
         // Auto-generate key from timestamp + counter.
         var kb: [32]u8 = undefined;
-        const k = std.fmt.bufPrint(&kb, "doc_{d}", .{std.time.milliTimestamp()}) catch
+        const k = std.fmt.bufPrint(&kb, "doc_{d}", .{compat.milliTimestamp()}) catch
             return err(400, "bad key");
         return doInsert(srv, tenant_id, col_name, k, value);
     };
@@ -447,17 +413,17 @@ fn handleInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, body:
 }
 
 fn doInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, value: []const u8) usize {
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = compat.nanoTimestamp();
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     srv.db.ensureTenantStorageAvailable(tenant_id, value.len) catch return err(429, "tenant storage quota exceeded");
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
     const doc_id = col.insert(key, value) catch return err(500, "insert failed");
     srv.recordQueryCost(tenant_id, "insert", 1, value.len, start_ns);
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    std.fmt.format(fbs.writer(),
+    var w = std.Io.Writer.fixed(getBodyBuf());
+    w.print(
         "{{\"doc_id\":{d},\"key\":\"{s}\",\"collection\":\"{s}\",\"tenant\":\"{s}\"}}",
         .{ doc_id, key, col_name, tenant_id }) catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 /// POST /db/:col/bulk — insert multiple documents in one request.
@@ -465,7 +431,7 @@ fn doInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []co
 /// Response: {"inserted":N,"errors":M,"collection":"...","tenant":"..."}
 fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
     _ = alloc;
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = compat.nanoTimestamp();
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
 
@@ -498,14 +464,14 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
 
     srv.recordQueryCost(tenant_id, "bulk_insert", inserted, total_bytes, start_ns);
 
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    std.fmt.format(fbs.writer(),
+    var w = std.Io.Writer.fixed(getBodyBuf());
+    w.print(
         "{{\"inserted\":{d},\"errors\":{d},\"collection\":\"{s}\",\"tenant\":\"{s}\"}}",
         .{ inserted, errors, col_name, tenant_id }) catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, as_of: ?i64) usize {
-        const start_ns = std.time.nanoTimestamp();
+        const start_ns = compat.nanoTimestamp();
         srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
         const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
         const d = if (as_of) |ts_ms|
@@ -514,42 +480,31 @@ fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []c
             (col.get(key) orelse return err(404, "not found"));
         srv.recordQueryCost(tenant_id, "get", 1, d.key.len + d.value.len, start_ns);
 
-        // Write JSON body directly into resp_buf at offset 256 (reserve space for headers)
-        const HEADER_RESERVE = 256;
+        // Fixed-length header = 103 bytes ("Content-Length" padded to 10 digits).
+        const HEADER_LEN = 103;
         var resp = getRespBuf();
-        var fbs = std.io.fixedBufferStream(resp[HEADER_RESERVE..]);
-        const val = if (d.value.len > 0) d.value else "{}";
-        const is_json = val.len > 0 and (val[0] == '{' or val[0] == '[' or val[0] == '"');
-        const w = fbs.writer();
-        if (is_json) {
-            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}", .{ d.header.doc_id, d.key, d.header.version, val }) catch {};
-        } else {
-            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":\"", .{ d.header.doc_id, d.key, d.header.version }) catch {};
-            for (val) |ch| {
-                if (ch == '"' or ch == '\\') w.writeByte('\\') catch {};
-                if (ch == '\n') { w.writeAll("\\n") catch {}; continue; }
-                w.writeByte(ch) catch {};
-            }
-            w.writeAll("\"}") catch {};
-        }
-        const body_len = fbs.pos;
 
-        // Now write headers into the reserved space at the front
-        var hdr_fbs = std.io.fixedBufferStream(resp[0..HEADER_RESERVE]);
-        std.fmt.format(hdr_fbs.writer(),
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
+        // Write body directly after the header region. No reserved-prefix
+        // memcpy dance — the header is always HEADER_LEN bytes.
+        var w = std.Io.Writer.fixed(resp[HEADER_LEN..]);
+        w.print(
+            "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":",
+            .{ d.header.doc_id, d.key, d.header.version }) catch {};
+        writeJsonValue(&w, d.value);
+        w.writeByte('}') catch {};
+        const body_len = w.end;
+
+        // Header with zero-padded Content-Length so length is deterministic.
+        var hdr_w = std.Io.Writer.fixed(resp[0..HEADER_LEN]);
+        hdr_w.print(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d:0>10}\r\nConnection: keep-alive\r\n\r\n",
             .{body_len}) catch {};
-        const hdr_len = hdr_fbs.pos;
-
-        // Move body right after headers (memmove if needed)
-        if (hdr_len < HEADER_RESERVE) {
-            std.mem.copyForwards(u8, resp[hdr_len .. hdr_len + body_len], resp[HEADER_RESERVE .. HEADER_RESERVE + body_len]);
-        }
-        return hdr_len + body_len;
+        // hdr_w.end == HEADER_LEN by construction.
+        return HEADER_LEN + body_len;
     }
 
 fn handleUpdate(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = compat.nanoTimestamp();
     _ = alloc;
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     srv.db.ensureTenantStorageAvailable(tenant_id, body.len) catch return err(429, "tenant storage quota exceeded");
@@ -561,7 +516,7 @@ fn handleUpdate(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: 
 }
 
 fn handleDelete(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8) usize {
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = compat.nanoTimestamp();
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
     const deleted = col.delete(key) catch return err(500, "delete failed");
@@ -571,7 +526,7 @@ fn handleDelete(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: 
 }
 
 fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_str: []const u8, as_of: ?i64, alloc: std.mem.Allocator) usize {
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = compat.nanoTimestamp();
     const limit: u32 = qparamInt(query_str, "limit") orelse 20;
     const offset: u32 = qparamInt(query_str, "offset") orelse 0;
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
@@ -585,32 +540,22 @@ fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_s
     for (result.docs) |d| bytes_read += d.key.len + d.value.len;
     srv.recordQueryCost(tenant_id, "scan", result.docs.len, bytes_read, start_ns);
 
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    const w = fbs.writer();
-    std.fmt.format(w, "{{\"tenant\":\"{s}\",\"collection\":\"{s}\",\"count\":{d},\"docs\":[",
+    var w = std.Io.Writer.fixed(getBodyBuf());
+    w.print("{{\"tenant\":\"{s}\",\"collection\":\"{s}\",\"count\":{d},\"docs\":[",
         .{ tenant_id, col_name, result.docs.len }) catch {};
     for (result.docs, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
-        const val = if (d.value.len > 0) d.value else "{}";
-        const is_json = val.len > 0 and (val[0] == '{' or val[0] == '[' or val[0] == '"');
-        if (is_json) {
-            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}", .{ d.header.doc_id, d.key, d.header.version, val }) catch {};
-        } else {
-            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":\"", .{ d.header.doc_id, d.key, d.header.version }) catch {};
-            for (val) |ch| {
-                if (ch == '"' or ch == '\\') w.writeByte('\\') catch {};
-                if (ch == '\n') { w.writeAll("\\n") catch {}; continue; }
-                w.writeByte(ch) catch {};
-            }
-            w.writeAll("\"}") catch {};
-        }
+        w.print("{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":",
+            .{ d.header.doc_id, d.key, d.header.version }) catch {};
+        writeJsonValue(&w, d.value);
+        w.writeByte('}') catch {};
     }
     w.writeAll("]}") catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn handleDrop(srv: *Server, tenant_id: []const u8, col_name: []const u8) usize {
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = compat.nanoTimestamp();
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     srv.db.dropCollectionForTenant(tenant_id, col_name);
     srv.recordQueryCost(tenant_id, "drop", 0, 0, start_ns);
@@ -618,7 +563,7 @@ fn handleDrop(srv: *Server, tenant_id: []const u8, col_name: []const u8) usize {
 }
 
 fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query: []const u8, limit: u32, alloc: std.mem.Allocator) usize {
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = compat.nanoTimestamp();
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
     const result = col.searchText(query, limit, alloc) catch return err(500, "search failed");
@@ -627,41 +572,28 @@ fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query
     for (result.docs) |d| bytes_read += d.key.len + d.value.len;
     srv.recordQueryCost(tenant_id, "search", result.docs.len, bytes_read, start_ns);
 
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(getBodyBuf());
     // Write JSON header with escaped query string
     w.writeAll("{\"query\":\"") catch {};
     for (query) |ch| {
         if (ch == '"' or ch == '\\') { w.writeByte('\\') catch {}; }
         w.writeByte(ch) catch {};
     }
-    std.fmt.format(w,
-        "\",\"hits\":{d},\"candidates\":{d},\"total_docs\":{d},\"total_files\":{d},\"results\":[",
+    w.print("\",\"hits\":{d},\"candidates\":{d},\"total_docs\":{d},\"total_files\":{d},\"results\":[",
         .{ result.docs.len, result.candidate_paths.len, col.docCount(), result.total_files }) catch {};
     for (result.docs, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
-        // Output value as valid JSON — objects/arrays as-is, strings quoted
-        const val = if (d.value.len > 0) d.value else "{}";
-        const is_json = val.len > 0 and (val[0] == '{' or val[0] == '[' or val[0] == '"');
-        if (is_json) {
-            std.fmt.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":{s}}}", .{ d.header.doc_id, d.key, val }) catch {};
-        } else {
-            w.writeAll("{\"doc_id\":") catch {};
-            std.fmt.format(w, "{d},\"key\":\"{s}\",\"value\":\"", .{ d.header.doc_id, d.key }) catch {};
-            for (val) |ch| {
-                if (ch == '"' or ch == '\\') w.writeByte('\\') catch {};
-                if (ch == '\n') { w.writeAll("\\n") catch {}; continue; }
-                w.writeByte(ch) catch {};
-            }
-            w.writeAll("\"}") catch {};
-        }
+        w.print("{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":",
+            .{ d.header.doc_id, d.key }) catch {};
+        writeJsonValue(&w, d.value);
+        w.writeByte('}') catch {};
     }
     w.writeAll("]}") catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn handleDiscoverContext(srv: *Server, tenant_id: []const u8, col_name: []const u8, query: []const u8, limit: u32, alloc: std.mem.Allocator) usize {
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = compat.nanoTimestamp();
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
     var result = col.discoverContext(query, limit, alloc) catch return err(500, "context discovery failed");
@@ -670,8 +602,7 @@ fn handleDiscoverContext(srv: *Server, tenant_id: []const u8, col_name: []const 
     for (result.matching_files) |d| bytes_read += d.key.len + d.value.len;
     srv.recordQueryCost(tenant_id, "context", result.matching_files.len, bytes_read, start_ns);
 
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(getBodyBuf());
 
     // Write JSON: matching_files
     w.writeAll("{\"query\":\"") catch {};
@@ -682,60 +613,57 @@ fn handleDiscoverContext(srv: *Server, tenant_id: []const u8, col_name: []const 
     w.writeAll("\",\"matching_files\":[") catch {};
     for (result.matching_files, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
-        std.fmt.format(w, "{{\"key\":\"{s}\",\"size\":{d}}}", .{ d.key, d.value.len }) catch {};
+        w.print("{{\"key\":\"{s}\",\"size\":{d}}}", .{ d.key, d.value.len }) catch {};
     }
     w.writeAll("],\"related_files\":[") catch {};
     for (result.related_files, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
-        std.fmt.format(w, "{{\"key\":\"{s}\"}}", .{d.key}) catch {};
+        w.print("{{\"key\":\"{s}\"}}", .{d.key}) catch {};
     }
     w.writeAll("],\"test_files\":[") catch {};
     for (result.test_files, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
-        std.fmt.format(w, "{{\"key\":\"{s}\"}}", .{d.key}) catch {};
+        w.print("{{\"key\":\"{s}\"}}", .{d.key}) catch {};
     }
-    std.fmt.format(w, "],\"recent_versions\":{d},\"total_files\":{d}}}", .{ result.recent_versions, result.total_files }) catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    w.print("],\"recent_versions\":{d},\"total_files\":{d}}}", .{ result.recent_versions, result.total_files }) catch {};
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn handleListCollections(srv: *Server, tenant_id: []const u8, alloc: std.mem.Allocator) usize {
-    const start_ns = std.time.nanoTimestamp();
+    const start_ns = compat.nanoTimestamp();
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     var cols = srv.db.listCollectionsForTenant(tenant_id, alloc) catch return err(500, "list collections failed");
     defer {
         for (cols.items) |name| alloc.free(name);
         cols.deinit(alloc);
     }
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    const w = fbs.writer();
-    std.fmt.format(w, "{{\"tenant\":\"{s}\",\"collections\":[", .{tenant_id}) catch {};
+    var w = std.Io.Writer.fixed(getBodyBuf());
+    w.print("{{\"tenant\":\"{s}\",\"collections\":[", .{tenant_id}) catch {};
     for (cols.items, 0..) |name, i| {
         if (i > 0) w.writeByte(',') catch {};
-        std.fmt.format(w, "\"{s}\"", .{name}) catch {};
+        w.print("\"{s}\"", .{name}) catch {};
     }
     srv.recordQueryCost(tenant_id, "list_collections", cols.items.len, 0, start_ns);
     w.writeAll("]}") catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn handleBillingLog(srv: *Server) usize {
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(getBodyBuf());
     w.writeAll("{\"queries\":[") catch {};
-    srv.billing_mu.lock();
-    defer srv.billing_mu.unlock();
-    // Read from ring buffer: emit up to 100 most recent entries.
-    const count = srv.billing_ring_count;
-    const emit = @min(count, 100);
-    const cap = Server.BILLING_LOG_CAP;
-    // Start index: oldest of the last `emit` entries in the ring.
-    const start_idx = if (count >= emit) (srv.billing_ring_head + cap - emit) % cap else 0;
-    for (0..emit) |i| {
-        const idx = (start_idx + i) % cap;
-        const entry = srv.billing_ring[idx];
+    srv.billing_mu.lockUncancelable(runtime.io);
+    defer srv.billing_mu.unlock(runtime.io);
+    // Iterate ring in logical order: newest entries are the most recent `min(len, 100)`.
+    const shown: u32 = @min(srv.billing_len, 100);
+    const first_slot: u32 = (srv.billing_head + 1024 - srv.billing_len) % 1024;
+    const start_offset: u32 = srv.billing_len - shown;
+    var idx: u32 = 0;
+    while (idx < shown) : (idx += 1) {
+        const slot = (first_slot + start_offset + idx) % 1024;
+        const entry = srv.billing_ring[slot];
+        const i = idx;
         if (i > 0) w.writeByte(',') catch {};
-        std.fmt.format(w,
-            "{{\"tenant\":\"{s}\",\"op\":\"{s}\",\"rows_scanned\":{d},\"bytes_read\":{d},\"cpu_us\":{d},\"cost_nanos_usd\":{d}}}",
+        w.print("{{\"tenant\":\"{s}\",\"op\":\"{s}\",\"rows_scanned\":{d},\"bytes_read\":{d},\"cpu_us\":{d},\"cost_nanos_usd\":{d}}}",
             .{
                 entry.tenant_id[0..entry.tenant_id_len],
                 entry.op[0..entry.op_len],
@@ -747,17 +675,16 @@ fn handleBillingLog(srv: *Server) usize {
         ) catch {};
     }
     w.writeAll("]}") catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn handleResourceState(srv: *Server) usize {
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    std.fmt.format(
-        fbs.writer(),
+    var w = std.Io.Writer.fixed(getBodyBuf());
+    w.print(
         "{{\"state\":\"{s}\",\"queries_per_second\":{d},\"last_query_ms\":{d}}}",
         .{ resourceStateName(srv.activity.state()), srv.activity.queriesPerSecond(), srv.activity.lastQueryMs() },
     ) catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn handleWebhookRegistration(srv: *Server, body: []const u8) usize {
@@ -766,21 +693,19 @@ fn handleWebhookRegistration(srv: *Server, body: []const u8) usize {
     const secret = jsonStr(body, "secret") orelse return err(400, "missing secret");
     const collection_name = jsonStr(body, "collection") orelse "";
     const id = srv.db.registerWebhook(tenant, collection_name, webhook, secret) catch return err(500, "register webhook failed");
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    std.fmt.format(fbs.writer(), "{{\"subscription_id\":{d}}}", .{id}) catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    var w = std.Io.Writer.fixed(getBodyBuf());
+    w.print("{{\"subscription_id\":{d}}}", .{id}) catch {};
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn handleCdcEvents(srv: *Server, tenant_filter: ?[]const u8, alloc: std.mem.Allocator) usize {
     const deliveries = srv.db.listWebhookDeliveries(alloc, tenant_filter) catch return err(500, "cdc read failed");
     defer alloc.free(deliveries);
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(getBodyBuf());
     w.writeAll("{\"events\":[") catch {};
     for (deliveries, 0..) |entry, i| {
         if (i > 0) w.writeByte(',') catch {};
-        std.fmt.format(w,
-            "{{\"seq\":{d},\"tenant\":\"{s}\",\"collection\":\"{s}\",\"webhook_url\":\"{s}\",\"signature\":\"{s}\",\"payload\":{s}}}",
+        w.print("{{\"seq\":{d},\"tenant\":\"{s}\",\"collection\":\"{s}\",\"webhook_url\":\"{s}\",\"signature\":\"{s}\",\"payload\":{s}}}",
             .{
                 entry.seq,
                 entry.tenant(),
@@ -792,7 +717,7 @@ fn handleCdcEvents(srv: *Server, tenant_filter: ?[]const u8, alloc: std.mem.Allo
         ) catch {};
     }
     w.writeAll("]}") catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 // ─── Branch handlers ─────────────────────────────────────────────────────
@@ -820,11 +745,11 @@ fn handleBranchRead(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
     const br = col.getBranch(branch_name) orelse return err(404, "branch not found");
     const val = col.getOnBranch(br, key) orelse return err(404, "not found");
     // Write response with raw value
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    std.fmt.format(fbs.writer(), "{{\"key\":\"{s}\",\"value\":{s}}}", .{
+    var w = std.Io.Writer.fixed(getBodyBuf());
+    w.print("{{\"key\":\"{s}\",\"value\":{s}}}", .{
         key, if (val.len > 0) val else "{}",
     }) catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn handleBranchMerge(srv: *Server, tenant_id: []const u8, col_name: []const u8, branch_name: []const u8, alloc: std.mem.Allocator) usize {
@@ -835,13 +760,13 @@ fn handleBranchMerge(srv: *Server, tenant_id: []const u8, col_name: []const u8, 
     defer result.deinit();
     if (result.conflicts.len > 0) {
         // Return conflict count
-        var fbs = std.io.fixedBufferStream(getBodyBuf());
-        std.fmt.format(fbs.writer(), "{{\"merged\":false,\"conflicts\":{d}}}", .{result.conflicts.len}) catch {};
-        return respond(409, "Conflict", getBodyBuf()[0..fbs.pos]);
+        var w = std.Io.Writer.fixed(getBodyBuf());
+        w.print("{{\"merged\":false,\"conflicts\":{d}}}", .{result.conflicts.len}) catch {};
+        return respond(409, "Conflict", getBodyBuf()[0..w.end]);
     }
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    std.fmt.format(fbs.writer(), "{{\"merged\":true,\"applied\":{d}}}", .{result.applied}) catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    var w = std.Io.Writer.fixed(getBodyBuf());
+    w.print("{{\"merged\":true,\"applied\":{d}}}", .{result.applied}) catch {};
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn handleBranchSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, branch_name: []const u8, query_text: []const u8, limit: u32, alloc: std.mem.Allocator) usize {
@@ -851,18 +776,17 @@ fn handleBranchSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8,
     const result = col.searchOnBranch(br, query_text, limit, alloc) catch return err(500, "branch search failed");
     defer result.deinit();
 
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    const w = fbs.writer();
-    std.fmt.format(w, "{{\"branch\":\"{s}\",\"hits\":{d},\"results\":[", .{ branch_name, result.docs.len }) catch {};
+    var w = std.Io.Writer.fixed(getBodyBuf());
+    w.print("{{\"branch\":\"{s}\",\"hits\":{d},\"results\":[", .{ branch_name, result.docs.len }) catch {};
     for (result.docs, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
-        std.fmt.format(w,
-            "{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":{s}}}",
-            .{ d.header.doc_id, d.key,
-               if (d.value.len > 0) d.value else "{}" }) catch {};
+        w.print("{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":",
+            .{ d.header.doc_id, d.key }) catch {};
+        writeJsonValue(&w, d.value);
+        w.writeByte('}') catch {};
     }
     w.writeAll("]}") catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn handleListBranches(srv: *Server, tenant_id: []const u8, col_name: []const u8, alloc: std.mem.Allocator) usize {
@@ -871,15 +795,14 @@ fn handleListBranches(srv: *Server, tenant_id: []const u8, col_name: []const u8,
     const names = col.listBranches(alloc) catch return err(500, "list branches failed");
     defer alloc.free(names);
 
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    const w = fbs.writer();
+    var w = std.Io.Writer.fixed(getBodyBuf());
     w.writeAll("{\"branches\":[") catch {};
     for (names, 0..) |name, i| {
         if (i > 0) w.writeByte(',') catch {};
-        std.fmt.format(w, "\"{s}\"", .{name}) catch {};
+        w.print("\"{s}\"", .{name}) catch {};
     }
     w.writeAll("]}") catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn requestTenant(raw: []const u8, query: []const u8) []const u8 {
@@ -916,8 +839,28 @@ fn resourceStateName(state: activity.ResourceState) []const u8 {
 }
 
 // ─── response helpers ────────────────────────────────────────────────────
-// ─── response helpers ────────────────────────────────────────────────────
 
+/// Write a document value as a JSON value — pass-through for JSON objects/arrays/strings,
+/// quoted + escaped for plain text (with empty → "{}" default).
+fn writeJsonValue(w: *std.Io.Writer, val_in: []const u8) void {
+    const val = if (val_in.len > 0) val_in else "{}";
+    const is_json = val[0] == '{' or val[0] == '[' or val[0] == '"';
+    if (is_json) {
+        w.writeAll(val) catch {};
+        return;
+    }
+    w.writeByte('"') catch {};
+    for (val) |ch| {
+        switch (ch) {
+            '"', '\\' => { w.writeByte('\\') catch {}; w.writeByte(ch) catch {}; },
+            '\n' => w.writeAll("\\n") catch {},
+            '\r' => w.writeAll("\\r") catch {},
+            '\t' => w.writeAll("\\t") catch {},
+            else => w.writeByte(ch) catch {},
+        }
+    }
+    w.writeByte('"') catch {};
+}
 fn ok(body: []const u8) usize {
     return respond(200, "OK", body);
 }
@@ -936,11 +879,11 @@ fn err(code: u16, msg: []const u8) usize {
 }
 
 fn respond(code: u16, status: []const u8, body: []const u8) usize {
-    var fbs = std.io.fixedBufferStream(getRespBuf());
-    std.fmt.format(fbs.writer(),
+    var w = std.Io.Writer.fixed(getRespBuf());
+    w.print(
         "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}",
         .{ code, status, body.len, body }) catch {};
-    return fbs.pos;
+    return w.end;
 }
 
 // ─── mini parsers ────────────────────────────────────────────────────────

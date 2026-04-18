@@ -8,6 +8,7 @@
 const std = @import("std");
 const activity = @import("activity.zig");
 const collection_mod = @import("collection.zig");
+const compat = @import("compat");
 const Database = collection_mod.Database;
 const Collection = collection_mod.Collection;
 
@@ -38,46 +39,24 @@ pub const WireServer = struct {
     }
 
     pub fn run(self: *WireServer) !void {
-        const addr = try std.net.Address.parseIp("0.0.0.0", self.port);
-        var listener = try addr.listen(.{ .reuse_address = true, .kernel_backlog = 1024 });
-        defer listener.deinit();
+        const runtime = @import("runtime");
+        const addr = try std.Io.net.IpAddress.parse("0.0.0.0", self.port);
+        var listener = try std.Io.net.IpAddress.listen(&addr, runtime.io, .{ .reuse_address = true, .kernel_backlog = 1024 });
+        defer listener.deinit(runtime.io);
         self.running.store(true, .release);
         std.log.info("TurboDB wire protocol on :{d}", .{self.port});
         while (self.running.load(.acquire)) {
-            const conn = listener.accept() catch continue;
-            const t = std.Thread.spawn(.{}, handleConn, .{ self, conn }) catch continue;
+            const stream = listener.accept(runtime.io) catch continue;
+            const t = std.Thread.spawn(.{}, handleConn, .{ self, stream }) catch continue;
             t.detach();
         }
     }
-
     pub fn runUnix(self: *WireServer, path: []const u8) !void {
-        // Remove any existing socket file
-        // Remove any existing socket file
-        std.posix.unlink(path) catch {};
-        const fd = try std.posix.socket(std.posix.AF.UNIX, std.posix.SOCK.STREAM, 0);
-        defer std.posix.close(fd);
-
-        // Construct sockaddr_un
-        var addr: std.posix.sockaddr.un = .{ .family = std.posix.AF.UNIX, .path = undefined };
-        @memset(&addr.path, 0);
-        if (path.len >= addr.path.len) return error.PathTooLong;
-        @memcpy(addr.path[0..path.len], path);
-
-        try std.posix.bind(fd, @ptrCast(&addr), @sizeOf(std.posix.sockaddr.un));
-        try std.posix.listen(fd, 1024);
-
-        self.running.store(true, .release);
-        std.log.info("TurboDB wire protocol on unix:{s}", .{path});
-
-        while (self.running.load(.acquire)) {
-            var client_addr: std.posix.sockaddr.un = undefined;
-            var addr_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.un);
-            const client_fd = std.posix.accept(fd, @ptrCast(&client_addr), &addr_len, 0) catch continue;
-            const stream = std.net.Stream{ .handle = client_fd };
-            const conn = std.net.Server.Connection{ .stream = stream, .address = std.net.Address.initUnix(path) catch continue };
-            const t = std.Thread.spawn(.{}, handleConn, .{ self, conn }) catch continue;
-            t.detach();
-        }
+        // TODO(0.16): Unix socket support removed during Zig 0.16 migration.
+        // std.posix.socket/bind/accept were removed; reimplement on std.Io.net.UnixAddress.
+        _ = self;
+        _ = path;
+        return error.Unimplemented;
     }
 
     pub fn stop(self: *WireServer) void {
@@ -87,8 +66,8 @@ pub const WireServer = struct {
 
 const Bufs = struct { rd: [RD_BUF]u8, wr: [WR_BUF]u8 };
 
-fn handleConn(srv: *WireServer, conn: std.net.Server.Connection) void {
-    defer conn.stream.close();
+fn handleConn(srv: *WireServer, stream: std.Io.net.Stream) void {
+    const runtime = @import("runtime"); defer stream.close(runtime.io);
     const bufs = std.heap.page_allocator.create(Bufs) catch return;
     defer std.heap.page_allocator.destroy(bufs);
 
@@ -101,7 +80,7 @@ fn handleConn(srv: *WireServer, conn: std.net.Server.Connection) void {
 
     while (true) {
         if (rp >= RD_BUF) rp = 0;
-        const n = conn.stream.read(bufs.rd[rp..]) catch return;
+        const n = compat.streamRead(stream, bufs.rd[rp..]) catch return;
         if (n == 0) return;
         rp += n;
 
@@ -117,7 +96,7 @@ fn handleConn(srv: *WireServer, conn: std.net.Server.Connection) void {
             if (op == OP_GET) {
                 srv.activity.recordQuery();
                 const wn = fastGet(srv, payload, &bufs.wr, &cached_col, &cached_col_name, &cached_col_len);
-                conn.stream.writeAll(bufs.wr[0..wn]) catch return;
+                compat.streamWriteAll(stream, bufs.wr[0..wn]) catch return;
             } else {
                 // Invalidate collection cache on writes
                 if (op == OP_INSERT or op == OP_UPDATE or op == OP_DELETE) {
@@ -125,7 +104,7 @@ fn handleConn(srv: *WireServer, conn: std.net.Server.Connection) void {
                 }
                 srv.activity.recordQuery();
                 const wn = dispatch(srv, op, payload, &bufs.wr);
-                conn.stream.writeAll(bufs.wr[0..wn]) catch return;
+                compat.streamWriteAll(stream, bufs.wr[0..wn]) catch return;
             }
             consumed += flen;
         }

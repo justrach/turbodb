@@ -10,6 +10,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const runtime = @import("runtime");
 const posix = std.posix;
 const Allocator = std.mem.Allocator;
 
@@ -480,6 +481,8 @@ pub const EventLoop = struct {
         if (self.running.load(.acquire)) {
             self.running.store(false, .release);
         }
+        // Wake all workers so they can observe running=false and exit.
+        runtime.io.futexWake(u32, &self.wake_signal.raw, @intCast(self.worker_count));
         if (self.listen_fd >= 0) {
             posix.close(self.listen_fd);
         }
@@ -541,6 +544,8 @@ pub const EventLoop = struct {
     /// Stop the event loop gracefully.
     pub fn stop(self: *EventLoop) void {
         self.running.store(false, .release);
+        // Wake all sleeping workers so they see running=false.
+        runtime.io.futexWake(u32, &self.wake_signal.raw, @intCast(self.worker_count));
     }
 
     // ── Internal completion handlers ──
@@ -608,6 +613,10 @@ pub const EventLoop = struct {
             // Queue full — close connection to shed load.
             conn.state = .closing;
             self.engine.submitClose(conn.fd, comp.user_data) catch {};
+        } else {
+            // Wake one sleeping worker to process this item.
+            _ = self.wake_signal.fetchAdd(1, .release);
+            runtime.io.futexWake(u32, &self.wake_signal.raw, 1);
         }
     }
 
@@ -650,9 +659,11 @@ pub const EventLoop = struct {
     fn workerThread(self: *EventLoop, handler: *const fn (request: []const u8, response: []u8) usize) void {
         while (self.running.load(.acquire)) {
             const item = self.work_queue.pop() orelse {
-                // No work — brief spin-then-yield.
-                std.atomic.spinLoopHint();
-                std.Thread.yield() catch {};
+                // No work — sleep on futex instead of spinning.
+                const cur = self.wake_signal.load(.acquire);
+                // Re-check running before sleeping (avoid missed wake on shutdown).
+                if (!self.running.load(.acquire)) break;
+                runtime.io.futexWaitTimeout(u32, &self.wake_signal.raw, cur, .{ .duration = .{ .raw = std.Io.Duration.fromNanoseconds(50_000_000), .clock = .awake } }) catch {};
                 continue;
             };
 

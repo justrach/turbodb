@@ -13,6 +13,8 @@
 const std = @import("std");
 const collection_mod = @import("collection.zig");
 const codeindex = @import("codeindex.zig");
+const runtime = @import("runtime");
+const compat = @import("compat");
 const Database = collection_mod.Database;
 const Collection = collection_mod.Collection;
 
@@ -22,13 +24,12 @@ const EXTS = [_][]const u8{
     ".json", ".toml", ".yaml", ".yml", ".md",
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const alloc = init.gpa;
+    runtime.setIo(init.io);
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const args = try compat.argsAlloc(alloc, init.minimal.args);
+    defer compat.argsFree(alloc, args);
 
     var data_dir: []const u8 = "./turbodb_data";
     var col_name: []const u8 = "code";
@@ -62,7 +63,7 @@ pub fn main() !void {
     }
 
     // Ensure data dir
-    std.fs.cwd().makeDir(data_dir) catch |e| switch (e) {
+    compat.fs.cwdMakeDir(data_dir) catch |e| switch (e) {
         error.PathAlreadyExists => {},
         else => return e,
     };
@@ -119,32 +120,32 @@ pub fn main() !void {
 fn cmdIndex(db: *Database, col_name: []const u8, dir_path: []const u8, alloc: std.mem.Allocator) !void {
     const col = try db.collection(col_name);
 
-    var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch |e| {
+    var dir = compat.fs.cwdOpenDir(dir_path, .{ .iterate = true }) catch |e| {
         std.debug.print("Cannot open directory: {any}\n", .{e});
         return;
     };
-    defer dir.close();
+    defer compat.fs.dirClose(dir);
 
     var indexed: u64 = 0;
     var skipped: u64 = 0;
-    const t0 = std.time.nanoTimestamp();
+    const t0 = compat.nanoTimestamp();
 
     var walker = try dir.walk(alloc);
     defer walker.deinit();
 
-    while (try walker.next()) |entry| {
+    while (try walker.next(runtime.io)) |entry| {
         if (entry.kind != .file) continue;
         if (!hasValidExt(entry.basename)) continue;
 
         // Read file content (first 8KB for indexing)
-        var file = dir.openFile(entry.path, .{}) catch {
+        const file = compat.fs.dirOpenFile(dir, entry.path, .{}) catch {
             skipped += 1;
             continue;
         };
-        defer file.close();
+        defer compat.fs.fileClose(file);
 
         var buf: [8192]u8 = undefined;
-        const n = file.read(&buf) catch {
+        const n = compat.fs.fileReadAll(file, &buf) catch {
             skipped += 1;
             continue;
         };
@@ -164,14 +165,14 @@ fn cmdIndex(db: *Database, col_name: []const u8, dir_path: []const u8, alloc: st
         indexed += 1;
 
         if (indexed % 1000 == 0) {
-            const elapsed_ns = std.time.nanoTimestamp() - t0;
+            const elapsed_ns = compat.nanoTimestamp() - t0;
             const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
             const rate = @as(f64, @floatFromInt(indexed)) / elapsed_s;
             std.debug.print("\r  Indexed {d} files ({d:.0} files/s)...", .{ indexed, rate });
         }
     }
 
-    const elapsed_ns = std.time.nanoTimestamp() - t0;
+    const elapsed_ns = compat.nanoTimestamp() - t0;
     const elapsed_s = @as(f64, @floatFromInt(elapsed_ns)) / 1e9;
     const rate = @as(f64, @floatFromInt(indexed)) / elapsed_s;
 
@@ -183,10 +184,10 @@ fn cmdIndex(db: *Database, col_name: []const u8, dir_path: []const u8, alloc: st
 fn cmdSearch(db: *Database, col_name: []const u8, query: []const u8, alloc: std.mem.Allocator) !void {
     const col = try db.collection(col_name);
 
-    const t0 = std.time.nanoTimestamp();
+    const t0 = compat.nanoTimestamp();
     const result = try col.searchText(query, 20, alloc);
     defer result.deinit();
-    const elapsed_ns = std.time.nanoTimestamp() - t0;
+    const elapsed_ns = compat.nanoTimestamp() - t0;
     const elapsed_us = @as(f64, @floatFromInt(elapsed_ns)) / 1e3;
 
     const n_cand = result.candidate_paths.len;
@@ -250,9 +251,9 @@ fn cmdBench(db: *Database, col_name: []const u8, dir_path: []const u8, alloc: st
     var total_candidates: u64 = 0;
 
     for (queries) |q| {
-        const t0 = std.time.nanoTimestamp();
+        const t0 = compat.nanoTimestamp();
         const result = try col.searchText(q, 50, alloc);
-        const elapsed_ns = std.time.nanoTimestamp() - t0;
+        const elapsed_ns = compat.nanoTimestamp() - t0;
         const elapsed_us = @as(f64, @floatFromInt(elapsed_ns)) / 1e3;
         total_us += elapsed_us;
         total_hits += result.docs.len;
@@ -330,7 +331,7 @@ fn findSnippet(value: []const u8, query: []const u8) []const u8 {
             if (value[ls] == '\n' and ls < vi) ls += 1;
             var le = end;
             while (le < value.len and value[le] != '\n') le += 1;
-            return std.mem.trimRight(u8, value[ls..le], " \t\r\n");
+            return std.mem.trimEnd(u8, value[ls..le], " \t\r\n");
         }
     }
     return "";

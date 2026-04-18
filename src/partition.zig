@@ -174,7 +174,7 @@ pub const PartitionedCollection = struct {
         offset: u32,
         alloc_: std.mem.Allocator,
     ) !ScanResult {
-        var all_docs: std.ArrayList(Doc) = .{};
+        var all_docs: std.ArrayList(Doc) = .empty;
         defer all_docs.deinit(alloc_);
 
         // Gather from each partition — request enough to cover offset + limit
@@ -234,7 +234,7 @@ pub const PartitionedCollection = struct {
         }
 
         // Merge
-        var merged: std.ArrayList(Doc) = .{};
+        var merged: std.ArrayList(Doc) = .empty;
         defer merged.deinit(alloc_);
 
         for (results) |maybe_res| {

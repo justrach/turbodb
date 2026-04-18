@@ -9,6 +9,8 @@
 ///
 /// Same source tree ALWAYS produces same hash regardless of filesystem ordering.
 const std = @import("std");
+const compat = @import("compat");
+const runtime = @import("runtime");
 const Blake3 = std.crypto.hash.Blake3;
 
 /// Hash raw bytes with BLAKE3. Returns 32-byte digest.
@@ -45,7 +47,7 @@ pub fn hashSourceTree(alloc: std.mem.Allocator, dir_path: []const u8) !struct { 
         var full_path_buf: [4096]u8 = undefined;
         const full_path = std.fmt.bufPrint(&full_path_buf, "{s}/{s}", .{ dir_path, rel_path }) catch continue;
 
-        const content = std.fs.cwd().readFileAlloc(alloc, full_path, 64 * 1024 * 1024) catch continue;
+        const content = compat.fs.cwdReadFileAlloc(alloc, full_path, 64 * 1024 * 1024) catch continue;
         defer alloc.free(content);
 
         // BLAKE3(path ++ \0 ++ content)
@@ -88,11 +90,11 @@ fn collectFiles(
     else
         base_dir;
 
-    var dir = std.fs.cwd().openDir(dir_to_open, .{ .iterate = true }) catch return;
-    defer dir.close();
+    var dir = compat.fs.cwdOpenDir(dir_to_open, .{ .iterate = true }) catch return;
+    defer compat.fs.dirClose(dir);
 
     var iter = dir.iterate();
-    while (try iter.next()) |entry| {
+    while (try iter.next(runtime.io)) |entry| {
         // Skip hidden files and common non-source dirs
         if (entry.name.len > 0 and entry.name[0] == '.') continue;
         if (std.mem.eql(u8, entry.name, "zig-out")) continue;

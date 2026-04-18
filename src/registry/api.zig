@@ -22,6 +22,7 @@ const registry_mod = @import("registry.zig");
 const sign_mod = @import("sign.zig");
 const hash_mod = @import("hash.zig");
 const auth_mod = @import("auth.zig");
+const compat = @import("compat");
 const AuthContext = auth_mod.AuthContext;
 const Registry = registry_mod.Registry;
 
@@ -61,23 +62,23 @@ pub const RegistryServer = struct {
     }
 
     pub fn run(self: *RegistryServer) !void {
-        const addr = try std.net.Address.parseIp("0.0.0.0", self.port);
-        var listener = try addr.listen(.{
+        const runtime = @import("runtime");
+        const addr = try std.Io.net.IpAddress.parse("0.0.0.0", self.port);
+        var listener = try std.Io.net.IpAddress.listen(&addr, runtime.io, .{
             .reuse_address = true,
             .kernel_backlog = 256,
         });
-        defer listener.deinit();
+        defer listener.deinit(runtime.io);
 
         self.running.store(true, .release);
         std.log.info("ZagDB Registry listening on :{d}", .{self.port});
 
         while (self.running.load(.acquire)) {
-            const conn = listener.accept() catch |e| {
-                if (e == error.WouldBlock) continue;
+            const stream = listener.accept(runtime.io) catch |e| {
                 std.log.err("accept: {}", .{e});
                 continue;
             };
-            const t = std.Thread.spawn(.{}, handleConn, .{ self, conn }) catch continue;
+            const t = std.Thread.spawn(.{}, handleConn, .{ self, stream }) catch continue;
             t.detach();
         }
     }
@@ -87,8 +88,8 @@ pub const RegistryServer = struct {
     }
 };
 
-fn handleConn(srv: *RegistryServer, conn: std.net.Server.Connection) void {
-    defer conn.stream.close();
+fn handleConn(srv: *RegistryServer, stream: std.Io.net.Stream) void {
+    const runtime = @import("runtime"); defer stream.close(runtime.io);
 
     const bufs = std.heap.page_allocator.create(ConnBufs) catch return;
     defer std.heap.page_allocator.destroy(bufs);
@@ -96,18 +97,18 @@ fn handleConn(srv: *RegistryServer, conn: std.net.Server.Connection) void {
     defer tl_bufs = null;
 
     while (true) {
-        const n = conn.stream.read(&bufs.req) catch return;
+        const n = compat.streamRead(stream, &bufs.req) catch return;
         if (n == 0) return;
         _ = srv.req_count.fetchAdd(1, .monotonic);
 
         const resp_len = dispatch(srv, bufs.req[0..n]);
-        conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
+        compat.streamWriteAll(stream, bufs.resp[0..resp_len]) catch return;
     }
 }
 
 fn dispatch(srv: *RegistryServer, raw: []const u8) usize {
     const nl = std.mem.indexOfScalar(u8, raw, '\n') orelse return err(400, "bad request");
-    const req_line = std.mem.trimRight(u8, raw[0..nl], "\r");
+    const req_line = std.mem.trimEnd(u8, raw[0..nl], "\r");
     var parts = std.mem.splitScalar(u8, req_line, ' ');
     const method = parts.next() orelse return err(400, "bad request");
     const full_path = parts.next() orelse return err(400, "bad request");
@@ -131,12 +132,12 @@ fn dispatch(srv: *RegistryServer, raw: []const u8) usize {
 
     // ─── /metrics ───────────────────────────────────────────────────────
     if (std.mem.eql(u8, path, "/metrics")) {
-        var fbs = std.io.fixedBufferStream(getBodyBuf());
-        std.fmt.format(fbs.writer(), "{{\"requests\":{d},\"errors\":{d}}}", .{
+        var fbs = std.Io.Writer.fixed(getBodyBuf());
+        fbs.print("{{\"requests\":{d},\"errors\":{d}}}", .{
             srv.req_count.load(.acquire),
             srv.err_count.load(.acquire),
         }) catch {};
-        return ok(getBodyBuf()[0..fbs.pos]);
+        return ok(getBodyBuf()[0..fbs.end]);
     }
 
     // ─── /api/v1/search?q=...&limit=N ──────────────────────────────────
@@ -215,19 +216,18 @@ fn handleSearch(srv: *RegistryServer, query_str: []const u8, auth: AuthContext) 
     var results: [50]registry_mod.PackageInfo = undefined;
     const count = srv.registry.searchAuth(q, capped, &results, auth) catch return err(500, "search failed");
 
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    const w = fbs.writer();
-    w.writeAll("{\"results\":[") catch {};
+    var fbs = std.Io.Writer.fixed(getBodyBuf());
+    fbs.writeAll("{\"results\":[") catch {};
     for (0..count) |i| {
-        if (i > 0) w.writeAll(",") catch {};
-        std.fmt.format(w, "{{\"name\":\"{s}\",\"description\":\"{s}\",\"version\":\"{s}\"}}", .{
+        if (i > 0) fbs.writeAll(",") catch {};
+        fbs.print("{{\"name\":\"{s}\",\"description\":\"{s}\",\"version\":\"{s}\"}}", .{
             results[i].name,
             results[i].description,
             results[i].version,
         }) catch {};
     }
-    std.fmt.format(w, "],\"count\":{d}}}", .{count}) catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    fbs.print("],\"count\":{d}}}", .{count}) catch {};
+    return ok(getBodyBuf()[0..fbs.end]);
 }
 
 fn handlePublish(srv: *RegistryServer, body: []const u8) usize {
@@ -255,13 +255,13 @@ fn handlePublish(srv: *RegistryServer, body: []const u8) usize {
         };
     };
 
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    std.fmt.format(fbs.writer(), "{{\"ok\":true,\"name\":\"{s}\",\"version\":\"{s}\",\"hash\":\"{s}\"}}", .{
+    var fbs = std.Io.Writer.fixed(getBodyBuf());
+    fbs.print("{{\"ok\":true,\"name\":\"{s}\",\"version\":\"{s}\",\"hash\":\"{s}\"}}", .{
         result.package_name,
         result.version,
         result.source_hash_hex,
     }) catch {};
-    return ok(getBodyBuf()[0..fbs.pos]);
+    return ok(getBodyBuf()[0..fbs.end]);
 }
 
 fn handleGetPackage(srv: *RegistryServer, name: []const u8, auth: AuthContext) usize {
@@ -318,9 +318,9 @@ fn handleDownload(srv: *RegistryServer, hash_hex: []const u8) usize {
     // For blobs, return raw data (not JSON)
     if (data.len > MAX_RESP - 256) return err(413, "blob too large for response buffer");
 
-    var fbs = std.io.fixedBufferStream(getRespBuf());
-    std.fmt.format(fbs.writer(), "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n", .{data.len}) catch {};
-    const header_len = fbs.pos;
+    var fbs = std.Io.Writer.fixed(getRespBuf());
+    fbs.print("HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n", .{data.len}) catch {};
+    const header_len = fbs.end;
     if (header_len + data.len <= MAX_RESP) {
         @memcpy(getRespBuf()[header_len..][0..data.len], data);
         return header_len + data.len;
@@ -361,9 +361,9 @@ fn err(code: u16, msg: []const u8) usize {
 }
 
 fn respond(code: u16, status: []const u8, body: []const u8) usize {
-    var fbs = std.io.fixedBufferStream(getRespBuf());
-    std.fmt.format(fbs.writer(), "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}", .{ code, status, body.len, body }) catch {};
-    return fbs.pos;
+    var fbs = std.Io.Writer.fixed(getRespBuf());
+    fbs.print("HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}", .{ code, status, body.len, body }) catch {};
+    return fbs.end;
 }
 
 // ─── Query parameter parsers ────────────────────────────────────────────────

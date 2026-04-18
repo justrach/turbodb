@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 
 pub const ResourceState = enum(u8) {
     deep_sleep,
@@ -13,7 +14,7 @@ pub const ActivityTracker = struct {
     queries_in_window: std.atomic.Value(u64),
 
     pub fn init() ActivityTracker {
-        const now = std.time.milliTimestamp();
+        const now = compat.milliTimestamp();
         return .{
             .last_query_ms = std.atomic.Value(i64).init(now),
             .window_start_ms = std.atomic.Value(i64).init(now),
@@ -22,7 +23,7 @@ pub const ActivityTracker = struct {
     }
 
     pub fn recordQuery(self: *ActivityTracker) void {
-        const now = std.time.milliTimestamp();
+        const now = compat.milliTimestamp();
         self.last_query_ms.store(now, .release);
 
         const start = self.window_start_ms.load(.acquire);
@@ -43,7 +44,7 @@ pub const ActivityTracker = struct {
     }
 
     pub fn state(self: *const ActivityTracker) ResourceState {
-        const now = std.time.milliTimestamp();
+        const now = compat.milliTimestamp();
         const idle_ms = now - self.last_query_ms.load(.acquire);
         const qps = self.queries_in_window.load(.acquire);
         if (idle_ms >= 30 * 60 * 1000) return .deep_sleep;
@@ -55,13 +56,13 @@ pub const ActivityTracker = struct {
 
 test "activity tracker state machine transitions" {
     var tracker = ActivityTracker.init();
-    tracker.last_query_ms.store(std.time.milliTimestamp() - 31 * 60 * 1000, .release);
+    tracker.last_query_ms.store(compat.milliTimestamp() - 31 * 60 * 1000, .release);
     try std.testing.expectEqual(ResourceState.deep_sleep, tracker.state());
 
-    tracker.last_query_ms.store(std.time.milliTimestamp() - 2 * 60 * 1000, .release);
+    tracker.last_query_ms.store(compat.milliTimestamp() - 2 * 60 * 1000, .release);
     try std.testing.expectEqual(ResourceState.light_sleep, tracker.state());
 
-    tracker.last_query_ms.store(std.time.milliTimestamp(), .release);
+    tracker.last_query_ms.store(compat.milliTimestamp(), .release);
     tracker.queries_in_window.store(150, .release);
     try std.testing.expectEqual(ResourceState.hot, tracker.state());
 

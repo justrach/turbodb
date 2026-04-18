@@ -1,4 +1,6 @@
 const std = @import("std");
+const compat = @import("compat");
+const runtime = @import("runtime");
 const Allocator = std.mem.Allocator;
 
 /// Operation types for WAL entries.
@@ -29,7 +31,7 @@ pub const WALSegment = struct {
         var path_buf: [512]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "{s}/wal_seg_{d:0>4}", .{ data_dir, id }) catch return error.PathTooLong;
 
-        const fd = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        const fd = try compat.fs.cwdCreateFile(path, .{ .truncate = true });
 
         const buf = try alloc.alignedAlloc(u8, .fromByteUnits(4096), BUF_SIZE);
         @memset(buf, 0);
@@ -133,6 +135,7 @@ pub const ParallelWAL = struct {
     allocator: Allocator,
     flusher_thread: ?std.Thread,
     running: std.atomic.Value(u8),
+    wake_signal: std.atomic.Value(u32),
 
     pub fn init(alloc: Allocator, data_dir: []const u8, n_segments: u32) !*ParallelWAL {
         const segs = try alloc.alloc(*WALSegment, n_segments);
@@ -162,6 +165,7 @@ pub const ParallelWAL = struct {
             .allocator = alloc,
             .flusher_thread = null,
             .running = std.atomic.Value(u8).init(0),
+            .wake_signal = std.atomic.Value(u32).init(0),
         };
         return self;
     }
@@ -187,7 +191,11 @@ pub const ParallelWAL = struct {
     /// Append an entry to the thread-local segment (lock-free).
     pub fn write(self: *ParallelWAL, op: OpType, key_hash: u64, data: []const u8) !u32 {
         const seg = self.getSegment();
-        return seg.append(op, key_hash, data);
+        const off = try seg.append(op, key_hash, data);
+        // Wake the flusher. Signal value only needs to change; actual count is ignored.
+        _ = self.wake_signal.fetchAdd(1, .release);
+        runtime.io.futexWake(u32, &self.wake_signal.raw, 1);
+        return off;
     }
 
     /// Group commit: flush + fsync every segment and advance the epoch.
@@ -220,16 +228,40 @@ pub const ParallelWAL = struct {
     pub fn stopFlusher(self: *ParallelWAL) void {
         if (self.running.load(.acquire) == 0) return;
         self.running.store(0, .release);
+        // Wake the flusher so it observes running=0 without waiting out its timeout.
+        _ = self.wake_signal.fetchAdd(1, .release);
+        runtime.io.futexWake(u32, &self.wake_signal.raw, 1);
         if (self.flusher_thread) |t| {
             t.join();
             self.flusher_thread = null;
         }
     }
 
+    /// Returns true if any segment has unflushed bytes.
+    fn anyDirty(self: *ParallelWAL) bool {
+        var i: u32 = 0;
+        while (i < self.n_segments) : (i += 1) {
+            const seg = self.segments[i];
+            if (seg.pos.load(.acquire) > seg.flushed_pos) return true;
+        }
+        return false;
+    }
+
     fn flusherLoop(self: *ParallelWAL) void {
         while (self.running.load(.acquire) == 1) {
-            self.groupCommit() catch {};
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            if (self.anyDirty()) {
+                self.groupCommit() catch {};
+                continue;
+            }
+            // Idle. Sleep on futex; writes or stopFlusher will wake us.
+            const cur = self.wake_signal.load(.acquire);
+            if (self.running.load(.acquire) == 0) break;
+            runtime.io.futexWaitTimeout(
+                u32,
+                &self.wake_signal.raw,
+                cur,
+                .{ .duration = .{ .raw = std.Io.Duration.fromNanoseconds(10 * std.time.ns_per_ms), .clock = .awake } },
+            ) catch {};
         }
         // Final flush on shutdown.
         self.groupCommit() catch {};
@@ -357,7 +389,7 @@ test "ParallelWAL background flusher runs" {
     _ = try wal.write(.put, 99, "flusher-test");
 
     // Sleep a bit to let the flusher run at least once (~1 ms interval).
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    compat.threadSleep(10 * std.time.ns_per_ms);
 
     const epoch = wal.current_epoch.load(.acquire);
     try std.testing.expect(epoch >= 1);

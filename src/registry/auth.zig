@@ -7,6 +7,7 @@
 ///   - Request signing/verification (Ed25519 over method+path+timestamp)
 const std = @import("std");
 const sign_mod = @import("sign.zig");
+const compat = @import("compat");
 
 // ─── Visibility ────────────────────────────────────────────────────────────────
 
@@ -54,14 +55,13 @@ pub const Permissions = struct {
 
     /// Serialize to JSON-friendly string: "read,publish,yank,admin"
     pub fn toStr(self: Permissions, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
-        const w = fbs.writer();
+        var w = std.Io.Writer.fixed(buf);
         var first = true;
         if (self.read) { if (!first) try w.writeAll(","); try w.writeAll("read"); first = false; }
         if (self.publish) { if (!first) try w.writeAll(","); try w.writeAll("publish"); first = false; }
         if (self.yank) { if (!first) try w.writeAll(","); try w.writeAll("yank"); first = false; }
         if (self.admin) { if (!first) try w.writeAll(","); try w.writeAll("admin"); first = false; }
-        return fbs.getWritten();
+        return w.buffered();
     }
 
     /// Parse from comma-separated string
@@ -204,7 +204,7 @@ pub fn signRequest(method: []const u8, path: []const u8, timestamp: i64, secret_
 /// Verify an HTTP request signature.
 pub fn verifyRequest(method: []const u8, path: []const u8, timestamp: i64, signature: [64]u8, pubkey: [32]u8) bool {
     // Check timestamp is within 5 minutes
-    const now = std.time.timestamp();
+    const now = compat.timestampSec();
     const diff = if (now > timestamp) now - timestamp else timestamp - now;
     if (diff > 300) return false; // 5 minute window
 
@@ -362,7 +362,7 @@ test "format package key" {
 
 test "request signing and verification" {
     const kp = sign_mod.KeyPair.generate();
-    const now = std.time.timestamp();
+    const now = compat.timestampSec();
 
     const sig = signRequest("GET", "/api/v1/packages/test", now, kp.secret_key);
     try std.testing.expect(verifyRequest("GET", "/api/v1/packages/test", now, sig, kp.public_key));
