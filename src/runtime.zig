@@ -23,15 +23,38 @@ const std = @import("std");
 
 pub var threaded: std.Io.Threaded = undefined;
 pub var io: std.Io = undefined;
-var initialized: bool = false;
+
+/// Lockless init state machine. Uninit → Initing → Ready.
+/// Losers of the CAS spin on `state` until it reaches Ready, then read `io`
+/// (which is published with a release store by the winner).
+const State = enum(u8) { uninit = 0, initing = 1, ready = 2 };
+var state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(State.uninit));
+
+/// Returns true if the caller won the CAS and should perform init; false if
+/// it lost or init already finished (in which case it has already spin-waited
+/// until the winner published the final state).
+fn claimOrWait() bool {
+    if (state.load(.acquire) == @intFromEnum(State.ready)) return false;
+    if (state.cmpxchgStrong(
+        @intFromEnum(State.uninit),
+        @intFromEnum(State.initing),
+        .acquire,
+        .acquire,
+    )) |_| {
+        while (state.load(.acquire) != @intFromEnum(State.ready)) std.atomic.spinLoopHint();
+        return false;
+    }
+    return true;
+}
 
 /// Must be called once at process startup, before any other module touches
-/// `runtime.io`. Idempotent.
+/// `runtime.io`. Idempotent and thread-safe — concurrent FFI callers can race
+/// into `turbodb_open`, but only the first one through the gate initializes.
 pub fn init(gpa: std.mem.Allocator) void {
-    if (initialized) return;
+    if (!claimOrWait()) return;
     threaded = std.Io.Threaded.init(gpa, .{});
     io = threaded.io();
-    initialized = true;
+    state.store(@intFromEnum(State.ready), .release);
 }
 
 /// Publish an externally-owned Io (e.g. `std.process.Init.io` from the new
@@ -39,22 +62,22 @@ pub fn init(gpa: std.mem.Allocator) void {
 /// because the stdlib start code already instantiates Io based on build
 /// options; we just piggyback on it.
 pub fn setIo(external: std.Io) void {
-    if (initialized) return;
+    if (!claimOrWait()) return;
     io = external;
-    initialized = true;
+    state.store(@intFromEnum(State.ready), .release);
 }
 
 pub fn deinit() void {
-    if (!initialized) return;
+    if (state.load(.acquire) != @intFromEnum(State.ready)) return;
     threaded.deinit();
-    initialized = false;
+    state.store(@intFromEnum(State.uninit), .release);
 }
 
 /// Test-only: fall back to `global_single_threaded` if `init()` wasn't called.
 /// This lets unit tests that don't bootstrap the full runtime still exercise
 /// compat helpers. Never call this in production code — prefer `init()`.
 pub fn ensureForTest() void {
-    if (initialized) return;
+    if (!claimOrWait()) return;
     io = std.Io.Threaded.global_single_threaded.io();
-    initialized = true;
+    state.store(@intFromEnum(State.ready), .release);
 }

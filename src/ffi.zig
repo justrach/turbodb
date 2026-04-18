@@ -196,7 +196,7 @@ export fn turbodb_insert_many(
     out_ids: [*]u64,
     out_inserted: *u32,
 ) c_int {
-    const col: *Collection = @ptrCast(@alignCast(col_handle));
+    const col = validateColHandle(col_handle) orelse return -1;
     const buf = packed_ptr[0..packed_len];
 
     var off: usize = 0;
