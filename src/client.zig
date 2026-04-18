@@ -2,6 +2,7 @@ const std = @import("std");
 const collection_mod = @import("collection.zig");
 const doc_mod = @import("doc.zig");
 const compat = @import("compat");
+const runtime = @import("runtime");
 
 pub const Database = collection_mod.Database;
 pub const Collection = collection_mod.Collection;
@@ -12,9 +13,11 @@ pub const DocHeader = doc_mod.DocHeader;
 pub const Db = struct {
     inner: *Database,
     alloc: std.mem.Allocator,
-
     /// Open a TurboDB database at the given directory.
     pub fn open(alloc: std.mem.Allocator, data_dir: []const u8) !Db {
+        // Embedded callers don't route through std.process.Init; bootstrap
+        // runtime.io before the first compat/Io call. Idempotent.
+        runtime.init(alloc);
         // Ensure directory exists
         compat.fs.cwdMakeDir(data_dir) catch |e| switch (e) {
             error.PathAlreadyExists => {},

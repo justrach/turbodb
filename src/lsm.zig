@@ -226,27 +226,36 @@ pub const SSTable = struct {
         try file.writeStreamingAll(runtime.io, &buf);
     }
 
+    /// Read exactly `buffer.len` bytes, looping past transient short reads.
+    /// Returns UnexpectedEof if we hit real EOF before filling the buffer.
+    fn readExact(file: std.Io.File, buffer: []u8) !void {
+        var total: usize = 0;
+        while (total < buffer.len) {
+            const bufs = [_][]u8{buffer[total..]};
+            const n = try file.readStreaming(runtime.io, &bufs);
+            if (n == 0) return error.UnexpectedEof;
+            total += n;
+        }
+    }
+
     /// Read a u64 in little-endian from a file.
     fn readU64(file: std.Io.File) !u64 {
         var buf: [8]u8 = undefined;
-        var bufs = [_][]u8{&buf}; const n = try file.readStreaming(runtime.io, &bufs);
-        if (n < 8) return error.UnexpectedEof;
+        try readExact(file, &buf);
         return std.mem.readInt(u64, &buf, .little);
     }
 
     /// Read a u32 in little-endian from a file.
     fn readU32(file: std.Io.File) !u32 {
         var buf: [4]u8 = undefined;
-        var bufs = [_][]u8{&buf}; const n = try file.readStreaming(runtime.io, &bufs);
-        if (n < 4) return error.UnexpectedEof;
+        try readExact(file, &buf);
         return std.mem.readInt(u32, &buf, .little);
     }
 
     /// Read a single byte from a file.
     fn readByte(file: std.Io.File) !u8 {
         var buf: [1]u8 = undefined;
-        var bufs = [_][]u8{&buf}; const n = try file.readStreaming(runtime.io, &bufs);
-        if (n < 1) return error.UnexpectedEof;
+        try readExact(file, &buf);
         return buf[0];
     }
 
