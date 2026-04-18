@@ -106,9 +106,16 @@ pub const Server = struct {
                 std.log.err("accept: {}", .{e});
                 continue;
             };
-            const t = std.Thread.spawn(.{}, handleConn, .{self, stream}) catch |e| {
+            // Reject when at connection cap — bounds thread/FD use under flood.
+            if (self.active_conns.load(.monotonic) >= MAX_CONNECTIONS) {
+                stream.close(runtime.io);
+                _ = self.err_count.fetchAdd(1, .monotonic);
+                continue;
+            }
+            const t = std.Thread.spawn(.{}, handleConnWrapped, .{self, stream}) catch |e| {
                 std.log.err("thread spawn: {} (dropping connection)", .{e});
                 stream.close(runtime.io);
+                _ = self.err_count.fetchAdd(1, .monotonic);
                 continue;
             };
             t.detach();
@@ -159,6 +166,13 @@ pub const Server = struct {
         if (self.billing_len < 1024) self.billing_len += 1;
     }
 };
+
+/// Wrapper that tracks active connection count around handleConn.
+fn handleConnWrapped(srv: *Server, stream: std.Io.net.Stream) void {
+    _ = srv.active_conns.fetchAdd(1, .monotonic);
+    defer _ = srv.active_conns.fetchSub(1, .monotonic);
+    handleConn(srv, stream);
+}
 
 fn handleConn(srv: *Server, stream: std.Io.net.Stream) void {
     defer stream.close(runtime.io);

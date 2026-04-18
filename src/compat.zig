@@ -99,11 +99,20 @@ pub const fs = struct {
         file.close(runtime.io);
     }
 
-    /// Single-shot blocking read of up to `buffer.len` bytes into `buffer`.
-    /// Returns the number of bytes read (0 on EOF).
+    /// Read up to `buffer.len` bytes, looping until the buffer is full or EOF.
+    /// Matches the 0.15 `File.readAll` contract: a short return only means EOF,
+    /// never "transient short read" — callers downstream (SSTable/index) treat
+    /// short reads as corruption, so we must not surface them here.
     pub fn fileReadAll(file: File, buffer: []u8) !usize {
-        const bufs = [_][]u8{buffer};
-        return file.readStreaming(runtime.io, &bufs);
+        var total: usize = 0;
+        while (total < buffer.len) {
+            const rem = buffer[total..];
+            const bufs = [_][]u8{rem};
+            const n = try file.readStreaming(runtime.io, &bufs);
+            if (n == 0) break; // EOF
+            total += n;
+        }
+        return total;
     }
 
 
@@ -112,16 +121,22 @@ pub const fs = struct {
         _ = std.c.lseek(file.handle, @intCast(pos), std.posix.SEEK.SET);
     }
 
-    /// Portable fstat size. std.posix.fstat is gone in 0.16, and std.c.fstat is
-    /// not a function on Linux (fstat64 there) — branch on OS.
+    /// Portable fstat size. std.posix.fstat is gone in 0.16; std.c.fstat is
+    /// not a function on Linux; use statx(AT.EMPTY_PATH) there.
     pub fn fileSize(fd: std.posix.fd_t) !u64 {
         const builtin = @import("builtin");
         switch (builtin.os.tag) {
             .linux => {
-                var st: std.os.linux.Stat = undefined;
-                const rc = std.os.linux.fstat(fd, &st);
+                var stx: std.os.linux.Statx = undefined;
+                const rc = std.os.linux.statx(
+                    fd,
+                    "",
+                    std.os.linux.AT.EMPTY_PATH,
+                    .{ .SIZE = true },
+                    &stx,
+                );
                 if (std.os.linux.E.init(rc) != .SUCCESS) return error.FstatFailed;
-                return @intCast(st.size);
+                return stx.size;
             },
             else => {
                 var st: std.c.Stat = undefined;
