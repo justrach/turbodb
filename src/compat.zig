@@ -135,7 +135,7 @@ pub const fs = struct {
                     .{ .SIZE = true },
                     &stx,
                 );
-                if (std.os.linux.E.init(rc) != .SUCCESS) return error.FstatFailed;
+                if (std.posix.errno(rc) != .SUCCESS) return error.FstatFailed;
                 return stx.size;
             },
             else => {
