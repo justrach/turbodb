@@ -309,6 +309,7 @@ pub const Collection = struct {
         col.index_stop = std.atomic.Value(bool).init(false);
         col.queue_toggle = std.atomic.Value(u32).init(0);
         col.indexing_count = std.atomic.Value(u32).init(0);
+        col.index_wake = std.atomic.Value(u32).init(0);
         col.vectors = null;
         col.vector_field_len = 0;
         col.vec_entries = .empty;

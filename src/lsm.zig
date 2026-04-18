@@ -347,7 +347,7 @@ pub const SSTable = struct {
         );
         defer idx_file.close(runtime.io);
 
-        const idx_stat = blk: { var st: std.c.Stat = undefined; if (std.c.fstat(idx_file.handle, &st) != 0) return error.FstatFailed; break :blk .{ .size = @as(u64, @intCast(st.size)) }; };
+        const idx_stat = .{ .size = try compat.fs.fileSize(idx_file.handle) };
         const n_index_entries = idx_stat.size / INDEX_ENTRY_SIZE;
 
         // Binary search the sparse index.

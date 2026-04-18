@@ -111,6 +111,25 @@ pub const fs = struct {
     pub fn fileSeekTo(file: File, pos: u64) void {
         _ = std.c.lseek(file.handle, @intCast(pos), std.posix.SEEK.SET);
     }
+
+    /// Portable fstat size. std.posix.fstat is gone in 0.16, and std.c.fstat is
+    /// not a function on Linux (fstat64 there) — branch on OS.
+    pub fn fileSize(fd: std.posix.fd_t) !u64 {
+        const builtin = @import("builtin");
+        switch (builtin.os.tag) {
+            .linux => {
+                var st: std.os.linux.Stat = undefined;
+                const rc = std.os.linux.fstat(fd, &st);
+                if (std.os.linux.E.init(rc) != .SUCCESS) return error.FstatFailed;
+                return @intCast(st.size);
+            },
+            else => {
+                var st: std.c.Stat = undefined;
+                if (std.c.fstat(fd, &st) != 0) return error.FstatFailed;
+                return @intCast(st.size);
+            },
+        }
+    }
 };
 
     /// Blocking read from a net stream. Returns bytes read, 0 on EOF.
@@ -118,13 +137,21 @@ pub const fs = struct {
         return std.posix.read(stream.socket.handle, buffer);
     }
 
-    /// Blocking write-all to a net stream.
+    /// Blocking write-all to a net stream. Retries on EINTR/EAGAIN so transient
+    /// signal delivery doesn't fall through to BrokenPipe on a still-healthy socket.
     pub fn streamWriteAll(stream: std.Io.net.Stream, data: []const u8) !void {
         var rem = data;
         while (rem.len > 0) {
             const n = std.c.write(stream.socket.handle, rem.ptr, rem.len);
-            if (n <= 0) return error.BrokenPipe;
-            rem = rem[@intCast(n)..];
+            if (n > 0) {
+                rem = rem[@intCast(n)..];
+                continue;
+            }
+            const e = std.posix.errno(n);
+            switch (e) {
+                .INTR, .AGAIN => continue,
+                else => return error.BrokenPipe,
+            }
         }
     }
 // ─── Time ─────────────────────────────────────────────────────────────────

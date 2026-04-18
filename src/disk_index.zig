@@ -211,7 +211,8 @@ pub const DiskIndexBuilder = struct {
         for (self.file_paths.items) |p| {
             try files_file.writeStreamingAll(runtime.io, p);
         }
-        stats.files_bytes = @intCast(blk: { var st: std.c.Stat = undefined; if (std.c.fstat(files_file.handle, &st) != 0) return error.FstatFailed; break :blk @as(u64, @intCast(st.size)); });
+        const files_size = try compat.fs.fileSize(files_file.handle);
+        stats.files_bytes = @intCast(files_size);
         stats.n_files = n_files;
 
         // ── 5. Write frequency table ────────────────────────────────────

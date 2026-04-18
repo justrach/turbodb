@@ -106,7 +106,11 @@ pub const Server = struct {
                 std.log.err("accept: {}", .{e});
                 continue;
             };
-            const t = try std.Thread.spawn(.{}, handleConn, .{self, stream});
+            const t = std.Thread.spawn(.{}, handleConn, .{self, stream}) catch |e| {
+                std.log.err("thread spawn: {} (dropping connection)", .{e});
+                stream.close(runtime.io);
+                continue;
+            };
             t.detach();
         }
     }
@@ -470,9 +474,10 @@ fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []c
         // memcpy dance — the header is always HEADER_LEN bytes.
         var w = std.Io.Writer.fixed(resp[HEADER_LEN..]);
         w.print(
-            "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}",
-            .{ d.header.doc_id, d.key, d.header.version,
-               if (d.value.len > 0) d.value else "{}" }) catch {};
+            "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":",
+            .{ d.header.doc_id, d.key, d.header.version }) catch {};
+        writeJsonValue(&w, d.value);
+        w.writeByte('}') catch {};
         const body_len = w.end;
 
         // Header with zero-padded Content-Length so length is deterministic.
@@ -526,9 +531,10 @@ fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_s
         .{ tenant_id, col_name, result.docs.len }) catch {};
     for (result.docs, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
-        w.print("{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":{s}}}",
-            .{ d.header.doc_id, d.key, d.header.version,
-               if (d.value.len > 0) d.value else "{}" }) catch {};
+        w.print("{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":",
+            .{ d.header.doc_id, d.key, d.header.version }) catch {};
+        writeJsonValue(&w, d.value);
+        w.writeByte('}') catch {};
     }
     w.writeAll("]}") catch {};
     return ok(getBodyBuf()[0..w.end]);
@@ -563,9 +569,10 @@ fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query
         .{ result.docs.len, result.candidate_paths.len, col.docCount(), result.total_files }) catch {};
     for (result.docs, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
-        w.print("{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":{s}}}",
-            .{ d.header.doc_id, d.key,
-               if (d.value.len > 0) d.value else "{}" }) catch {};
+        w.print("{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":",
+            .{ d.header.doc_id, d.key }) catch {};
+        writeJsonValue(&w, d.value);
+        w.writeByte('}') catch {};
     }
     w.writeAll("]}") catch {};
     return ok(getBodyBuf()[0..w.end]);
@@ -759,9 +766,10 @@ fn handleBranchSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8,
     w.print("{{\"branch\":\"{s}\",\"hits\":{d},\"results\":[", .{ branch_name, result.docs.len }) catch {};
     for (result.docs, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
-        w.print("{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":{s}}}",
-            .{ d.header.doc_id, d.key,
-               if (d.value.len > 0) d.value else "{}" }) catch {};
+        w.print("{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":",
+            .{ d.header.doc_id, d.key }) catch {};
+        writeJsonValue(&w, d.value);
+        w.writeByte('}') catch {};
     }
     w.writeAll("]}") catch {};
     return ok(getBodyBuf()[0..w.end]);
@@ -817,8 +825,28 @@ fn resourceStateName(state: activity.ResourceState) []const u8 {
 }
 
 // ─── response helpers ────────────────────────────────────────────────────
-// ─── response helpers ────────────────────────────────────────────────────
 
+/// Write a document value as a JSON value — pass-through for JSON objects/arrays/strings,
+/// quoted + escaped for plain text (with empty → "{}" default).
+fn writeJsonValue(w: *std.Io.Writer, val_in: []const u8) void {
+    const val = if (val_in.len > 0) val_in else "{}";
+    const is_json = val[0] == '{' or val[0] == '[' or val[0] == '"';
+    if (is_json) {
+        w.writeAll(val) catch {};
+        return;
+    }
+    w.writeByte('"') catch {};
+    for (val) |ch| {
+        switch (ch) {
+            '"', '\\' => { w.writeByte('\\') catch {}; w.writeByte(ch) catch {}; },
+            '\n' => w.writeAll("\\n") catch {},
+            '\r' => w.writeAll("\\r") catch {},
+            '\t' => w.writeAll("\\t") catch {},
+            else => w.writeByte(ch) catch {},
+        }
+    }
+    w.writeByte('"') catch {};
+}
 fn ok(body: []const u8) usize {
     return respond(200, "OK", body);
 }

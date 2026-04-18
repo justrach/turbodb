@@ -12,6 +12,7 @@ const doc_mod = @import("doc.zig");
 const crypto = @import("crypto.zig");
 const vector = @import("vector.zig");
 const compat = @import("compat");
+const runtime = @import("runtime");
 const Database = collection.Database;
 const Collection = collection.Collection;
 const Doc = doc_mod.Doc;
@@ -69,6 +70,10 @@ pub const TurboScanHandle = extern struct {
 /// Open a database at the given directory.
 /// Returns an opaque handle, or null on failure.
 export fn turbodb_open(dir: [*]const u8, dir_len: usize) ?*anyopaque {
+    // FFI consumers don't go through std.process.Init; bootstrap runtime.io
+    // before any compat/Io call. Idempotent, so cheap to call per-open.
+    runtime.init(alloc);
+
     // Ensure data directory exists.
     const dir_slice = dir[0..dir_len];
     compat.fs.cwdMakeDir(dir_slice) catch |e| switch (e) {

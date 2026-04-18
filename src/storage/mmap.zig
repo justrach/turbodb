@@ -29,15 +29,14 @@ pub const MmapFile = struct {
         const fd = try posix.openatZ(posix.AT.FDCWD, path, flags, 0o644);
         errdefer _ = std.c.close(fd);
 
-        var stat_buf: std.c.Stat = undefined;
-        if (std.c.fstat(fd, &stat_buf) != 0) return error.FstatFailed;
-        const existing: usize = @intCast(stat_buf.size);
+        const file_size = try @import("compat").fs.fileSize(fd);
+        const existing: usize = @intCast(file_size);
         const capacity = alignUp(
             @max(existing, @max(initial_size, GROW_CHUNK)),
             PAGE_SIZE,
         );
 
-        if (@as(usize, @intCast(stat_buf.size)) < capacity)
+        if (file_size < capacity)
             if (std.c.ftruncate(fd, @intCast(capacity)) != 0) return error.FtruncateFailed;
 
         const ptr = try posix.mmap(

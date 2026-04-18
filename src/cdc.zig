@@ -139,7 +139,7 @@ pub const Delivery = struct {
 pub const CDCManager = struct {
     allocator: std.mem.Allocator,
     subscriptions: std.ArrayList(Subscription),
-    pending: Ring(Event, 1024),
+    pending: std.ArrayList(Event),
     deliveries: Ring(Delivery, 512),
     next_subscription_id: std.atomic.Value(u64),
     next_seq: std.atomic.Value(u64),
@@ -152,7 +152,7 @@ pub const CDCManager = struct {
         return .{
             .allocator = allocator,
             .subscriptions = .empty,
-            .pending = .{},
+            .pending = .empty,
             .deliveries = .{},
             .next_subscription_id = std.atomic.Value(u64).init(1),
             .next_seq = std.atomic.Value(u64).init(1),
@@ -166,6 +166,7 @@ pub const CDCManager = struct {
     pub fn deinit(self: *CDCManager) void {
         self.stop();
         self.subscriptions.deinit(self.allocator);
+        self.pending.deinit(self.allocator);
     }
 
     pub fn start(self: *CDCManager) !void {
@@ -205,10 +206,9 @@ pub const CDCManager = struct {
         fill(&ev.collection, &ev.collection_len, collection);
         fill(&ev.key, &ev.key_len, key);
         fillU16(&ev.value, &ev.value_len, value);
-
         self.mu.lockUncancelable(runtime.io);
         defer self.mu.unlock(runtime.io);
-        self.pending.push(ev);
+        self.pending.append(self.allocator, ev) catch return;
         self.cond.signal(runtime.io);
     }
 
@@ -234,14 +234,14 @@ pub const CDCManager = struct {
     fn workerMain(self: *CDCManager) void {
         while (true) {
             self.mu.lockUncancelable(runtime.io);
-            while (self.pending.len == 0 and self.running.load(.acquire)) {
+            while (self.pending.items.len == 0 and self.running.load(.acquire)) {
                 self.cond.waitUncancelable(runtime.io, &self.mu);
             }
-            if (self.pending.len == 0 and !self.running.load(.acquire)) {
+            if (self.pending.items.len == 0 and !self.running.load(.acquire)) {
                 self.mu.unlock(runtime.io);
                 return;
             }
-            const ev = self.pending.popFront() orelse unreachable;
+            const ev = self.pending.orderedRemove(0);
             const subs = self.subscriptions.items;
             self.mu.unlock(runtime.io);
 
