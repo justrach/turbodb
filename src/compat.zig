@@ -200,11 +200,19 @@ pub fn nanoTimestamp() i128 {
 // keeps the old semantics bit-for-bit.
 
 pub fn threadSleep(nanoseconds: u64) void {
-    const ts = std.c.timespec{
+    var remaining = std.c.timespec{
         .sec = @intCast(nanoseconds / std.time.ns_per_s),
         .nsec = @intCast(nanoseconds % std.time.ns_per_s),
     };
-    _ = std.c.nanosleep(&ts, null);
+    // Loop across EINTR so signal delivery doesn't collapse the sleep —
+    // WAL and background workers rely on the full duration for backoff.
+    while (true) {
+        var rem: std.c.timespec = undefined;
+        const rc = std.c.nanosleep(&remaining, &rem);
+        if (rc == 0) return;
+        if (std.posix.errno(rc) != .INTR) return;
+        remaining = rem;
+    }
 }
 
 // ─── Random ───────────────────────────────────────────────────────────────
