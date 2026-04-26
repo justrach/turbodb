@@ -85,6 +85,22 @@ pub const fs = struct {
         return Dir.cwd().realPathFileAlloc(runtime.io, sub_path, gpa);
     }
 
+    /// Canonicalize `sub_path` relative to `dir`. Replacement for the
+    /// removed-in-0.16 `Dir.realpathAlloc`. Used heavily by tmpDir-based tests.
+    pub fn dirRealpathAlloc(dir: Dir, gpa: std.mem.Allocator, sub_path: []const u8) ![:0]u8 {
+        return dir.realPathFileAlloc(runtime.io, sub_path, gpa);
+    }
+
+    /// Replacement for the removed-in-0.16 `std.fs.createFileAbsolute`.
+    /// Opens the parent dir, then creates the file relative to it.
+    pub fn createFileAbsolute(absolute_path: []const u8, flags: Dir.CreateFileOptions) !File {
+        const dir_path = std.fs.path.dirname(absolute_path) orelse "/";
+        const file_name = std.fs.path.basename(absolute_path);
+        var dir = try Dir.openDirAbsolute(runtime.io, dir_path, .{});
+        defer dir.close(runtime.io);
+        return dir.createFile(runtime.io, file_name, flags);
+    }
+
     // Dir / File method wrappers that inject runtime.io (saves threading it
     // through bench and profile call sites).
     pub fn dirClose(dir: Dir) void {

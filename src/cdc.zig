@@ -1,6 +1,7 @@
 const std = @import("std");
 const crypto = @import("crypto.zig");
 const runtime = @import("runtime");
+const compat = @import("compat");
 
 pub const Op = enum(u8) {
     insert,
@@ -309,7 +310,7 @@ test "cdc filters by tenant and collection and signs payload" {
     cdc.emit("tenant-a", "users", "u1", "{\"name\":\"alice\"}", 1, .insert);
     cdc.emit("tenant-a", "orders", "o1", "{\"id\":1}", 2, .insert);
     cdc.emit("tenant-b", "users", "u2", "{\"name\":\"bob\"}", 3, .update);
-    std.Thread.sleep(20_000_000);
+    compat.threadSleep(20_000_000);
 
     const a = try cdc.listDeliveries(alloc, "tenant-a");
     defer alloc.free(a);
@@ -334,7 +335,7 @@ test "cdc preserves event order under queueing" {
     cdc.emit("tenant-a", "users", "u1", "{\"v\":1}", 1, .insert);
     cdc.emit("tenant-a", "users", "u1", "{\"v\":2}", 1, .update);
     cdc.emit("tenant-a", "users", "u1", "", 1, .delete);
-    std.Thread.sleep(20_000_000);
+    compat.threadSleep(20_000_000);
 
     const deliveries = try cdc.listDeliveries(alloc, "tenant-a");
     defer alloc.free(deliveries);

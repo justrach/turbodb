@@ -145,7 +145,9 @@ const KqueueBackend = struct {
     const PendingClose = struct { fd: posix.fd_t, user_data: usize };
 
     fn init(alloc: Allocator) !KqueueBackend {
-        const kq = try posix.kqueue();
+        const kq_rc = std.c.kqueue();
+        if (kq_rc < 0) return error.KqueueFailed;
+        const kq: posix.fd_t = @intCast(kq_rc);
         return .{
             .kq = kq,
             .alloc = alloc,
@@ -156,7 +158,7 @@ const KqueueBackend = struct {
     }
 
     fn deinit(self: *KqueueBackend) void {
-        posix.close(self.kq);
+        _ = std.c.close(self.kq);
         self.changelist.deinit(self.alloc);
         self.pending_accepts.deinit(self.alloc);
         self.pending_closes.deinit(self.alloc);
@@ -217,7 +219,7 @@ const KqueueBackend = struct {
         var count: usize = 0;
 
         for (self.pending_closes.items) |pc| {
-            posix.close(pc.fd);
+            _ = std.c.close(pc.fd);
             if (count < completions.len) {
                 completions[count] = .{
                     .fd = pc.fd,
@@ -484,7 +486,7 @@ pub const EventLoop = struct {
         // Wake all workers so they can observe running=false and exit.
         runtime.io.futexWake(u32, &self.wake_signal.raw, @intCast(self.worker_count));
         if (self.listen_fd >= 0) {
-            posix.close(self.listen_fd);
+            _ = std.c.close(self.listen_fd);
         }
         self.engine.deinit();
         self.pool.deinit();
@@ -494,15 +496,23 @@ pub const EventLoop = struct {
 
     /// Bind and listen on the given TCP port.
     pub fn bind(self: *EventLoop, port: u16) !void {
-        const addr = try std.net.Address.resolveIp("0.0.0.0", port);
+        // Construct sockaddr_in for 0.0.0.0:port directly — std.net is gone in 0.16
+        // and std.Io.net.IpAddress doesn't expose a sockaddr conversion that pairs
+        // with the posix.bind() API we're already using here.
         const flags: u32 = posix.SOCK.STREAM | posix.SOCK.NONBLOCK | posix.SOCK.CLOEXEC;
-        const fd = try posix.socket(addr.any.family, flags, posix.IPPROTO.TCP);
-        errdefer posix.close(fd);
+        const fd = try posix.socket(posix.AF.INET, flags, posix.IPPROTO.TCP);
+        errdefer _ = std.c.close(fd);
 
         // SO_REUSEADDR for fast restart.
         posix.setsockopt(fd, posix.SOL.SOCKET, posix.SO.REUSEADDR, &std.mem.toBytes(@as(c_int, 1))) catch {};
 
-        try posix.bind(fd, &addr.any, addr.getOsSockLen());
+        var addr: posix.sockaddr.in = .{
+            .family = posix.AF.INET,
+            .port = std.mem.nativeToBig(u16, port),
+            .addr = 0, // INADDR_ANY (0.0.0.0)
+            .zero = .{0} ** 8,
+        };
+        try posix.bind(fd, @ptrCast(&addr), @sizeOf(@TypeOf(addr)));
         try posix.listen(fd, 128);
         self.listen_fd = fd;
     }
@@ -558,7 +568,7 @@ pub const EventLoop = struct {
 
         const idx = self.pool.acquire() orelse {
             // Pool exhausted — reject.
-            posix.close(comp.fd);
+            _ = std.c.close(comp.fd);
             return;
         };
 
@@ -568,7 +578,7 @@ pub const EventLoop = struct {
         // Submit a read on the new connection.
         self.engine.submitRead(comp.fd, &self.pool.conns[idx].read_buf, idx) catch {
             self.pool.release(idx);
-            posix.close(comp.fd);
+            _ = std.c.close(comp.fd);
         };
     }
 
@@ -580,7 +590,7 @@ pub const EventLoop = struct {
             // EOF or error — close.
             conn.state = .closing;
             self.engine.submitClose(conn.fd, comp.user_data) catch {
-                posix.close(conn.fd);
+                _ = std.c.close(conn.fd);
                 self.pool.release(comp.user_data);
             };
             return;

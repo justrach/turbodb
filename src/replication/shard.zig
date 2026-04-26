@@ -147,7 +147,7 @@ pub const ShardManager = struct {
             .ring = HashRing.init(alloc),
             .local_node_id = local_node_id,
             .alloc = alloc,
-            .mu = .{},
+            .mu = .init,
             .migrations = .empty,
         };
     }

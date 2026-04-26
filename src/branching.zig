@@ -130,7 +130,7 @@ pub const BranchedDatabase = struct {
             else => return e,
         };
 
-        var file = try std.fs.createFileAbsolute(manifest_path, .{ .truncate = true });
+        var file = try compat.fs.createFileAbsolute(manifest_path, .{ .truncate = true });
         defer file.close();
         try file.writeAll(base_data_dir);
 

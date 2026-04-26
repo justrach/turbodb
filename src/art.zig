@@ -1107,7 +1107,7 @@ test "ART: concurrent insert and search" {
 
     // Serialize all writes with a mutex. ART's optimistic lock coupling
     // provides safe concurrent reads alongside a single writer.
-    var write_mu = std.Io.Mutex{};
+    var write_mu: std.Io.Mutex = .init;
 
     // Pre-insert keys under mutex (single-threaded here, but same pattern)
     for (0..keys_per_thread) |i| {

@@ -15,7 +15,9 @@ const activity = @import("activity.zig");
 const auth = @import("auth.zig");
 const collection = @import("collection.zig");
 const compat = @import("compat");
+const doc_mod = @import("doc.zig");
 const runtime = @import("runtime");
+const qe = @import("query_engine.zig");
 const Database = collection.Database;
 
 const MAX_REQ  = 65536;  // 64 KiB (initial read)
@@ -376,9 +378,18 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
             const col_name = rest[0..sep];
             const key = rest[sep + 1 ..];
             const tenant_id = requestTenant(raw, query);
-            // POST /db/:col/bulk — bulk insert
+            // POST /db/:col/bulk — bulk insert (best-effort, non-atomic)
             if (std.mem.eql(u8, key, "bulk") and std.mem.eql(u8, method, "POST"))
                 return handleBulkInsert(srv, tenant_id, col_name, body, alloc);
+            // POST /db/:col/txn — atomic batch (all-or-nothing)
+            if (std.mem.eql(u8, key, "txn") and std.mem.eql(u8, method, "POST"))
+                return handleTxn(srv, tenant_id, col_name, body, alloc);
+            // PUT /db/:col/_schema — set/replace collection schema
+            if (std.mem.eql(u8, key, "_schema") and std.mem.eql(u8, method, "PUT"))
+                return handleSetSchema(srv, tenant_id, col_name, body);
+            // GET /db/:col/_schema — get current schema (or null)
+            if (std.mem.eql(u8, key, "_schema") and std.mem.eql(u8, method, "GET"))
+                return handleGetSchema(srv, tenant_id, col_name);
             if (std.mem.eql(u8, method, "GET"))    return handleGet(srv, tenant_id, col_name, key, requestAsOf(raw, query));
             if (std.mem.eql(u8, method, "PUT"))    return handleUpdate(srv, tenant_id, col_name, key, body, alloc);
             if (std.mem.eql(u8, method, "DELETE")) return handleDelete(srv, tenant_id, col_name, key);
@@ -399,23 +410,58 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
 
 fn handleInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
     _ = alloc;
-    // Expect body: {"key":"...","value":{...}}  OR  use auto-generated key.
-    // Extract the value field; fall back to the full body for backwards compat.
+    // Body shape options (precedence high → low):
+    //   1. {"_id": "...", ...rest...}      — caller-supplied PK; whole body is the value
+    //   2. {"key": "...", "value": {...}}  — legacy explicit envelope
+    //   3. {...}                            — auto-generate key, body is the value
+    //
+    // When the caller supplies `_id`, we route through col.insertUnique so a
+    // duplicate id maps to HTTP 409 instead of silently shadowing the prior doc.
+    if (jsonStr(body, "_id")) |id| {
+        return doInsertUnique(srv, tenant_id, col_name, id, body);
+    }
     const value = jsonValue(body, "value") orelse body;
-    const key_raw = jsonStr(body, "key") orelse {
-        // Auto-generate key from timestamp + counter.
-        var kb: [32]u8 = undefined;
-        const k = std.fmt.bufPrint(&kb, "doc_{d}", .{compat.milliTimestamp()}) catch
-            return err(400, "bad key");
+    if (jsonStr(body, "key")) |k| {
         return doInsert(srv, tenant_id, col_name, k, value);
+    }
+    // Auto-generate from a process-wide counter combined with millisecond
+    // timestamp — pure timestamp collides under concurrent inserts within
+    // the same millisecond.
+    const seq = global_doc_seq.fetchAdd(1, .monotonic);
+    var kb: [40]u8 = undefined;
+    const k = std.fmt.bufPrint(&kb, "doc_{d}_{d}", .{ compat.milliTimestamp(), seq }) catch
+        return err(400, "bad key");
+    return doInsert(srv, tenant_id, col_name, k, value);
+}
+
+/// Process-wide auto-generated-key sequence. Together with the wall-clock
+/// millisecond, guarantees uniqueness for non-`_id` POSTs even under
+/// concurrent load (same-ms races no longer collide).
+var global_doc_seq: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+fn doInsertUnique(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, value: []const u8) usize {
+    const start_ns = compat.nanoTimestamp();
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    srv.db.ensureTenantStorageAvailable(tenant_id, value.len) catch return err(429, "tenant storage quota exceeded");
+    if (validateSchema(srv, tenant_id, col_name, value)) |msg| return err(400, msg);
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+    const doc_id = col.insertUnique(key, value) catch |e| switch (e) {
+        error.AlreadyExists => return err(409, "duplicate _id"),
+        else => return err(500, "insert failed"),
     };
-    return doInsert(srv, tenant_id, col_name, key_raw, value);
+    srv.recordQueryCost(tenant_id, "insert", 1, value.len, start_ns);
+    var w = std.Io.Writer.fixed(getBodyBuf());
+    w.print(
+        "{{\"doc_id\":{d},\"key\":\"{s}\",\"collection\":\"{s}\",\"tenant\":\"{s}\"}}",
+        .{ doc_id, key, col_name, tenant_id }) catch {};
+    return ok(getBodyBuf()[0..w.end]);
 }
 
 fn doInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, value: []const u8) usize {
     const start_ns = compat.nanoTimestamp();
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     srv.db.ensureTenantStorageAvailable(tenant_id, value.len) catch return err(429, "tenant storage quota exceeded");
+    if (validateSchema(srv, tenant_id, col_name, value)) |msg| return err(400, msg);
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
     const doc_id = col.insert(key, value) catch return err(500, "insert failed");
     srv.recordQueryCost(tenant_id, "insert", 1, value.len, start_ns);
@@ -424,6 +470,74 @@ fn doInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []co
         "{{\"doc_id\":{d},\"key\":\"{s}\",\"collection\":\"{s}\",\"tenant\":\"{s}\"}}",
         .{ doc_id, key, col_name, tenant_id }) catch {};
     return ok(getBodyBuf()[0..w.end]);
+}
+
+/// Validate a JSON value against the (optional) per-collection schema stored
+/// in the `_schemas` meta-collection. Returns null if the value passes (or no
+/// schema is configured); else a static error message describing the violation.
+///
+/// Schema body: {"field":"type", ...} where type ∈ {u64, i64, f64, str, bool,
+/// obj, array}. Type checks are JSON-token shape only — we don't parse
+/// numbers, just look at the leading char (digit vs '-' vs '"' etc).
+///
+/// The `_schemas` collection itself, plus the legacy `_schemas` meta-store,
+/// bypass validation so we don't recurse on schema writes.
+fn validateSchema(srv: *Server, tenant_id: []const u8, col_name: []const u8, value: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, col_name, "_schemas")) return null;
+    const meta_col = srv.db.collectionForTenant(tenant_id, "_schemas") catch return null;
+    var key_buf: [256]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}:{s}", .{ tenant_id, col_name }) catch return null;
+    const schema_doc = meta_col.get(key) orelse return null;
+    return checkSchema(schema_doc.value, value);
+}
+
+/// Walk the schema object's top-level fields and check each is present in
+/// the value with the right JSON-token shape. Static buffer, no allocation.
+fn checkSchema(schema: []const u8, value: []const u8) ?[]const u8 {
+    // Iterate `"field":"type"` pairs in `schema`.
+    var i: usize = 0;
+    while (i < schema.len) : (i += 1) {
+        if (schema[i] != '"') continue;
+        // Parse field name.
+        const fstart = i + 1;
+        var fend = fstart;
+        while (fend < schema.len and schema[fend] != '"') : (fend += 1) {
+            if (schema[fend] == '\\' and fend + 1 < schema.len) fend += 1;
+        }
+        if (fend >= schema.len) return "malformed schema";
+        const field = schema[fstart..fend];
+        i = fend + 1;
+        // Skip ':' and whitespace.
+        while (i < schema.len and (schema[i] == ' ' or schema[i] == '\t' or schema[i] == ':')) i += 1;
+        if (i >= schema.len or schema[i] != '"') continue;
+        // Parse type name.
+        const tstart = i + 1;
+        var tend = tstart;
+        while (tend < schema.len and schema[tend] != '"') : (tend += 1) {}
+        if (tend >= schema.len) return "malformed schema";
+        const ty = schema[tstart..tend];
+        i = tend;
+
+        const got = qe.jsonExtract(value, field) orelse return "missing required field";
+        // Token-shape check based on first byte of `got`.
+        const c0 = got[0];
+        const ok_shape: bool = if (std.mem.eql(u8, ty, "u64") or std.mem.eql(u8, ty, "i64") or std.mem.eql(u8, ty, "f64"))
+            (c0 == '-' or (c0 >= '0' and c0 <= '9'))
+        else if (std.mem.eql(u8, ty, "str"))
+            (c0 == '"')
+        else if (std.mem.eql(u8, ty, "bool"))
+            (got.len >= 4 and (std.mem.eql(u8, got[0..4], "true") or (got.len >= 5 and std.mem.eql(u8, got[0..5], "false"))))
+        else if (std.mem.eql(u8, ty, "obj"))
+            (c0 == '{')
+        else if (std.mem.eql(u8, ty, "array"))
+            (c0 == '[')
+        else
+            true; // unknown type — don't reject
+        if (!ok_shape) return "field type mismatch";
+        // u64 specifically forbids the leading '-'.
+        if (std.mem.eql(u8, ty, "u64") and c0 == '-') return "u64 field has negative value";
+    }
+    return null;
 }
 
 /// POST /db/:col/bulk — insert multiple documents in one request.
@@ -480,26 +594,22 @@ fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []c
             (col.get(key) orelse return err(404, "not found"));
         srv.recordQueryCost(tenant_id, "get", 1, d.key.len + d.value.len, start_ns);
 
-        // Fixed-length header = 103 bytes ("Content-Length" padded to 10 digits).
         const HEADER_LEN = 103;
         var resp = getRespBuf();
 
-        // Write body directly after the header region. No reserved-prefix
-        // memcpy dance — the header is always HEADER_LEN bytes.
         var w = std.Io.Writer.fixed(resp[HEADER_LEN..]);
+        const ts = col.getTs(d.header.doc_id);
         w.print(
-            "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":",
-            .{ d.header.doc_id, d.key, d.header.version }) catch {};
+            "{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"ts\":{d},\"value\":",
+            .{ d.header.doc_id, d.key, d.header.version, ts }) catch {};
         writeJsonValue(&w, d.value);
         w.writeByte('}') catch {};
         const body_len = w.end;
 
-        // Header with zero-padded Content-Length so length is deterministic.
         var hdr_w = std.Io.Writer.fixed(resp[0..HEADER_LEN]);
         hdr_w.print(
             "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d:0>10}\r\nConnection: keep-alive\r\n\r\n",
             .{body_len}) catch {};
-        // hdr_w.end == HEADER_LEN by construction.
         return HEADER_LEN + body_len;
     }
 
@@ -508,6 +618,7 @@ fn handleUpdate(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: 
     _ = alloc;
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     srv.db.ensureTenantStorageAvailable(tenant_id, body.len) catch return err(429, "tenant storage quota exceeded");
+    if (validateSchema(srv, tenant_id, col_name, body)) |msg| return err(400, msg);
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
     const updated = col.update(key, body) catch return err(500, "update failed");
     if (!updated) return err(404, "not found");
@@ -531,27 +642,218 @@ fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_s
     const offset: u32 = qparamInt(query_str, "offset") orelse 0;
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
-    const result = if (as_of) |ts_ms|
-        col.scanAsOfTimestamp(ts_ms, limit, offset, alloc) catch return err(500, "scan failed")
+
+    const spec = qe.Spec.parse(query_str);
+    // If WHERE/ORDER active, fetch a wider window so post-filter can satisfy
+    // limit. Capped at 10x to keep memory bounded.
+    const fetch_n: u32 = if (spec.where_field != null or spec.order_field != null)
+        @min(limit *| 10, 10000)
     else
-        col.scan(limit, offset, alloc) catch return err(500, "scan failed");
+        limit;
+
+    const result = if (as_of) |ts_ms|
+        col.scanAsOfTimestamp(ts_ms, fetch_n, offset, alloc) catch return err(500, "scan failed")
+    else
+        col.scan(fetch_n, offset, alloc) catch return err(500, "scan failed");
     defer result.deinit();
     var bytes_read: u64 = 0;
     for (result.docs) |d| bytes_read += d.key.len + d.value.len;
-    srv.recordQueryCost(tenant_id, "scan", result.docs.len, bytes_read, start_ns);
+
+    // Build an indirection slice we can filter and sort cheaply without
+    // touching the underlying Doc storage.
+    var idxs = alloc.alloc(u32, result.docs.len) catch return err(500, "scan failed");
+    defer alloc.free(idxs);
+    var idx_count: u32 = 0;
+    for (result.docs, 0..) |d, i| {
+        if (qe.passesWhere(d.value, spec)) {
+            idxs[idx_count] = @intCast(i);
+            idx_count += 1;
+        }
+    }
+
+    // ORDER BY: pull the field out of each surviving doc, then sort by it.
+    if (spec.order_field) |of| {
+        const Ctx = struct {
+            docs: []const doc_mod.Doc,
+            field: []const u8,
+            desc: bool,
+            pub fn lessThan(self: @This(), a: u32, b: u32) bool {
+                const av = qe.jsonExtract(self.docs[a].value, self.field) orelse "";
+                const bv = qe.jsonExtract(self.docs[b].value, self.field) orelse "";
+                const ord = qe.compareValues(qe.stripQuotes(av), qe.stripQuotes(bv));
+                return if (self.desc) ord == .gt else ord == .lt;
+            }
+        };
+        std.sort.pdq(u32, idxs[0..idx_count], Ctx{
+            .docs = result.docs, .field = of, .desc = spec.order_desc,
+        }, Ctx.lessThan);
+    }
+
+    if (idx_count > limit) idx_count = limit;
+    srv.recordQueryCost(tenant_id, "scan", idx_count, bytes_read, start_ns);
 
     var w = std.Io.Writer.fixed(getBodyBuf());
     w.print("{{\"tenant\":\"{s}\",\"collection\":\"{s}\",\"count\":{d},\"docs\":[",
-        .{ tenant_id, col_name, result.docs.len }) catch {};
-    for (result.docs, 0..) |d, i| {
+        .{ tenant_id, col_name, idx_count }) catch {};
+    for (idxs[0..idx_count], 0..) |di, i| {
+        const d = result.docs[di];
         if (i > 0) w.writeByte(',') catch {};
-        w.print("{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"value\":",
-            .{ d.header.doc_id, d.key, d.header.version }) catch {};
-        writeJsonValue(&w, d.value);
+        const ts = col.getTs(d.header.doc_id);
+        w.print("{{\"doc_id\":{d},\"key\":\"{s}\",\"version\":{d},\"ts\":{d},\"value\":",
+            .{ d.header.doc_id, d.key, d.header.version, ts }) catch {};
+        qe.writeProjected(&w, d.value, spec.select);
+        // JOIN: for each active join, look up `value.field` in the named col,
+        // then inline. We collect all joined writes under a single "joined" key
+        // so the doc shape stays predictable.
+        var any_join = false;
+        for (spec.joins) |maybe_j| {
+            const j = maybe_j orelse continue;
+            if (!any_join) {
+                w.writeAll(",\"joined\":{") catch {};
+                any_join = true;
+            } else {
+                w.writeByte(',') catch {};
+            }
+            writeJoin(&w, srv, tenant_id, j, d.value);
+        }
+        if (any_join) w.writeByte('}') catch {};
         w.writeByte('}') catch {};
     }
     w.writeAll("]}") catch {};
     return ok(getBodyBuf()[0..w.end]);
+}
+
+/// Look up the joined doc and emit `"as": <doc_value>` (or null). The lookup
+/// key is the value of `field` extracted from the parent's JSON value, with
+/// surrounding quotes stripped (so id=42 and id="42" both work).
+fn writeJoin(w: *std.Io.Writer, srv: *Server, tenant_id: []const u8, j: qe.Spec.Join, parent_value: []const u8) void {
+    w.print("\"{s}\":", .{j.as}) catch {};
+    const raw = qe.jsonExtract(parent_value, j.field) orelse {
+        w.writeAll("null") catch {};
+        return;
+    };
+    const key = qe.stripQuotes(raw);
+    const target_col = srv.db.collectionForTenant(tenant_id, j.col) catch {
+        w.writeAll("null") catch {};
+        return;
+    };
+    const joined = target_col.get(key) orelse {
+        w.writeAll("null") catch {};
+        return;
+    };
+    writeJsonValue(w, joined.value);
+}
+
+// ─── Atomic transactions ─────────────────────────────────────────────
+//
+// POST /db/:col/txn body:
+//   {"ops":[
+//     {"op":"insert","key":"...","value":{...}},
+//     {"op":"update","key":"...","value":{...}},
+//     {"op":"upsert","key":"...","value":{...}},
+//     {"op":"delete","key":"..."}
+//   ]}
+//
+// All ops succeed → 200; any validation failure → 400/404/409 with no
+// writes; engine error → 500. The whole batch executes under one set of
+// stripe locks, so concurrent readers never observe a partial txn —
+// matching TigerBeetle's atomic-batch semantics for single-collection ops.
+
+fn handleTxn(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
+    const start_ns = compat.nanoTimestamp();
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+
+    // Stack-allocated op buffer caps the txn at MAX_TXN_OPS — same as the
+    // engine's internal limit, so no surprise rejection later.
+    var ops_buf: [collection.Collection.MAX_TXN_OPS]collection.Collection.TxnOp = undefined;
+    var n_ops: usize = 0;
+
+    // Body is `{"ops": [...]}` — find the array bytes via jsonValue.
+    const ops_array = jsonValue(body, "ops") orelse return err(400, "missing ops array");
+    var pos: usize = 0;
+    // Walk top-level objects within the array. We use jsonValue's
+    // brace-balanced extractor on each `{...}` element.
+    while (pos < ops_array.len) {
+        // Find next '{'
+        while (pos < ops_array.len and ops_array[pos] != '{') pos += 1;
+        if (pos >= ops_array.len) break;
+        // Match braces.
+        var depth: i32 = 0;
+        const start = pos;
+        var in_str = false;
+        while (pos < ops_array.len) : (pos += 1) {
+            const c = ops_array[pos];
+            if (in_str) {
+                if (c == '\\' and pos + 1 < ops_array.len) { pos += 1; continue; }
+                if (c == '"') in_str = false;
+                continue;
+            }
+            if (c == '"') { in_str = true; continue; }
+            if (c == '{') depth += 1;
+            if (c == '}') { depth -= 1; if (depth == 0) { pos += 1; break; } }
+        }
+        const elem = ops_array[start..pos];
+        if (n_ops >= ops_buf.len) return err(400, "too many ops in txn (max 32)");
+
+        const op_str = jsonStr(elem, "op") orelse return err(400, "missing op field");
+        const key = jsonStr(elem, "key") orelse return err(400, "missing key field");
+        const kind: collection.Collection.TxnOpKind = if (std.mem.eql(u8, op_str, "insert")) .insert
+            else if (std.mem.eql(u8, op_str, "update")) .update
+            else if (std.mem.eql(u8, op_str, "upsert")) .upsert
+            else if (std.mem.eql(u8, op_str, "delete")) .delete
+            else return err(400, "bad op kind (insert|update|upsert|delete)");
+        const val = if (kind == .delete) "" else (jsonValue(elem, "value") orelse return err(400, "missing value"));
+
+        ops_buf[n_ops] = .{ .kind = kind, .key = key, .value = val };
+        n_ops += 1;
+    }
+
+    col.applyTxn(ops_buf[0..n_ops]) catch |e| switch (e) {
+        error.AlreadyExists => return err(409, "duplicate key in txn"),
+        error.NotFound => return err(404, "missing key in txn"),
+        error.TxnTooLarge => return err(400, "txn too large"),
+        else => return err(500, "txn failed"),
+    };
+
+    srv.recordQueryCost(tenant_id, "txn", @intCast(n_ops), body.len, start_ns);
+    var w = std.Io.Writer.fixed(getBodyBuf());
+    w.print("{{\"applied\":{d},\"collection\":\"{s}\",\"tenant\":\"{s}\"}}",
+        .{ n_ops, col_name, tenant_id }) catch {};
+    _ = alloc;
+    return ok(getBodyBuf()[0..w.end]);
+}
+
+// ─── Schema (optional per-collection validation) ─────────────────────
+//
+// PUT /db/:col/_schema body: {"field1":"u64","field2":"str", ...}
+// Types: u64, i64, f64, str, bool, obj, array. Each field is required
+// in subsequent inserts/updates; presence is checked, not type-strict
+// (turbodb stays schemaless-by-default — opt-in validation).
+//
+// Schemas live in a dedicated `_schemas` collection keyed by
+// `<tenant>:<collection>` so they survive restart via the normal WAL
+// replay path and don't require new persistence machinery.
+
+fn handleSetSchema(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8) usize {
+    const meta_col = srv.db.collectionForTenant(tenant_id, "_schemas") catch return err(500, "schema store unavailable");
+    var key_buf: [256]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}:{s}", .{ tenant_id, col_name }) catch return err(400, "name too long");
+    // Upsert: if exists, update; else insert.
+    if (meta_col.get(key) != null) {
+        _ = meta_col.update(key, body) catch return err(500, "schema write failed");
+    } else {
+        _ = meta_col.insert(key, body) catch return err(500, "schema write failed");
+    }
+    return ok("{\"ok\":true}");
+}
+
+fn handleGetSchema(srv: *Server, tenant_id: []const u8, col_name: []const u8) usize {
+    const meta_col = srv.db.collectionForTenant(tenant_id, "_schemas") catch return ok("null");
+    var key_buf: [256]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "{s}:{s}", .{ tenant_id, col_name }) catch return err(400, "name too long");
+    const d = meta_col.get(key) orelse return ok("null");
+    return ok(d.value);
 }
 
 fn handleDrop(srv: *Server, tenant_id: []const u8, col_name: []const u8) usize {

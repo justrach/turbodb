@@ -753,7 +753,7 @@ test "SSTable create and read back" {
     // Use a tmp directory.
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = tmp_dir.dir.realpathAlloc(std.testing.allocator, ".") catch unreachable;
+    const tmp_path = compat.fs.dirRealpathAlloc(tmp_dir.dir, std.testing.allocator, ".") catch unreachable;
     defer std.testing.allocator.free(tmp_path);
 
     // Create sorted entries.
@@ -782,7 +782,7 @@ test "SSTable create and read back" {
 test "LSMTree put/get across memtable and SSTable" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = tmp_dir.dir.realpathAlloc(std.testing.allocator, ".") catch unreachable;
+    const tmp_path = compat.fs.dirRealpathAlloc(tmp_dir.dir, std.testing.allocator, ".") catch unreachable;
     defer std.testing.allocator.free(tmp_path);
 
     var lsm = try LSMTree.init(std.testing.allocator, tmp_path);
@@ -815,7 +815,7 @@ test "LSMTree put/get across memtable and SSTable" {
 test "LSMTree flush" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = tmp_dir.dir.realpathAlloc(std.testing.allocator, ".") catch unreachable;
+    const tmp_path = compat.fs.dirRealpathAlloc(tmp_dir.dir, std.testing.allocator, ".") catch unreachable;
     defer std.testing.allocator.free(tmp_path);
 
     var lsm = try LSMTree.init(std.testing.allocator, tmp_path);
@@ -835,7 +835,7 @@ test "LSMTree flush" {
 test "Tombstone handling" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = tmp_dir.dir.realpathAlloc(std.testing.allocator, ".") catch unreachable;
+    const tmp_path = compat.fs.dirRealpathAlloc(tmp_dir.dir, std.testing.allocator, ".") catch unreachable;
     defer std.testing.allocator.free(tmp_path);
 
     var lsm = try LSMTree.init(std.testing.allocator, tmp_path);

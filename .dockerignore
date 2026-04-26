@@ -1,0 +1,10 @@
+.git
+.zig-cache
+turbodb_data
+research
+optimizations
+benchmark
+codedb.snapshot
+*.log
+zig-out/lib
+zig-out/include

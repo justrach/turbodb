@@ -278,7 +278,7 @@ test "WALSegment single-threaded append and read" {
     // Use a temp directory.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
+    const tmp_path = try compat.fs.dirRealpathAlloc(tmp.dir, alloc, ".");
     defer alloc.free(tmp_path);
 
     var seg = try WALSegment.init(alloc, tmp_path, 0);
@@ -305,7 +305,7 @@ test "ParallelWAL multi-threaded writes" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
+    const tmp_path = try compat.fs.dirRealpathAlloc(tmp.dir, alloc, ".");
     defer alloc.free(tmp_path);
 
     const n_segments: u32 = 4;
@@ -355,7 +355,7 @@ test "ParallelWAL group commit advances epoch" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
+    const tmp_path = try compat.fs.dirRealpathAlloc(tmp.dir, alloc, ".");
     defer alloc.free(tmp_path);
 
     var wal = try ParallelWAL.init(alloc, tmp_path, 2);
@@ -377,7 +377,7 @@ test "ParallelWAL background flusher runs" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
+    const tmp_path = try compat.fs.dirRealpathAlloc(tmp.dir, alloc, ".");
     defer alloc.free(tmp_path);
 
     var wal = try ParallelWAL.init(alloc, tmp_path, 2);

@@ -217,6 +217,26 @@ fn extractJsonFloatArray(json: []const u8, field_name: []const u8, out: []f32) ?
     }
     return count;
 }
+/// Process-wide monotonic timestamp counter — bumped once per insert, update,
+/// or delete across all collections. Surfaced in HTTP responses as `"ts"`,
+/// giving callers a global ordering primitive analogous to TigerBeetle's
+/// nanosecond timestamp. Initialized lazily from wall-clock so values
+/// reasonably approximate real time.
+var engine_ts: std.atomic.Value(u64) = std.atomic.Value(u64).init(0);
+
+pub fn nextEngineTs() u64 {
+    var prev = engine_ts.load(.monotonic);
+    while (true) {
+        const wall: u64 = @intCast(@max(0, compat.nanoTimestamp()));
+        const next = if (wall > prev + 1) wall else prev + 1;
+        if (engine_ts.cmpxchgWeak(prev, next, .monotonic, .monotonic)) |observed| {
+            prev = observed;
+            continue;
+        }
+        return next;
+    }
+}
+
 // ─── Collection ──────────────────────────────────────────────────────────
 pub const Collection = struct {
     pub const STRIPE_COUNT = 1024;
@@ -240,6 +260,13 @@ pub const Collection = struct {
     /// Per-key monotonic doc_id — serves both as the live key→doc_id index and
     /// as the modification epoch for branch conflict detection.
     key_doc_ids: std.AutoHashMap(u64, u64),
+    /// Engine timestamp per doc_id. Persists in memory only; rebuilt on
+    /// startup from doc_id ordering. Surfaced to HTTP responses as `"ts"`.
+    ts_by_doc_id: std.AutoHashMap(u64, u64),
+    /// Guards `hash_idx`, `key_doc_ids`, `ts_by_doc_id` — these are shared
+    /// maps mutated from any stripe, so per-key stripe locks are insufficient.
+    /// A single mutex is fine: the protected ops are O(1) HashMap calls.
+    idx_mu: std.Io.Mutex,
     alloc: std.mem.Allocator,
     cache: hot_cache.HotCache,
     // MVCC version chain — append-only, vacuumed periodically via gc_counter.
@@ -301,6 +328,8 @@ pub const Collection = struct {
         }
         col.hash_idx = std.AutoHashMap(u64, BTreeEntry).init(alloc);
         col.key_doc_ids = std.AutoHashMap(u64, u64).init(alloc);
+        col.ts_by_doc_id = std.AutoHashMap(u64, u64).init(alloc);
+        col.idx_mu = .init;
         col.alloc = alloc;
         col.cache = hot_cache.HotCache.init();
         col.versions = mvcc_mod.VersionChain.init(alloc);
@@ -350,6 +379,7 @@ pub const Collection = struct {
         self.words.deinit();
         self.hash_idx.deinit();
         self.key_doc_ids.deinit();
+        self.ts_by_doc_id.deinit();
         self.versions.deinit(self.alloc);
         if (self.vectors) |vc| {
             vc.deinit(self.alloc);
@@ -419,17 +449,44 @@ pub const Collection = struct {
 
     /// Insert a new document. Returns assigned doc_id.
     /// Uses per-key stripe lock for fine-grained concurrency.
+    /// If `unique` is true and the key already exists, returns error.AlreadyExists
+    /// without mutating storage — the basis for HTTP 409 semantics.
     pub fn insert(self: *Collection, key: []const u8, value: []const u8) !u64 {
+        return self.insertImpl(key, value, false);
+    }
+
+    /// Insert that fails with `error.AlreadyExists` on duplicate key.
+    /// Used by the HTTP layer when the caller supplied an explicit `_id`,
+    /// so retries are idempotent and duplicate posts don't silently shadow.
+    pub fn insertUnique(self: *Collection, key: []const u8, value: []const u8) !u64 {
+        return self.insertImpl(key, value, true);
+    }
+
+    fn insertImpl(self: *Collection, key: []const u8, value: []const u8, unique: bool) !u64 {
         const key_hash = doc_mod.fnv1a(key);
         const stripe = stripeIndex(key_hash);
         self.stripe_locks[stripe].lockUncancelable(runtime.io);
         defer self.stripe_locks[stripe].unlock(runtime.io);
+        return self.insertLocked(key, value, unique);
+    }
+
+    /// Insert assuming the caller already holds the stripe lock for `key`.
+    /// Used by `applyTxn` so multiple ops can run under one set of locks.
+    fn insertLocked(self: *Collection, key: []const u8, value: []const u8, unique: bool) !u64 {
+        const key_hash = doc_mod.fnv1a(key);
+
+        if (unique) {
+            self.idx_mu.lockUncancelable(runtime.io);
+            const exists = self.hash_idx.contains(key_hash);
+            self.idx_mu.unlock(runtime.io);
+            if (exists) return error.AlreadyExists;
+        }
 
         const doc_id = self.next_doc_id.fetchAdd(1, .monotonic);
+        const ts = nextEngineTs();
         const hdr = doc_mod.newHeader(doc_id, key, value);
         const d = Doc{ .header = hdr, .key = key, .value = value };
 
-        // Use stack buffer for small docs, heap for large ones (code files can be 100KB+)
         var enc_buf: [65536]u8 = undefined;
         const total_size = DocHeader.size + key.len + value.len;
         var heap_buf: ?[]u8 = null;
@@ -442,16 +499,13 @@ pub const Collection = struct {
         };
         const enc = try d.encodeBuf(buf);
 
-        // Write to WAL buffer (background flusher will commit periodically).
         const txn = self.wal_log.next_lsn.load(.monotonic);
         _ = try self.wal_log.write(txn, .doc_insert, 0, 0, enc);
 
-        // Find (or allocate) a leaf page with enough space.
         const pno = try self.findOrAllocLeaf(enc.len);
         const page_off = self.pf.leafAppend(pno, enc) orelse
             return error.PageFull;
 
-        // Index the document.
         const entry = BTreeEntry{
             .key_hash = hdr.key_hash,
             .doc_id   = doc_id,
@@ -459,27 +513,24 @@ pub const Collection = struct {
             .page_off = page_off,
         };
         try self.idx.insert(entry);
+        self.idx_mu.lockUncancelable(runtime.io);
         self.hash_idx.put(hdr.key_hash, entry) catch {};
+        self.ts_by_doc_id.put(doc_id, ts) catch {};
+        self.idx_mu.unlock(runtime.io);
 
-        // MVCC: register version in the version chain.
         const epoch = self.epochs.advance();
         self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
-        // key_doc_ids doubles as the per-key modification epoch for branch
-        // conflict detection (doc_id is monotonic across the collection).
+        self.idx_mu.lockUncancelable(runtime.io);
         self.key_doc_ids.put(hdr.key_hash, doc_id) catch {};
+        self.idx_mu.unlock(runtime.io);
 
-        // Async trigram + word indexing — push to background queue, sync fallback if full or no worker.
         if (value.len >= 3) {
             if (self.index_thread == null) {
-                // No background worker — index synchronously to avoid losing data.
                 self.tri.indexFile(key, value) catch {};
                 self.words.indexFile(key, value) catch {};
             } else {
-                // Queue's push() now owns storage internally — inline for small
-                // docs, one contiguous heap alloc for large. No dupe per side.
                 const q = &self.index_queue;
                 if (!q.push(key, value)) {
-                    // Queue full — fall back to synchronous indexing.
                     self.tri.indexFile(key, value) catch {};
                     self.words.indexFile(key, value) catch {};
                 } else {
@@ -489,8 +540,6 @@ pub const Collection = struct {
             }
         }
 
-        // Extract and store vector embedding if configured.
-        // Uses stack buffer to avoid heap allocation per insert.
         if (self.vectors) |vc| {
             const field = self.vector_field[0..self.vector_field_len];
             const dims: usize = vc.dims;
@@ -511,7 +560,6 @@ pub const Collection = struct {
 
         emitChange(self, .insert, key, value, doc_id);
 
-        // Periodic MVCC version chain GC to prevent unbounded memory growth.
         if (self.gc_counter.fetchAdd(1, .monotonic) % GC_INTERVAL == GC_INTERVAL - 1) {
             _ = self.gcVersions();
         }
@@ -561,7 +609,10 @@ pub const Collection = struct {
                     vc.append(self.alloc, embedding) catch {};
                     // Look up the BTreeEntry for this doc
                     const key_hash = doc_mod.fnv1a(key);
-                    if (self.hash_idx.get(key_hash)) |entry| {
+                    self.idx_mu.lockUncancelable(runtime.io);
+                    const cached_entry_opt = self.hash_idx.get(key_hash);
+                    self.idx_mu.unlock(runtime.io);
+                    if (cached_entry_opt) |entry| {
                         self.vec_entries.append(self.alloc, entry) catch {};
                     }
                 }
@@ -583,7 +634,10 @@ pub const Collection = struct {
         }
 
         // L2: Hash index (O(1), but hash table lookup)
-        if (self.hash_idx.get(key_hash)) |entry| {
+        self.idx_mu.lockUncancelable(runtime.io);
+        const hash_entry_opt = self.hash_idx.get(key_hash);
+        self.idx_mu.unlock(runtime.io);
+        if (hash_entry_opt) |entry| {
             if (self.readEntry(entry)) |d| {
                 self.cache.insert(key_hash, entry.page_no, entry.page_off);
                 return d;
@@ -598,7 +652,10 @@ pub const Collection = struct {
 
     pub fn getAsOfEpoch(self: *Collection, key: []const u8, epoch: u64) ?Doc {
         const key_hash = doc_mod.fnv1a(key);
-        const doc_id = self.key_doc_ids.get(key_hash) orelse return null;
+        self.idx_mu.lockUncancelable(runtime.io);
+        const doc_id_opt = self.key_doc_ids.get(key_hash);
+        self.idx_mu.unlock(runtime.io);
+        const doc_id = doc_id_opt orelse return null;
         const ver = self.versions.getAtEpoch(doc_id, epoch) orelse return null;
         return self.readLoc(ver.page_no, ver.page_off);
     }
@@ -638,14 +695,20 @@ pub const Collection = struct {
         const stripe = stripeIndex(key_hash);
         self.stripe_locks[stripe].lockUncancelable(runtime.io);
         defer self.stripe_locks[stripe].unlock(runtime.io);
+        return self.updateLocked(key, new_value);
+    }
 
+    /// Update assuming the caller already holds the stripe lock for `key`.
+    /// Used by `applyTxn` so multiple ops can run under one set of locks.
+    fn updateLocked(self: *Collection, key: []const u8, new_value: []const u8) !bool {
+        const key_hash = doc_mod.fnv1a(key);
         const old_entry = self.idx.search(key_hash) orelse return false;
         const old_doc = self.readEntry(old_entry) orelse return false;
 
         const doc_id = old_doc.header.doc_id;
+        const ts = nextEngineTs();
         var new_hdr = doc_mod.newHeader(doc_id, key, new_value);
         new_hdr.version = old_doc.header.version +% 1;
-        // MVCC: encode old location into next_ver field.
         new_hdr.next_ver = (@as(u64, old_entry.page_no) << 16) | old_entry.page_off;
 
         const d = Doc{ .header = new_hdr, .key = key, .value = new_value };
@@ -664,10 +727,12 @@ pub const Collection = struct {
             .page_no  = pno,
             .page_off = page_off,
         };
+        self.idx_mu.lockUncancelable(runtime.io);
         self.hash_idx.put(key_hash, new_entry) catch {};
+        self.ts_by_doc_id.put(doc_id, ts) catch {};
+        self.idx_mu.unlock(runtime.io);
         self.cache.invalidate(key_hash);
 
-        // MVCC: register new version in the version chain (links to old automatically).
         const epoch = self.epochs.advance();
         self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
         emitChange(self, .update, key, new_value, doc_id);
@@ -676,16 +741,20 @@ pub const Collection = struct {
     }
 
     // ─── delete ──────────────────────────────────────────────────────────
-
     pub fn delete(self: *Collection, key: []const u8) !bool {
         const key_hash = doc_mod.fnv1a(key);
         const stripe = stripeIndex(key_hash);
         self.stripe_locks[stripe].lockUncancelable(runtime.io);
         defer self.stripe_locks[stripe].unlock(runtime.io);
+        return self.deleteLocked(key);
+    }
 
+    /// Delete assuming the caller already holds the stripe lock for `key`.
+    fn deleteLocked(self: *Collection, key: []const u8) !bool {
+        const key_hash = doc_mod.fnv1a(key);
         const entry = self.idx.search(key_hash) orelse return false;
-
         const old_doc = self.readEntry(entry) orelse return false;
+        const ts = nextEngineTs();
         var tomb_hdr = doc_mod.newHeader(old_doc.header.doc_id, key, "");
         tomb_hdr.flags |= DocHeader.DELETED;
         tomb_hdr.version = old_doc.header.version +% 1;
@@ -700,11 +769,133 @@ pub const Collection = struct {
         const epoch = self.epochs.advance();
         self.versions.appendVersion(self.alloc, old_doc.header.doc_id, pno, page_off, epoch) catch {};
         self.idx.delete(key_hash);
+        self.idx_mu.lockUncancelable(runtime.io);
         _ = self.hash_idx.remove(key_hash);
+        _ = self.key_doc_ids.remove(key_hash);
+        self.ts_by_doc_id.put(old_doc.header.doc_id, ts) catch {};
+        self.idx_mu.unlock(runtime.io);
         self.cache.invalidate(key_hash);
         emitChange(self, .delete, key, "", old_doc.header.doc_id);
         return true;
     }
+
+    /// Look up the engine timestamp assigned at insert/update/delete.
+    /// Returns 0 if doc_id has no recorded ts (e.g. recovered from WAL on
+    /// startup before its first mutation in this process).
+    pub fn getTs(self: *Collection, doc_id: u64) u64 {
+        self.idx_mu.lockUncancelable(runtime.io);
+        defer self.idx_mu.unlock(runtime.io);
+        return self.ts_by_doc_id.get(doc_id) orelse 0;
+    }
+
+    // ─── Atomic transactions ──────────────────────────────────────────
+
+    pub const TxnOpKind = enum { insert, update, upsert, delete };
+
+    pub const TxnOp = struct {
+        kind: TxnOpKind,
+        key: []const u8,
+        value: []const u8 = "",
+    };
+
+    pub const MAX_TXN_OPS = 32;
+
+    /// Apply a batch of ops atomically.
+    ///
+    /// All needed stripe locks are taken first (in sorted order to prevent
+    /// deadlock with concurrent txns), then every op is validated against
+    /// the live index — `.insert` requires the key NOT to exist;
+    /// `.update`/`.delete` require it to exist; `.upsert` is unconditional.
+    /// If any validation fails, no ops are applied and the matching error
+    /// is returned. Otherwise all ops execute under the held locks. The WAL
+    /// records each op individually but they're written under the same set
+    /// of latches, so concurrent readers never observe a partial txn.
+    pub fn applyTxn(self: *Collection, ops: []const TxnOp) !void {
+        if (ops.len == 0) return;
+        if (ops.len > MAX_TXN_OPS) return error.TxnTooLarge;
+
+        // Collect unique stripe indexes, sorted ascending.
+        var stripes_buf: [MAX_TXN_OPS]u32 = undefined;
+        var n_stripes: usize = 0;
+        for (ops) |op| {
+            const h = doc_mod.fnv1a(op.key);
+            const s = stripeIndex(h);
+            var seen = false;
+            for (stripes_buf[0..n_stripes]) |existing| {
+                if (existing == s) { seen = true; break; }
+            }
+            if (!seen) {
+                stripes_buf[n_stripes] = @intCast(s);
+                n_stripes += 1;
+            }
+        }
+        std.mem.sort(u32, stripes_buf[0..n_stripes], {}, std.sort.asc(u32));
+
+        // Acquire all stripe locks. Deferred release runs in reverse order
+        // (Zig defers are LIFO) which matches the canonical lock-release rule.
+        for (stripes_buf[0..n_stripes]) |s| self.stripe_locks[s].lockUncancelable(runtime.io);
+        defer {
+            var i = n_stripes;
+            while (i > 0) : (i -= 1) self.stripe_locks[stripes_buf[i - 1]].unlock(runtime.io);
+        }
+
+        // Validate every op before any side effect. Two checks:
+        //  1. Each op's key must satisfy its precondition against current state.
+        //  2. Within the batch, no two `insert` ops target the same key — that
+        //     would duplicate-insert under the B-tree and corrupt indexing.
+        self.idx_mu.lockUncancelable(runtime.io);
+        for (ops, 0..) |op, i| {
+            const h = doc_mod.fnv1a(op.key);
+            const exists = self.hash_idx.contains(h);
+            switch (op.kind) {
+                .insert => if (exists) {
+                    self.idx_mu.unlock(runtime.io);
+                    return error.AlreadyExists;
+                },
+                .update => if (!exists) {
+                    self.idx_mu.unlock(runtime.io);
+                    return error.NotFound;
+                },
+                .delete => if (!exists) {
+                    self.idx_mu.unlock(runtime.io);
+                    return error.NotFound;
+                },
+                .upsert => {},
+            }
+            // Intra-txn duplicate-key check: scan prior ops.
+            if (op.kind == .insert) {
+                var j: usize = 0;
+                while (j < i) : (j += 1) {
+                    if (ops[j].kind == .insert and std.mem.eql(u8, ops[j].key, op.key)) {
+                        self.idx_mu.unlock(runtime.io);
+                        return error.AlreadyExists;
+                    }
+                }
+            }
+        }
+        self.idx_mu.unlock(runtime.io);
+        // risk a single insert has today; full crash-atomic txn (with a
+        // begin/commit WAL marker pair) is a follow-up.
+        for (ops) |op| {
+            switch (op.kind) {
+                .insert => _ = try self.insertLocked(op.key, op.value, false),
+                .update => _ = try self.updateLocked(op.key, op.value),
+                .delete => _ = try self.deleteLocked(op.key),
+                .upsert => {
+                    const h = doc_mod.fnv1a(op.key);
+                    self.idx_mu.lockUncancelable(runtime.io);
+                    const exists = self.hash_idx.contains(h);
+                    self.idx_mu.unlock(runtime.io);
+                    if (exists) {
+                        _ = try self.updateLocked(op.key, op.value);
+                    } else {
+                        _ = try self.insertLocked(op.key, op.value, false);
+                    }
+                },
+            }
+        }
+    }
+
 
     // ─── search (codedb2-style trigram + word index) ───────────────────
 
@@ -920,6 +1111,8 @@ pub const Collection = struct {
         errdefer results.deinit(alloc);
 
         var skipped: u32 = 0;
+        self.idx_mu.lockUncancelable(runtime.io);
+        defer self.idx_mu.unlock(runtime.io);
         var it = self.key_doc_ids.iterator();
         while (it.next()) |entry| {
             const ver = self.versions.getAtEpoch(entry.value_ptr.*, epoch) orelse continue;
@@ -1003,8 +1196,10 @@ pub const Collection = struct {
                     .page_off = @intCast(pos),
                 };
                 if (d.header.flags & DocHeader.DELETED == 0) {
+                    self.idx_mu.lockUncancelable(runtime.io);
                     self.hash_idx.put(d.header.key_hash, entry) catch {};
                     self.key_doc_ids.put(d.header.key_hash, d.header.doc_id) catch {};
+                    self.idx_mu.unlock(runtime.io);
                     if (d.value.len >= 3) {
                         self.tri.indexFile(d.key, d.value) catch {};
                         self.words.indexFile(d.key, d.value) catch {};
@@ -1238,7 +1433,10 @@ pub const Collection = struct {
 
             const key_hash = doc_mod.fnv1a(w.key);
 
-            if (self.key_doc_ids.get(key_hash)) |main_epoch| {
+            self.idx_mu.lockUncancelable(runtime.io);
+            const main_epoch_opt = self.key_doc_ids.get(key_hash);
+            self.idx_mu.unlock(runtime.io);
+            if (main_epoch_opt) |main_epoch| {
                 if (main_epoch > br.base_epoch) {
                     // Main was modified after branch fork — this is a real conflict
                     const main_doc = self.get(w.key);

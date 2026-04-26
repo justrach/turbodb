@@ -199,9 +199,9 @@ fn parseManifest(alloc: std.mem.Allocator, raw: []const u8) !Release {
 
 fn ensureDir(path: []const u8) !void {
     if (std.fs.path.isAbsolute(path)) {
-        var root = try std.fs.openDirAbsolute("/", .{});
+        var root = try compat.fs.openDirAbsolute("/", .{});
         defer root.close();
-        const rel = std.mem.trimLeft(u8, path, "/");
+        const rel = std.mem.trimStart(u8, path, "/");
         if (rel.len > 0) try root.makePath(rel);
     } else {
         try compat.fs.cwdMakePath(path);
@@ -211,7 +211,7 @@ fn ensureDir(path: []const u8) !void {
 fn copyDirRecursive(alloc: std.mem.Allocator, src_dir: []const u8, dst_dir: []const u8) !void {
     try ensureDir(dst_dir);
 
-    var dir = try std.fs.openDirAbsolute(src_dir, .{ .iterate = true });
+    var dir = try compat.fs.openDirAbsolute(src_dir, .{ .iterate = true });
     defer dir.close();
 
     var it = dir.iterate();

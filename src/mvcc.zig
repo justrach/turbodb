@@ -1,4 +1,5 @@
 const std = @import("std");
+const runtime = @import("runtime");
 const Allocator = std.mem.Allocator;
 const testing = std.testing;
 
@@ -23,6 +24,8 @@ pub const ReadTxn = struct {
     /// Return the version of `doc_id` visible at this transaction's epoch.
     /// Walks the chain backwards until it finds a version with epoch <= pinned epoch.
     pub fn get(self: ReadTxn, doc_id: u64) ?VersionPtr {
+        self.chain.mu.lockUncancelable(runtime.io);
+        defer self.chain.mu.unlock(runtime.io);
         const ptr = self.chain.latest.get(doc_id) orelse return null;
         return self.walkChain(ptr);
     }
@@ -72,6 +75,9 @@ pub const VersionChain = struct {
     min_active_epoch: std.atomic.Value(u64),
     /// Track all doc versions for GC (doc_id, epoch) pairs.
     all_versions: std.ArrayList(VersionEntry),
+    /// Guards `latest`, `history`, `all_versions` — concurrent inserts from
+    /// different stripes mutate these maps without coordination otherwise.
+    mu: std.Io.Mutex,
 
     pub fn init(alloc: Allocator) VersionChain {
         return .{
@@ -80,6 +86,7 @@ pub const VersionChain = struct {
             .current_epoch = std.atomic.Value(u64).init(1),
             .min_active_epoch = std.atomic.Value(u64).init(1),
             .all_versions = .empty,
+            .mu = .init,
         };
     }
 
@@ -92,6 +99,9 @@ pub const VersionChain = struct {
     /// Register a new version for `doc_id` at the given page location and epoch.
     /// Links the new version to the previous latest (if any) via prev pointers.
     pub fn appendVersion(self: *VersionChain, alloc: Allocator, doc_id: u64, page_no: u32, page_off: u16, epoch: u64) !void {
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
+
         var prev_page_no: u32 = NO_PREV_PAGE_NO;
         var prev_page_off: u16 = NO_PREV_PAGE_OFF;
 
@@ -115,10 +125,14 @@ pub const VersionChain = struct {
 
     /// Get the latest version location for a document.
     pub fn getLatest(self: *VersionChain, doc_id: u64) ?VersionPtr {
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
         return self.latest.get(doc_id);
     }
 
     pub fn getAtEpoch(self: *VersionChain, doc_id: u64, epoch: u64) ?VersionPtr {
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
         const ptr = self.latest.get(doc_id) orelse return null;
         var cur = ptr;
         while (true) {
