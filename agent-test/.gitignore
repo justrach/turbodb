@@ -1,0 +1,16 @@
+node_modules/
+agent-test-data/
+agent-test-data*/
+*.log
+.env
+.env.local
+out/
+dist/
+*.tgz
+coverage/
+*.lcov
+.cache/
+*.tsbuildinfo
+.zigrep_archive
+.idea/
+.DS_Store

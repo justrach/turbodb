@@ -1,0 +1,29 @@
+{
+  "name": "agent-test",
+  "module": "harness.ts",
+  "type": "module",
+  "private": true,
+  "scripts": {
+    "test": "bun run harness.ts",
+    "test:no-llm": "bun run harness.ts --no-llm",
+    "swarm": "bun run swarm.ts",
+    "swarm:no-llm": "bun run swarm.ts --no-llm",
+    "chat": "bun run chat.ts",
+    "chat:no-llm": "bun run chat.ts --no-llm",
+    "chat:codex-tools": "bun run codex-chat-tools.ts",
+    "agent-slack": "bun run codex-chat-tools.ts",
+    "agent-slack:test": "bun run codex-chat-tools.ts",
+    "agent-slack:compare": "bun run agent-slack-compare.ts"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.119",
+    "@modelcontextprotocol/sdk": "^1.29.0",
+    "zod": "^4.3.6"
+  }
+}

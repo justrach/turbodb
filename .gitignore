@@ -12,3 +12,6 @@ preprocessed_configs/
 
 # Optimization docs (tracked)
 # optimizations/
+
+# Local architecture notes
+architecture/
