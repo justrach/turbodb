@@ -1,5 +1,7 @@
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("compat");
+const linux = std.os.linux;
 const Allocator = std.mem.Allocator;
 
 /// Operation types for WAL entries.
@@ -20,6 +22,7 @@ const ENTRY_HEADER_SIZE = 13;
 pub const WALSegment = struct {
     segment_id: u32,
     fd: compat.File,
+    uring: ?compat.LinuxUring,
     buf: []align(4096) u8,
     pos: std.atomic.Value(u32),
     published_pos: std.atomic.Value(u32),
@@ -40,6 +43,7 @@ pub const WALSegment = struct {
         return WALSegment{
             .segment_id = id,
             .fd = fd,
+            .uring = compat.initLinuxUring(8),
             .buf = buf,
             .pos = std.atomic.Value(u32).init(0),
             .published_pos = std.atomic.Value(u32).init(0),
@@ -48,6 +52,10 @@ pub const WALSegment = struct {
     }
 
     pub fn deinit(self: *WALSegment, alloc: Allocator) void {
+        if (self.uring) |*ring| {
+            compat.deinitLinuxUring(ring);
+            self.uring = null;
+        }
         self.fd.close();
         alloc.free(self.buf);
     }
@@ -103,15 +111,30 @@ pub const WALSegment = struct {
         if (current <= self.flushed_pos) return;
 
         const dirty = self.buf[self.flushed_pos..current];
-        const written = try self.fd.write(dirty);
-        if (written != dirty.len) return error.ShortWrite;
+        if (self.uring) |*ring| {
+            compat.uringWriteAllAt(ring, self.fd, dirty, self.flushed_pos) catch {
+                compat.deinitLinuxUring(ring);
+                self.uring = null;
+            };
+            if (self.uring == null) try self.fd.pwriteAll(dirty, self.flushed_pos);
+        } else {
+            try self.fd.pwriteAll(dirty, self.flushed_pos);
+        }
 
         self.flushed_pos = current;
     }
 
     /// Fsync the segment file to durable storage.
     pub fn sync(self: *WALSegment) !void {
-        try self.fd.sync();
+        if (self.uring) |*ring| {
+            compat.uringFsync(ring, self.fd) catch {
+                compat.deinitLinuxUring(ring);
+                self.uring = null;
+            };
+            if (self.uring == null) try self.fd.sync();
+        } else {
+            try self.fd.sync();
+        }
     }
 
     /// Read back an entry at the given buffer offset.  Returns the fields and
@@ -156,9 +179,20 @@ pub const ParallelWAL = struct {
     allocator: Allocator,
     flusher_thread: ?std.Thread,
     running: std.atomic.Value(u8),
+    uring: ?compat.LinuxUring,
+    dirty_ends: []u32,
+    dirty_lens: []usize,
+
+    const MAX_URING_SEGMENTS: u32 = 256;
 
     pub fn init(alloc: Allocator, data_dir: []const u8, n_segments: u32) !*ParallelWAL {
         const segs = try alloc.alloc(*WALSegment, n_segments);
+        const dirty_ends = try alloc.alloc(u32, n_segments);
+        errdefer alloc.free(dirty_ends);
+        const dirty_lens = try alloc.alloc(usize, n_segments);
+        errdefer alloc.free(dirty_lens);
+        @memset(dirty_ends, 0);
+        @memset(dirty_lens, 0);
         var inited: u32 = 0;
         errdefer {
             var j: u32 = 0;
@@ -185,17 +219,26 @@ pub const ParallelWAL = struct {
             .allocator = alloc,
             .flusher_thread = null,
             .running = std.atomic.Value(u8).init(0),
+            .uring = compat.initLinuxUring(MAX_URING_SEGMENTS),
+            .dirty_ends = dirty_ends,
+            .dirty_lens = dirty_lens,
         };
         return self;
     }
 
     pub fn deinit(self: *ParallelWAL) void {
         self.stopFlusher();
+        if (self.uring) |*ring| {
+            compat.deinitLinuxUring(ring);
+            self.uring = null;
+        }
         var i: u32 = 0;
         while (i < self.n_segments) : (i += 1) {
             self.segments[i].deinit(self.allocator);
             self.allocator.destroy(self.segments[i]);
         }
+        self.allocator.free(self.dirty_ends);
+        self.allocator.free(self.dirty_lens);
         self.allocator.free(self.segments);
         self.allocator.destroy(self);
     }
@@ -203,7 +246,7 @@ pub const ParallelWAL = struct {
     /// Select a segment for the calling thread — thread ID modulo n_segments.
     pub fn getSegment(self: *ParallelWAL) *WALSegment {
         const tid = std.Thread.getCurrentId();
-        const idx = @as(u32, @intCast(@as(u64, @bitCast(tid)) % @as(u64, self.n_segments)));
+        const idx = @as(u32, @intCast(@as(u64, @intCast(tid)) % @as(u64, self.n_segments)));
         return self.segments[idx];
     }
 
@@ -213,9 +256,18 @@ pub const ParallelWAL = struct {
         return seg.append(op, key_hash, data);
     }
 
+    pub fn usingLinuxUring(self: *const ParallelWAL) bool {
+        return self.uring != null;
+    }
+
     /// Group commit: flush + fsync every segment and advance the epoch.
     /// Called by the background flusher or manually in tests.
     pub fn groupCommit(self: *ParallelWAL) !void {
+        if (self.groupCommitWithUring()) {
+            _ = self.current_epoch.fetchAdd(1, .release);
+            return;
+        }
+
         // Phase 1: flush dirty buffers to OS page cache.
         var i: u32 = 0;
         while (i < self.n_segments) : (i += 1) {
@@ -230,6 +282,89 @@ pub const ParallelWAL = struct {
 
         // Advance epoch — readers use this to know data is durable.
         _ = self.current_epoch.fetchAdd(1, .release);
+    }
+
+    fn groupCommitWithUring(self: *ParallelWAL) bool {
+        if (comptime builtin.os.tag != .linux) return false;
+
+        if (self.n_segments == 0 or self.n_segments > MAX_URING_SEGMENTS) return false;
+        const ring = if (self.uring) |*r| r else return false;
+
+        @memset(self.dirty_lens, 0);
+        var writes: u32 = 0;
+        var i: u32 = 0;
+        while (i < self.n_segments) : (i += 1) {
+            const seg = self.segments[i];
+            const current = seg.published_pos.load(.acquire);
+            self.dirty_ends[i] = current;
+            if (current <= seg.flushed_pos) continue;
+
+            const dirty = seg.buf[seg.flushed_pos..current];
+            self.dirty_lens[i] = dirty.len;
+            _ = ring.write(@as(u64, i) + 1, seg.fd.handle, dirty, seg.flushed_pos) catch return self.disableUring();
+            writes += 1;
+        }
+
+        if (writes == 0) return true;
+        _ = ring.submit_and_wait(writes) catch return self.disableUring();
+        if (!self.collectUringWrites(writes)) return self.disableUring();
+
+        var syncs: u32 = 0;
+        i = 0;
+        while (i < self.n_segments) : (i += 1) {
+            if (self.dirty_lens[i] == 0) continue;
+            _ = ring.fsync(@as(u64, i) + 1, self.segments[i].fd.handle, linux.IORING_FSYNC_DATASYNC) catch return self.disableUring();
+            syncs += 1;
+        }
+
+        _ = ring.submit_and_wait(syncs) catch return self.disableUring();
+        if (!self.collectUringSyncs(syncs)) return self.disableUring();
+
+        i = 0;
+        while (i < self.n_segments) : (i += 1) {
+            if (self.dirty_lens[i] == 0) continue;
+            self.segments[i].flushed_pos = self.dirty_ends[i];
+        }
+        return true;
+    }
+
+    fn collectUringWrites(self: *ParallelWAL, expected: u32) bool {
+        const ring = if (self.uring) |*r| r else return false;
+        var completed: u32 = 0;
+        while (completed < expected) : (completed += 1) {
+            const cqe = ring.copy_cqe() catch return false;
+            const idx = self.cqeSegmentIndex(cqe.user_data) orelse return false;
+            if (cqe.res < 0) return false;
+            const n: usize = @intCast(cqe.res);
+            if (n != self.dirty_lens[idx]) return false;
+        }
+        return true;
+    }
+
+    fn collectUringSyncs(self: *ParallelWAL, expected: u32) bool {
+        const ring = if (self.uring) |*r| r else return false;
+        var completed: u32 = 0;
+        while (completed < expected) : (completed += 1) {
+            const cqe = ring.copy_cqe() catch return false;
+            _ = self.cqeSegmentIndex(cqe.user_data) orelse return false;
+            if (cqe.res < 0) return false;
+        }
+        return true;
+    }
+
+    fn cqeSegmentIndex(self: *const ParallelWAL, user_data: u64) ?usize {
+        if (user_data == 0) return null;
+        const idx: usize = @intCast(user_data - 1);
+        if (idx >= self.n_segments) return null;
+        return idx;
+    }
+
+    fn disableUring(self: *ParallelWAL) bool {
+        if (self.uring) |*ring| {
+            compat.deinitLinuxUring(ring);
+            self.uring = null;
+        }
+        return false;
     }
 
     /// Start the background flusher thread (~1 ms group commit interval).

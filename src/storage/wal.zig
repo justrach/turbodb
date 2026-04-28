@@ -108,9 +108,13 @@ fn entryChecksum(header_bytes: []const u8, payload: []const u8) u32 {
 
 pub const WAL = struct {
     file: compat.File,
+    uring: ?compat.LinuxUring,
     write_buf: std.ArrayList(u8), // pending (not yet flushed)
     next_lsn: std.atomic.Value(u64),
     checkpoint_lsn: u64,
+    append_offset: u64,
+    uring_flushes: usize,
+    sync_flushes: usize,
     allocator: std.mem.Allocator,
 
     // Group commit state — guarded by mu
@@ -126,6 +130,7 @@ pub const WAL = struct {
 
     /// Backpressure: block writers if pending buffer exceeds this.
     const MAX_WRITE_BUF: usize = 8 * 1024 * 1024; // 8 MiB
+    const URING_MIN_WRITE_AND_SYNC: usize = 8 * 1024 * 1024;
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -135,11 +140,16 @@ pub const WAL = struct {
             if (fd < 0) return error.CreateFileError;
             break :blk compat.File{ .handle = fd };
         };
+        const end = std.c.lseek(f.handle, 0, std.c.SEEK.END);
         const wal = WAL{
             .file = f,
+            .uring = compat.initLinuxUring(8),
             .write_buf = .empty,
             .next_lsn = std.atomic.Value(u64).init(1),
             .checkpoint_lsn = 0,
+            .append_offset = if (end >= 0) @intCast(end) else 0,
+            .uring_flushes = 0,
+            .sync_flushes = 0,
             .allocator = allocator,
             .mu = .{},
             .cond = .{},
@@ -149,8 +159,6 @@ pub const WAL = struct {
             .flush_thread = null,
             .flush_running = std.atomic.Value(bool).init(false),
         };
-        // Seek to end (append mode)
-        _ = std.c.lseek(wal.file.handle, 0, std.c.SEEK.END);
         return wal;
     }
 
@@ -212,6 +220,14 @@ pub const WAL = struct {
         return self.last_flush_error;
     }
 
+    pub fn usingLinuxUring(self: *const WAL) bool {
+        return self.uring != null;
+    }
+
+    pub fn usedLinuxUring(self: *const WAL) bool {
+        return self.uring_flushes > 0;
+    }
+
     pub fn close(self: *WAL) void {
         if (self.flush_running.load(.acquire)) {
             self.flush_running.store(false, .release);
@@ -220,6 +236,10 @@ pub const WAL = struct {
         // Flush any remaining entries
         self.flushPending();
         self.write_buf.deinit(self.allocator);
+        if (self.uring) |*ring| {
+            compat.deinitLinuxUring(ring);
+            self.uring = null;
+        }
         self.file.close();
     }
 
@@ -384,6 +404,7 @@ pub const WAL = struct {
         // Truncate WAL — all data is checkpointed to page files.
         self.file.seekTo(0) catch {};
         self.file.setEndPos(0) catch {};
+        self.append_offset = 0;
 
         self.mu.lock();
         self.synced_lsn = lsn;
@@ -442,6 +463,7 @@ pub const WAL = struct {
         // ── Advance LSN counter and seek to EOF for new writes ────────────────
         self.next_lsn.store(max_lsn + 1, .release);
         self.synced_lsn = max_lsn;
+        self.append_offset = valid_end;
         try self.file.seekTo(valid_end);
         std.log.info("WAL recovery: replayed up to lsn={d}", .{max_lsn});
     }
@@ -453,8 +475,24 @@ pub const WAL = struct {
     }
 
     fn writeAndSync(self: *WAL, bytes: []const u8) ?anyerror {
-        self.file.writeAll(bytes) catch |e| return e;
+        if (bytes.len >= URING_MIN_WRITE_AND_SYNC) {
+            if (self.uring) |*ring| {
+                compat.uringWriteAndSyncAt(ring, self.file, bytes, self.append_offset) catch {
+                    compat.deinitLinuxUring(ring);
+                    self.uring = null;
+                };
+                if (self.uring != null) {
+                    self.append_offset += bytes.len;
+                    self.uring_flushes += 1;
+                    return null;
+                }
+            }
+        }
+
+        self.file.pwriteAll(bytes, self.append_offset) catch |e| return e;
         self.file.sync() catch |e| return e;
+        self.append_offset += bytes.len;
+        self.sync_flushes += 1;
         return null;
     }
 };

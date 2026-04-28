@@ -4,8 +4,10 @@
 /// std.fs, std.Thread, std.io, and std.time. Uses POSIX/C functions directly
 /// to avoid threading std.Io through the entire codebase.
 const std = @import("std");
+const builtin = @import("builtin");
 const c = std.c;
 const posix = std.posix;
+const linux = std.os.linux;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // File — drop-in replacement for std.fs.File (0.15)
@@ -56,6 +58,16 @@ pub const File = struct {
         var written: usize = 0;
         while (written < data.len) {
             const n = c.write(self.handle, data[written..].ptr, data[written..].len);
+            if (n < 0) return error.WriteError;
+            if (n == 0) return error.WriteError;
+            written += @intCast(n);
+        }
+    }
+
+    pub fn pwriteAll(self: File, data: []const u8, offset: u64) !void {
+        var written: usize = 0;
+        while (written < data.len) {
+            const n = c.pwrite(self.handle, data[written..].ptr, data[written..].len, @intCast(offset + written));
             if (n < 0) return error.WriteError;
             if (n == 0) return error.WriteError;
             written += @intCast(n);
@@ -129,6 +141,89 @@ pub const File = struct {
         return .{ .file = self };
     }
 };
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// Linux io_uring helpers — optional fast path for WAL flush/sync
+// ═══════════════════════════════════════════════════════════════════════════════
+
+pub const LinuxUring = linux.IoUring;
+
+pub fn initLinuxUring(entries: u16) ?LinuxUring {
+    if (comptime builtin.os.tag != .linux) return null;
+    if (ioUringDisabledByEnv()) return null;
+    return LinuxUring.init(entries, 0) catch null;
+}
+
+fn ioUringDisabledByEnv() bool {
+    const value = getenv("TURBODB_DISABLE_IO_URING") orelse return false;
+    return value[0] != 0 and value[0] != '0';
+}
+
+pub fn deinitLinuxUring(ring: *LinuxUring) void {
+    if (comptime builtin.os.tag != .linux) return;
+    ring.deinit();
+}
+
+pub fn uringWriteAllAt(ring: *LinuxUring, file: File, data: []const u8, offset: u64) !void {
+    if (comptime builtin.os.tag != .linux) return error.Unsupported;
+
+    var written: usize = 0;
+    while (written < data.len) {
+        const chunk = data[written..];
+        _ = ring.write(1, file.handle, chunk, offset + written) catch return error.WriteError;
+        _ = ring.submit_and_wait(1) catch return error.WriteError;
+        const cqe = ring.copy_cqe() catch return error.WriteError;
+        if (cqe.user_data != 1) return error.WriteError;
+        if (cqe.res <= 0) return error.WriteError;
+        const n: usize = @intCast(cqe.res);
+        if (n > chunk.len) return error.WriteError;
+        written += n;
+    }
+}
+
+pub fn uringFsync(ring: *LinuxUring, file: File) !void {
+    if (comptime builtin.os.tag != .linux) return error.Unsupported;
+
+    _ = ring.fsync(2, file.handle, linux.IORING_FSYNC_DATASYNC) catch return error.SyncError;
+    _ = ring.submit_and_wait(1) catch return error.SyncError;
+    const cqe = ring.copy_cqe() catch return error.SyncError;
+    if (cqe.user_data != 2) return error.SyncError;
+    if (cqe.res < 0) return error.SyncError;
+}
+
+pub fn uringWriteAndSyncAt(ring: *LinuxUring, file: File, data: []const u8, offset: u64) !void {
+    if (comptime builtin.os.tag != .linux) return error.Unsupported;
+    if (data.len == 0) return uringFsync(ring, file);
+
+    const write_sqe = ring.write(1, file.handle, data, offset) catch return error.WriteError;
+    write_sqe.flags |= linux.IOSQE_IO_LINK;
+    _ = ring.fsync(2, file.handle, linux.IORING_FSYNC_DATASYNC) catch return error.SyncError;
+    _ = ring.submit_and_wait(2) catch return error.WriteError;
+
+    var saw_write = false;
+    var saw_sync = false;
+    var write_res: i32 = 0;
+    var sync_res: i32 = 0;
+
+    while (!saw_write or !saw_sync) {
+        const cqe = ring.copy_cqe() catch return error.WriteError;
+        switch (cqe.user_data) {
+            1 => {
+                saw_write = true;
+                write_res = cqe.res;
+            },
+            2 => {
+                saw_sync = true;
+                sync_res = cqe.res;
+            },
+            else => return error.WriteError,
+        }
+    }
+
+    if (write_res < 0) return error.WriteError;
+    if (@as(usize, @intCast(write_res)) != data.len) return error.ShortWrite;
+    if (sync_res < 0) return error.SyncError;
+}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // Dir / cwd() — drop-in for std.fs.cwd()
@@ -587,9 +682,26 @@ pub fn bufferedReader(underlying: anytype) GenericBufferedReader(4096, @TypeOf(u
 // ═══════════════════════════════════════════════════════════════════════════════
 
 extern "c" fn arc4random_buf(buf: *anyopaque, nbytes: usize) void;
+extern "c" fn getenv(name: [*:0]const u8) ?[*:0]const u8;
 extern "c" fn system(command: [*:0]const u8) c_int;
 
 pub fn randomBytes(buf: []u8) void {
+    if (comptime builtin.os.tag == .linux) {
+        var filled: usize = 0;
+        while (filled < buf.len) {
+            const rc = linux.getrandom(buf[filled..].ptr, buf.len - filled, 0);
+            switch (linux.errno(rc)) {
+                .SUCCESS => {
+                    const n: usize = @intCast(rc);
+                    if (n == 0) @panic("getrandom returned zero bytes");
+                    filled += n;
+                },
+                .INTR => continue,
+                else => @panic("getrandom failed"),
+            }
+        }
+        return;
+    }
     arc4random_buf(buf.ptr, buf.len);
 }
 

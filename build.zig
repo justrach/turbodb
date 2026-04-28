@@ -245,6 +245,7 @@ pub fn build(b: *std.Build) void {
         .name = "bench-wal",
         .root_module = walbench_mod,
     });
+    b.installArtifact(walbench_exe);
 
     const walbench_run = b.addRunArtifact(walbench_exe);
     const walbench_step = b.step("bench-wal", "Run WAL microbenchmark");
