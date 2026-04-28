@@ -103,6 +103,7 @@ pub const CDCManager = struct {
     deliveries: std.ArrayList(Delivery),
     next_subscription_id: std.atomic.Value(u64),
     next_seq: std.atomic.Value(u64),
+    subscription_count: std.atomic.Value(u32),
     mu: compat.Mutex,
     cond: compat.Condition,
     running: std.atomic.Value(bool),
@@ -116,6 +117,7 @@ pub const CDCManager = struct {
             .deliveries = .empty,
             .next_subscription_id = std.atomic.Value(u64).init(1),
             .next_seq = std.atomic.Value(u64).init(1),
+            .subscription_count = std.atomic.Value(u32).init(0),
             .mu = .{},
             .cond = .{},
             .running = std.atomic.Value(bool).init(false),
@@ -155,10 +157,13 @@ pub const CDCManager = struct {
         self.mu.lock();
         defer self.mu.unlock();
         try self.subscriptions.append(self.allocator, sub);
+        _ = self.subscription_count.fetchAdd(1, .release);
         return sub.id;
     }
 
     pub fn emit(self: *CDCManager, tenant_id: []const u8, collection: []const u8, key: []const u8, value: []const u8, doc_id: u64, op: Op) void {
+        if (self.subscription_count.load(.acquire) == 0) return;
+
         var ev = std.mem.zeroes(Event);
         ev.seq = self.next_seq.fetchAdd(1, .monotonic);
         ev.doc_id = doc_id;

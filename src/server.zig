@@ -825,13 +825,12 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
 
         if (line.len < 2) continue; // skip empty lines
 
-        // Extract key from this JSON line
-        const key = jsonStr(line, "key") orelse {
+        const parsed = parseBulkLine(line) orelse {
             errors += 1;
             continue;
         };
-        // Extract value field; fall back to full line for backwards compat.
-        const value = jsonValue(line, "value") orelse line;
+        const key = parsed.key;
+        const value = parsed.value;
         const row_bytes = key.len + value.len + 128;
         if (rows.items.len > 0 and chunk_bytes + row_bytes > BULK_INSERT_CHUNK_BYTES) {
             BulkFlush.run(col, &rows, &chunk_bytes, &inserted, &errors, &total_bytes) catch
@@ -1737,6 +1736,74 @@ const KeyIter = struct {
     }
 };
 
+const BulkLine = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+fn parseBulkLine(line: []const u8) ?BulkLine {
+    if (parseBulkLineFast(line)) |parsed| return parsed;
+    const key = jsonStr(line, "key") orelse return null;
+    const value = jsonValue(line, "value") orelse line;
+    return .{ .key = key, .value = value };
+}
+
+fn parseBulkLineFast(line: []const u8) ?BulkLine {
+    if (line.len < "{\"key\":\"\",\"value\":}".len or line[0] != '{') return null;
+    var row_end = line.len;
+    while (row_end > 0 and (line[row_end - 1] == ' ' or line[row_end - 1] == '\t' or line[row_end - 1] == '\r')) row_end -= 1;
+    if (row_end == 0 or line[row_end - 1] != '}') return null;
+    row_end -= 1;
+
+    var i: usize = 1;
+    skipJsonSpaces(line, &i, row_end);
+    if (!std.mem.startsWith(u8, line[i..row_end], "\"key\"")) return null;
+    i += "\"key\"".len;
+    skipJsonSpaces(line, &i, row_end);
+    if (i >= row_end or line[i] != ':') return null;
+    i += 1;
+    skipJsonSpaces(line, &i, row_end);
+    const key = parseJsonStringToken(line, &i, row_end) orelse return null;
+    skipJsonSpaces(line, &i, row_end);
+    if (i >= row_end or line[i] != ',') return null;
+    i += 1;
+    skipJsonSpaces(line, &i, row_end);
+    if (!std.mem.startsWith(u8, line[i..row_end], "\"value\"")) return null;
+    i += "\"value\"".len;
+    skipJsonSpaces(line, &i, row_end);
+    if (i >= row_end or line[i] != ':') return null;
+    i += 1;
+    skipJsonSpaces(line, &i, row_end);
+    if (i >= row_end) return null;
+
+    var value_end = row_end;
+    while (value_end > i and (line[value_end - 1] == ' ' or line[value_end - 1] == '\t')) value_end -= 1;
+    if (value_end <= i) return null;
+    return .{ .key = key, .value = line[i..value_end] };
+}
+
+fn skipJsonSpaces(data: []const u8, pos: *usize, limit: usize) void {
+    while (pos.* < limit and (data[pos.*] == ' ' or data[pos.*] == '\t')) pos.* += 1;
+}
+
+fn parseJsonStringToken(data: []const u8, pos: *usize, limit: usize) ?[]const u8 {
+    if (pos.* >= limit or data[pos.*] != '"') return null;
+    pos.* += 1;
+    const start = pos.*;
+    while (pos.* < limit) : (pos.* += 1) {
+        if (data[pos.*] == '\\' and pos.* + 1 < limit) {
+            pos.* += 1;
+            continue;
+        }
+        if (data[pos.*] == '"') {
+            const end = pos.*;
+            pos.* += 1;
+            return data[start..end];
+        }
+    }
+    return null;
+}
+
 const BatchUpdateLine = struct {
     key: []const u8 = "",
     value: []const u8 = "",
@@ -2210,6 +2277,16 @@ test "read-only auth cannot write basic db methods" {
 
     ctx.perm = .read_write;
     try std.testing.expect(canWriteDb(&ctx));
+}
+
+test "bulk line parser fast path and generic fallback" {
+    const fast = parseBulkLine("{\"key\":\"u1\",\"value\":{\"name\":\"alice\",\"tags\":[1,2]}}").?;
+    try std.testing.expectEqualStrings("u1", fast.key);
+    try std.testing.expectEqualStrings("{\"name\":\"alice\",\"tags\":[1,2]}", fast.value);
+
+    const fallback = parseBulkLine("{\"value\":{\"name\":\"bob\"},\"key\":\"u2\"}").?;
+    try std.testing.expectEqualStrings("u2", fallback.key);
+    try std.testing.expectEqualStrings("{\"name\":\"bob\"}", fallback.value);
 }
 
 test "bulk memory estimate includes body and bounded chunk workspace" {

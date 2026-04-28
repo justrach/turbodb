@@ -203,11 +203,12 @@ export fn turbodb_insert_bulk_ndjson(
         pos = if (line_end < input.len) line_end + 1 else line_end;
         if (line.len == 0) continue;
 
-        const key = jsonStr(line, "key") orelse {
+        const parsed = parseBulkLine(line) orelse {
             errors += 1;
             continue;
         };
-        const value = jsonValue(line, "value") orelse line;
+        const key = parsed.key;
+        const value = parsed.value;
         const row_bytes = key.len + value.len + 128;
         if (rows.items.len > 0 and chunk_bytes + row_bytes > BULK_INSERT_CHUNK_BYTES) {
             BulkFlush.run(col, &rows, &chunk_bytes, &inserted, &errors) catch return -1;
@@ -444,6 +445,74 @@ const KeyIter = struct {
         return null;
     }
 };
+
+const BulkLine = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+fn parseBulkLine(line: []const u8) ?BulkLine {
+    if (parseBulkLineFast(line)) |parsed| return parsed;
+    const key = jsonStr(line, "key") orelse return null;
+    const value = jsonValue(line, "value") orelse line;
+    return .{ .key = key, .value = value };
+}
+
+fn parseBulkLineFast(line: []const u8) ?BulkLine {
+    if (line.len < "{\"key\":\"\",\"value\":}".len or line[0] != '{') return null;
+    var row_end = line.len;
+    while (row_end > 0 and (line[row_end - 1] == ' ' or line[row_end - 1] == '\t' or line[row_end - 1] == '\r')) row_end -= 1;
+    if (row_end == 0 or line[row_end - 1] != '}') return null;
+    row_end -= 1;
+
+    var i: usize = 1;
+    skipJsonSpaces(line, &i, row_end);
+    if (!std.mem.startsWith(u8, line[i..row_end], "\"key\"")) return null;
+    i += "\"key\"".len;
+    skipJsonSpaces(line, &i, row_end);
+    if (i >= row_end or line[i] != ':') return null;
+    i += 1;
+    skipJsonSpaces(line, &i, row_end);
+    const key = parseJsonStringToken(line, &i, row_end) orelse return null;
+    skipJsonSpaces(line, &i, row_end);
+    if (i >= row_end or line[i] != ',') return null;
+    i += 1;
+    skipJsonSpaces(line, &i, row_end);
+    if (!std.mem.startsWith(u8, line[i..row_end], "\"value\"")) return null;
+    i += "\"value\"".len;
+    skipJsonSpaces(line, &i, row_end);
+    if (i >= row_end or line[i] != ':') return null;
+    i += 1;
+    skipJsonSpaces(line, &i, row_end);
+    if (i >= row_end) return null;
+
+    var value_end = row_end;
+    while (value_end > i and (line[value_end - 1] == ' ' or line[value_end - 1] == '\t')) value_end -= 1;
+    if (value_end <= i) return null;
+    return .{ .key = key, .value = line[i..value_end] };
+}
+
+fn skipJsonSpaces(data: []const u8, pos: *usize, limit: usize) void {
+    while (pos.* < limit and (data[pos.*] == ' ' or data[pos.*] == '\t')) pos.* += 1;
+}
+
+fn parseJsonStringToken(data: []const u8, pos: *usize, limit: usize) ?[]const u8 {
+    if (pos.* >= limit or data[pos.*] != '"') return null;
+    pos.* += 1;
+    const start = pos.*;
+    while (pos.* < limit) : (pos.* += 1) {
+        if (data[pos.*] == '\\' and pos.* + 1 < limit) {
+            pos.* += 1;
+            continue;
+        }
+        if (data[pos.*] == '"') {
+            const end = pos.*;
+            pos.* += 1;
+            return data[start..end];
+        }
+    }
+    return null;
+}
 
 fn jsonStr(json: []const u8, key: []const u8) ?[]const u8 {
     var kbuf: [64]u8 = undefined;
