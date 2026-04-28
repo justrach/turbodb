@@ -11,10 +11,8 @@ import argparse
 import json
 import math
 import random
-import statistics
 import sys
 import time
-import urllib.error
 import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
