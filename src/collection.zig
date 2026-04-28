@@ -58,8 +58,11 @@ pub const IndexQueue = struct {
     const CAPACITY = 131072; // 128K entries — sized for 100+ concurrent writers
 
     const Entry = struct {
-        key: []const u8,
-        value: []const u8,
+        key: []const u8 = "",
+        value: []const u8 = "",
+        loc: BTreeEntry = undefined,
+        stored: bool = false,
+        queued_bytes: usize = 0,
     };
 
     buf: []Entry,
@@ -81,7 +84,22 @@ pub const IndexQueue = struct {
     }
 
     /// Push a (key, value) pair. Lock-free MPSC via CAS + per-slot ready flag.
-    pub fn push(self: *IndexQueue, key: []const u8, value: []const u8) bool {
+    pub fn pushOwned(self: *IndexQueue, key: []const u8, value: []const u8, queued_bytes: usize) bool {
+        return self.push(.{
+            .key = key,
+            .value = value,
+            .queued_bytes = queued_bytes,
+        });
+    }
+
+    pub fn pushStored(self: *IndexQueue, loc: BTreeEntry) bool {
+        return self.push(.{
+            .loc = loc,
+            .stored = true,
+        });
+    }
+
+    fn push(self: *IndexQueue, entry: Entry) bool {
         while (true) {
             const h = self.head.load(.acquire);
             const next = (h + 1) % CAPACITY;
@@ -91,7 +109,7 @@ pub const IndexQueue = struct {
                 continue; // CAS failed — another producer won, retry
             }
             // We own slot h — write data then signal readiness.
-            self.buf[h] = .{ .key = key, .value = value };
+            self.buf[h] = entry;
             self.ready[h].store(1, .release);
             return true;
         }
@@ -214,6 +232,8 @@ pub const Collection = struct {
         enc_off: usize,
         enc_len: usize,
         line_len: usize,
+        page_no: u32 = 0,
+        page_off: u16 = 0,
     };
 
     name_buf: [128]u8,
@@ -442,6 +462,7 @@ pub const Collection = struct {
         // Single-entry document writes are self-committed for recovery.
         try writeCommittedDocumentWal(self.wal_log, .doc_insert, enc);
 
+        var inserted_entry: BTreeEntry = undefined;
         self.meta_mu.lock();
         {
             defer self.meta_mu.unlock();
@@ -460,14 +481,13 @@ pub const Collection = struct {
             };
             try self.idx.insert(entry);
             self.hash_idx.put(hdr.key_hash, entry) catch {};
+            inserted_entry = entry;
 
             // MVCC: register version in the version chain.
             const epoch = self.epochs.advance();
             self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
             self.key_doc_ids.put(hdr.key_hash, doc_id) catch {};
             self.key_epochs.put(hdr.key_hash, doc_id) catch {}; // epoch = doc_id (monotonic)
-
-            self.enqueueTextIndex(key, value);
 
             // Extract and store vector embedding if configured.
             // Uses stack buffer to avoid heap allocation per insert.
@@ -495,6 +515,7 @@ pub const Collection = struct {
             }
         }
 
+        self.enqueueStoredTextIndex(inserted_entry, key, value);
         emitChange(self, .insert, key, value, doc_id);
 
         return doc_id;
@@ -568,7 +589,7 @@ pub const Collection = struct {
         self.meta_mu.lock();
         {
             defer self.meta_mu.unlock();
-            for (prepared.items) |item| {
+            for (prepared.items) |*item| {
                 const enc = encoded.items[item.enc_off .. item.enc_off + item.enc_len];
                 const pno = try self.findOrAllocLeaf(enc.len);
                 const page_off = self.pf.leafAppend(pno, enc) orelse return error.PageFull;
@@ -580,6 +601,8 @@ pub const Collection = struct {
                 };
                 try self.idx.insert(entry);
                 self.hash_idx.put(item.key_hash, entry) catch {};
+                item.page_no = pno;
+                item.page_off = page_off;
 
                 const epoch = self.epochs.advance();
                 self.versions.appendVersion(self.alloc, item.doc_id, pno, page_off, epoch) catch {};
@@ -614,7 +637,16 @@ pub const Collection = struct {
         }
 
         for (prepared.items) |item| {
-            self.enqueueTextIndex(item.key, item.value);
+            self.enqueueStoredTextIndex(
+                .{
+                    .key_hash = item.key_hash,
+                    .doc_id = item.doc_id,
+                    .page_no = item.page_no,
+                    .page_off = item.page_off,
+                },
+                item.key,
+                item.value,
+            );
             emitChange(self, .insert, item.key, item.value, item.doc_id);
         }
 
@@ -1202,7 +1234,7 @@ pub const Collection = struct {
             &self.index_queue2;
 
         var retries: u32 = 0;
-        while (!q.push(owned_key, owned_val)) {
+        while (!q.pushOwned(owned_key, owned_val, queued_bytes)) {
             retries += 1;
             if (retries > 1000) {
                 self.releaseIndexQueueBytes(queued_bytes);
@@ -1210,6 +1242,33 @@ pub const Collection = struct {
                 self.words.indexFile(owned_key, owned_val) catch {};
                 self.alloc.free(owned_val);
                 self.alloc.free(owned_key);
+                return;
+            }
+            std.Thread.yield() catch {};
+        }
+    }
+
+    fn enqueueStoredTextIndex(self: *Collection, entry: BTreeEntry, key: []const u8, value: []const u8) void {
+        if (value.len < 3) return;
+        if (self.index_thread == null and self.index_thread2 == null) {
+            self.tri.indexFile(key, value) catch {};
+            self.words.indexFile(key, value) catch {};
+            return;
+        }
+
+        const q = if (self.index_thread != null and self.index_thread2 != null)
+            if (self.queue_toggle.fetchAdd(1, .monotonic) % 2 == 0) &self.index_queue else &self.index_queue2
+        else if (self.index_thread != null)
+            &self.index_queue
+        else
+            &self.index_queue2;
+
+        var retries: u32 = 0;
+        while (!q.pushStored(entry)) {
+            retries += 1;
+            if (retries > 1000) {
+                self.tri.indexFile(key, value) catch {};
+                self.words.indexFile(key, value) catch {};
                 return;
             }
             std.Thread.yield() catch {};
@@ -1718,6 +1777,7 @@ fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
     const BATCH = 64;
     var batch_keys: [BATCH][]const u8 = undefined;
     var batch_vals: [BATCH][]const u8 = undefined;
+    var batch_entries: [BATCH]IndexQueue.Entry = undefined;
     var reusable_tris = std.AutoHashMap(codeindex.Trigram, void).init(col.alloc);
     defer reusable_tris.deinit();
 
@@ -1728,8 +1788,16 @@ fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
         var n: usize = 0;
         while (n < BATCH) {
             const entry = queue.pop() orelse break;
-            batch_keys[n] = entry.key;
-            batch_vals[n] = entry.value;
+            if (entry.stored) {
+                const doc = col.readEntry(entry.loc) orelse continue;
+                if (doc.value.len < 3) continue;
+                batch_keys[n] = doc.key;
+                batch_vals[n] = doc.value;
+            } else {
+                batch_keys[n] = entry.key;
+                batch_vals[n] = entry.value;
+            }
+            batch_entries[n] = entry;
             n += 1;
         }
         if (n == 0) {
@@ -1744,19 +1812,29 @@ fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
             col.words.indexFile(batch_keys[i], batch_vals[i]) catch {};
         }
         for (0..n) |i| {
-            col.releaseIndexQueueBytes(indexEntryBytes(batch_keys[i], batch_vals[i]));
-            col.alloc.free(batch_vals[i]);
-            col.alloc.free(batch_keys[i]);
+            const entry = batch_entries[i];
+            if (!entry.stored) {
+                col.releaseIndexQueueBytes(entry.queued_bytes);
+                col.alloc.free(entry.value);
+                col.alloc.free(entry.key);
+            }
         }
         _ = col.indexing_count.fetchSub(1, .release);
     }
     // Final drain on shutdown.
     while (queue.pop()) |entry| {
-        col.tri.indexFile(entry.key, entry.value) catch {};
-        col.words.indexFile(entry.key, entry.value) catch {};
-        col.releaseIndexQueueBytes(indexEntryBytes(entry.key, entry.value));
-        col.alloc.free(entry.value);
-        col.alloc.free(entry.key);
+        if (entry.stored) {
+            if (col.readEntry(entry.loc)) |doc| {
+                col.tri.indexFile(doc.key, doc.value) catch {};
+                col.words.indexFile(doc.key, doc.value) catch {};
+            }
+        } else {
+            col.tri.indexFile(entry.key, entry.value) catch {};
+            col.words.indexFile(entry.key, entry.value) catch {};
+            col.releaseIndexQueueBytes(entry.queued_bytes);
+            col.alloc.free(entry.value);
+            col.alloc.free(entry.key);
+        }
     }
 }
 

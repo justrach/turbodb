@@ -17,6 +17,8 @@ const Collection = collection.Collection;
 const Doc = doc_mod.Doc;
 
 const alloc = std.heap.c_allocator;
+const BULK_INSERT_CHUNK_ROWS: usize = 4096;
+const BULK_INSERT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
 
 // ── Handle wrappers with magic sentinel for validation ──────────────────────
 
@@ -173,6 +175,26 @@ export fn turbodb_insert_bulk_ndjson(
     var inserted: u32 = 0;
     var errors: u32 = 0;
     const input = body[0..body_len];
+    var rows: std.ArrayList(Collection.BulkInsertRow) = .empty;
+    defer rows.deinit(alloc);
+    var chunk_bytes: usize = 0;
+
+    const BulkFlush = struct {
+        fn run(
+            col_arg: *Collection,
+            rows_arg: *std.ArrayList(Collection.BulkInsertRow),
+            chunk_bytes_arg: *usize,
+            inserted_arg: *u32,
+            errors_arg: *u32,
+        ) !void {
+            if (rows_arg.items.len == 0) return;
+            const result = try col_arg.insertBulk(rows_arg.items);
+            inserted_arg.* += result.inserted;
+            errors_arg.* += result.errors;
+            rows_arg.clearRetainingCapacity();
+            chunk_bytes_arg.* = 0;
+        }
+    };
 
     var pos: usize = 0;
     while (pos < input.len) {
@@ -186,12 +208,18 @@ export fn turbodb_insert_bulk_ndjson(
             continue;
         };
         const value = jsonValue(line, "value") orelse line;
-        _ = col.insert(key, value) catch {
-            errors += 1;
-            continue;
-        };
-        inserted += 1;
+        const row_bytes = key.len + value.len + 128;
+        if (rows.items.len > 0 and chunk_bytes + row_bytes > BULK_INSERT_CHUNK_BYTES) {
+            BulkFlush.run(col, &rows, &chunk_bytes, &inserted, &errors) catch return -1;
+        }
+        rows.append(alloc, .{ .key = key, .value = value, .line_len = line.len }) catch return -1;
+        chunk_bytes += row_bytes;
+
+        if (rows.items.len >= BULK_INSERT_CHUNK_ROWS) {
+            BulkFlush.run(col, &rows, &chunk_bytes, &inserted, &errors) catch return -1;
+        }
     }
+    BulkFlush.run(col, &rows, &chunk_bytes, &inserted, &errors) catch return -1;
 
     out_inserted.* = inserted;
     out_errors.* = errors;
@@ -201,9 +229,12 @@ export fn turbodb_insert_bulk_ndjson(
 /// Insert with a pre-computed embedding (no JSON parsing). Fast path for vector inserts.
 export fn turbodb_insert_with_embedding(
     col_handle: *anyopaque,
-    key: [*]const u8, key_len: usize,
-    val: [*]const u8, val_len: usize,
-    embedding: [*]const f32, dims: u32,
+    key: [*]const u8,
+    key_len: usize,
+    val: [*]const u8,
+    val_len: usize,
+    embedding: [*]const f32,
+    dims: u32,
     out_id: *u64,
 ) c_int {
     const col = validateColHandle(col_handle) orelse return -1;
@@ -382,8 +413,9 @@ const KeyIter = struct {
         while (self.pos < self.body.len) {
             while (self.pos < self.body.len and
                 (self.body[self.pos] == ' ' or self.body[self.pos] == '\t' or
-                self.body[self.pos] == '\r' or self.body[self.pos] == '\n' or
-                self.body[self.pos] == ',')) : (self.pos += 1) {}
+                    self.body[self.pos] == '\r' or self.body[self.pos] == '\n' or
+                    self.body[self.pos] == ',')) : (self.pos += 1)
+            {}
             if (self.pos >= self.body.len or self.body[self.pos] == ']') return null;
 
             if (self.body[self.pos] == '"') {
