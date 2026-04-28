@@ -2,6 +2,9 @@
 /// Routes:
 ///   POST   /db/:col              insert document
 ///   POST   /db/:col/batch_get    get multiple documents by key
+///   POST   /db/:col/batch_update upsert multiple documents by key
+///   POST   /db/:col/batch_delete delete multiple documents by key
+///   POST   /db/:edge_col/join    read edge keys and batch-get target docs
 ///   GET    /db/:col/:key         get document by key
 ///   PUT    /db/:col/:key         upsert document
 ///   DELETE /db/:col/:key         delete document
@@ -20,15 +23,15 @@ const doc_mod = @import("doc.zig");
 const page_mod = @import("page.zig");
 const Database = collection.Database;
 
-const MAX_REQ  = 65536;  // 64 KiB (initial read)
+const MAX_REQ = 65536; // 64 KiB (initial read)
 const MAX_RESP = 131072; // 128 KiB
-const MAX_BODY = 65536;  // 64 KiB
+const MAX_BODY = 65536; // 64 KiB
 const MAX_BULK = 16 * 1024 * 1024; // 16 MiB for bulk inserts
 
 // Heap-allocated per-connection buffers (threadlocal pointers set in handleConn).
 // This avoids large threadlocal TLS segments that break in Release mode on macOS.
 const ConnBufs = struct {
-    req:  [MAX_REQ]u8,
+    req: [MAX_REQ]u8,
     resp: [MAX_RESP]u8,
     body: [MAX_BODY]u8,
 };
@@ -36,8 +39,12 @@ const ConnBufs = struct {
 const CONN_THREAD_STACK_SIZE = 1024 * 1024;
 threadlocal var tl_bufs: ?*ConnBufs = null;
 
-fn getRespBuf() *[MAX_RESP]u8 { return &tl_bufs.?.resp; }
-fn getBodyBuf() *[MAX_BODY]u8 { return &tl_bufs.?.body; }
+fn getRespBuf() *[MAX_RESP]u8 {
+    return &tl_bufs.?.resp;
+}
+fn getBodyBuf() *[MAX_BODY]u8 {
+    return &tl_bufs.?.body;
+}
 
 pub const Server = struct {
     pub const QueryCost = struct {
@@ -69,7 +76,7 @@ pub const Server = struct {
     query_cost_nanos_usd: std.atomic.Value(u64),
     // Ring buffer for billing log — avoids O(n) orderedRemove(0).
     billing_ring: [BILLING_LOG_CAP]QueryCost,
-    billing_ring_head: usize,  // next write position
+    billing_ring_head: usize, // next write position
     billing_ring_count: usize, // entries currently stored
     billing_mu: compat.Mutex,
     activity: activity.ActivityTracker,
@@ -78,10 +85,10 @@ pub const Server = struct {
 
     pub fn init(alloc: std.mem.Allocator, db: *Database, port: u16) Server {
         return .{
-            .db      = db,
-            .port    = port,
+            .db = db,
+            .port = port,
             .running = std.atomic.Value(bool).init(false),
-            .alloc   = alloc,
+            .alloc = alloc,
             .req_count = std.atomic.Value(u64).init(0),
             .err_count = std.atomic.Value(u64).init(0),
             .query_count = std.atomic.Value(u64).init(0),
@@ -124,7 +131,7 @@ pub const Server = struct {
                 _ = self.err_count.fetchAdd(1, .monotonic);
                 continue;
             }
-            const t = std.Thread.spawn(.{ .stack_size = CONN_THREAD_STACK_SIZE }, handleConnWrapped, .{self, conn}) catch {
+            const t = std.Thread.spawn(.{ .stack_size = CONN_THREAD_STACK_SIZE }, handleConnWrapped, .{ self, conn }) catch {
                 conn.stream.close();
                 _ = self.err_count.fetchAdd(1, .monotonic);
                 continue;
@@ -252,9 +259,7 @@ fn handleConn(srv: *Server, conn: compat.net.Server.Connection) void {
         // contain part of a large body.
         const content_length = extractContentLength(initial);
         if (content_length > 0) {
-            const header_end = if (std.mem.indexOf(u8, initial, "\r\n\r\n")) |p| p + 4
-                else if (std.mem.indexOf(u8, initial, "\n\n")) |p| p + 2
-                else n;
+            const header_end = if (std.mem.indexOf(u8, initial, "\r\n\r\n")) |p| p + 4 else if (std.mem.indexOf(u8, initial, "\n\n")) |p| p + 2 else n;
             const total_size = header_end + content_length;
             if (total_size > MAX_BULK) {
                 const resp_len = err(413, "request too large");
@@ -312,9 +317,7 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
     }
 
     // Body.
-    const body = if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |p| raw[p + 4 ..]
-                 else if (std.mem.indexOf(u8, raw, "\n\n")) |p| raw[p + 2 ..]
-                 else @as([]const u8, "");
+    const body = if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |p| raw[p + 4 ..] else if (std.mem.indexOf(u8, raw, "\n\n")) |p| raw[p + 2 ..] else @as([]const u8, "");
 
     // Route: /health
     if (std.mem.eql(u8, path, "/health")) {
@@ -326,17 +329,15 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
     // Route: /metrics
     if (std.mem.eql(u8, path, "/metrics")) {
         var fbs = compat.fixedBufferStream(getBodyBuf());
-        compat.format(fbs.writer(),
-            "{{\"requests\":{d},\"errors\":{d},\"queries\":{d},\"rows_scanned\":{d},\"bytes_read\":{d},\"cpu_us\":{d},\"cost_nanos_usd\":{d}}}",
-            .{
-                srv.req_count.load(.acquire),
-                srv.err_count.load(.acquire),
-                srv.query_count.load(.acquire),
-                srv.query_rows_scanned.load(.acquire),
-                srv.query_bytes_read.load(.acquire),
-                srv.query_cpu_us.load(.acquire),
-                srv.query_cost_nanos_usd.load(.acquire),
-            }) catch {};
+        compat.format(fbs.writer(), "{{\"requests\":{d},\"errors\":{d},\"queries\":{d},\"rows_scanned\":{d},\"bytes_read\":{d},\"cpu_us\":{d},\"cost_nanos_usd\":{d}}}", .{
+            srv.req_count.load(.acquire),
+            srv.err_count.load(.acquire),
+            srv.query_count.load(.acquire),
+            srv.query_rows_scanned.load(.acquire),
+            srv.query_bytes_read.load(.acquire),
+            srv.query_cpu_us.load(.acquire),
+            srv.query_cost_nanos_usd.load(.acquire),
+        }) catch {};
         return ok(getBodyBuf()[0..fbs.pos]);
     }
 
@@ -455,22 +456,31 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
             const tenant_id = requestTenant(raw, query, auth_ctx_ptr);
             // POST /db/:col/batch_get — read-only bulk point lookup.
             if (std.mem.eql(u8, key, "batch_get") and std.mem.eql(u8, method, "POST"))
-                return handleBatchGet(srv, tenant_id, col_name, body, requestAsOf(raw, query));
+                return handleBatchGet(srv, tenant_id, col_name, body, requestAsOf(raw, query), batchDocsCompact(query));
+            // POST /db/:edge_col/join — read-only edge doc lookup + target batch lookup.
+            if (std.mem.eql(u8, key, "join") and std.mem.eql(u8, method, "POST"))
+                return handleJoin(srv, tenant_id, col_name, body, batchDocsCompact(query));
             if (isBasicDbWriteMethod(method) and !canWriteDb(auth_ctx_ptr))
                 return err(403, "forbidden: API key is read-only");
+            // POST /db/:col/batch_update — write-gated bulk upsert.
+            if (std.mem.eql(u8, key, "batch_update") and std.mem.eql(u8, method, "POST"))
+                return handleBatchUpdate(srv, tenant_id, col_name, body, alloc);
+            // POST /db/:col/batch_delete — write-gated bulk delete.
+            if (std.mem.eql(u8, key, "batch_delete") and std.mem.eql(u8, method, "POST"))
+                return handleBatchDelete(srv, tenant_id, col_name, body);
             // POST /db/:col/bulk — bulk insert
             if (std.mem.eql(u8, key, "bulk") and std.mem.eql(u8, method, "POST"))
                 return handleBulkInsert(srv, tenant_id, col_name, body, alloc);
-            if (std.mem.eql(u8, method, "GET"))    return handleGet(srv, tenant_id, col_name, key, requestAsOf(raw, query));
-            if (std.mem.eql(u8, method, "PUT"))    return handleUpdate(srv, tenant_id, col_name, key, body, alloc);
+            if (std.mem.eql(u8, method, "GET")) return handleGet(srv, tenant_id, col_name, key, requestAsOf(raw, query));
+            if (std.mem.eql(u8, method, "PUT")) return handleUpdate(srv, tenant_id, col_name, key, body, alloc);
             if (std.mem.eql(u8, method, "DELETE")) return handleDelete(srv, tenant_id, col_name, key);
         } else {
             const col_name = rest;
             const tenant_id = requestTenant(raw, query, auth_ctx_ptr);
             if (isBasicDbWriteMethod(method) and !canWriteDb(auth_ctx_ptr))
                 return err(403, "forbidden: API key is read-only");
-            if (std.mem.eql(u8, method, "POST"))   return handleInsert(srv, tenant_id, col_name, body, alloc);
-            if (std.mem.eql(u8, method, "GET"))    return handleScan(srv, tenant_id, col_name, query, requestAsOf(raw, query), alloc);
+            if (std.mem.eql(u8, method, "POST")) return handleInsert(srv, tenant_id, col_name, body, alloc);
+            if (std.mem.eql(u8, method, "GET")) return handleScan(srv, tenant_id, col_name, query, requestAsOf(raw, query), alloc);
             if (std.mem.eql(u8, method, "DELETE")) return handleDrop(srv, tenant_id, col_name);
         }
     }
@@ -505,9 +515,7 @@ fn doInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []co
     const doc_id = col.insert(key, value) catch return err(500, "insert failed");
     srv.recordQueryCost(tenant_id, "insert", 1, value.len, start_ns);
     var fbs = compat.fixedBufferStream(getBodyBuf());
-    compat.format(fbs.writer(),
-        "{{\"doc_id\":{d},\"key\":\"{s}\",\"collection\":\"{s}\",\"tenant\":\"{s}\"}}",
-        .{ doc_id, key, col_name, tenant_id }) catch {};
+    compat.format(fbs.writer(), "{{\"doc_id\":{d},\"key\":\"{s}\",\"collection\":\"{s}\",\"tenant\":\"{s}\"}}", .{ doc_id, key, col_name, tenant_id }) catch {};
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 
@@ -551,30 +559,146 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
     srv.recordQueryCost(tenant_id, "bulk_insert", inserted, total_bytes, start_ns);
 
     var fbs = compat.fixedBufferStream(getBodyBuf());
-    compat.format(fbs.writer(),
-        "{{\"inserted\":{d},\"errors\":{d},\"collection\":\"{s}\",\"tenant\":\"{s}\"}}",
-        .{ inserted, errors, col_name, tenant_id }) catch {};
+    compat.format(fbs.writer(), "{{\"inserted\":{d},\"errors\":{d},\"collection\":\"{s}\",\"tenant\":\"{s}\"}}", .{ inserted, errors, col_name, tenant_id }) catch {};
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 
 /// POST /db/:col/batch_get — read multiple documents in one request.
 /// Body can be a JSON string array, {"keys":[...]}, or one key per line.
-fn handleBatchGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8, as_of: ?i64) usize {
+fn handleBatchGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8, as_of: ?i64, compact: bool) usize {
+    const start_ns = compat.nanoTimestamp();
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+    var iter = KeyIter.init(body);
+    return writeBatchDocsResponse(srv, tenant_id, col_name, col, &iter, as_of, "batch_get", start_ns, 0, compact);
+}
+
+/// POST /db/:col/batch_update — upsert multiple documents in one request.
+/// Body: NDJSON — one {"key":"...","value":...} per line.
+fn handleBatchUpdate(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
+    _ = alloc;
+    const start_ns = compat.nanoTimestamp();
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    srv.db.ensureTenantStorageAvailable(tenant_id, body.len) catch return err(429, "tenant storage quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+
+    var iter = BatchUpdateIter.init(body);
+    var updated: u32 = 0;
+    var inserted: u32 = 0;
+    var errors: u32 = 0;
+    var total_bytes: u64 = 0;
+
+    while (iter.next()) |entry| {
+        if (!entry.valid) {
+            errors += 1;
+            continue;
+        }
+        if (!documentFitsLeaf(entry.key, entry.value)) {
+            errors += 1;
+            continue;
+        }
+
+        const did_update = col.update(entry.key, entry.value) catch {
+            errors += 1;
+            continue;
+        };
+        if (did_update) {
+            updated += 1;
+        } else {
+            _ = col.insert(entry.key, entry.value) catch {
+                errors += 1;
+                continue;
+            };
+            inserted += 1;
+        }
+        total_bytes += entry.line_len;
+    }
+
+    srv.recordQueryCost(tenant_id, "batch_update", updated + inserted + errors, total_bytes, start_ns);
+
+    var fbs = compat.fixedBufferStream(getBodyBuf());
+    compat.format(fbs.writer(), "{{\"updated\":{d},\"inserted\":{d},\"errors\":{d},\"collection\":\"{s}\",\"tenant\":\"{s}\"}}", .{ updated, inserted, errors, col_name, tenant_id }) catch {};
+    return ok(getBodyBuf()[0..fbs.pos]);
+}
+
+/// POST /db/:col/batch_delete — delete multiple documents in one request.
+/// Body can be a JSON string array, {"keys":[...]}, or one key per line.
+fn handleBatchDelete(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8) usize {
     const start_ns = compat.nanoTimestamp();
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
 
+    var iter = KeyIter.init(body);
+    var deleted: u32 = 0;
+    var missing: u32 = 0;
+    var errors: u32 = 0;
+    while (iter.next()) |key| {
+        if (key.len == 0) continue;
+        const did_delete = col.delete(key) catch {
+            errors += 1;
+            continue;
+        };
+        if (did_delete) deleted += 1 else missing += 1;
+    }
+
+    srv.recordQueryCost(tenant_id, "batch_delete", deleted + missing + errors, 0, start_ns);
+
+    var fbs = compat.fixedBufferStream(getBodyBuf());
+    compat.format(fbs.writer(), "{{\"deleted\":{d},\"missing\":{d},\"errors\":{d},\"collection\":\"{s}\",\"tenant\":\"{s}\"}}", .{ deleted, missing, errors, col_name, tenant_id }) catch {};
+    return ok(getBodyBuf()[0..fbs.pos]);
+}
+
+/// POST /db/:edge_col/join — read edge.value[field] as target keys and batch-get targets.
+fn handleJoin(srv: *Server, tenant_id: []const u8, edge_col_name: []const u8, body: []const u8, compact: bool) usize {
+    const req = JoinRequest.parse(body) orelse return err(400, "missing key, target_collection, or field");
+    const start_ns = compat.nanoTimestamp();
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    const edge_col = srv.db.collectionForTenant(tenant_id, edge_col_name) catch return err(500, "open collection failed");
+    const target_col = srv.db.collectionForTenant(tenant_id, req.target_collection) catch return err(500, "open collection failed");
+
+    const edge = edge_col.get(req.key) orelse return err(404, "not found");
+    const raw_keys = jsonValue(edge.value, req.field) orelse return err(400, "missing join field");
+    const keys = std.mem.trim(u8, raw_keys, " \t\r\n");
+    if (keys.len == 0 or keys[0] != '[') return err(400, "join field must be an array");
+
+    var iter = KeyIter.init(keys);
+    return writeBatchDocsResponse(
+        srv,
+        tenant_id,
+        req.target_collection,
+        target_col,
+        &iter,
+        null,
+        "join",
+        start_ns,
+        edge.key.len + edge.value.len,
+        compact,
+    );
+}
+
+fn writeBatchDocsResponse(
+    srv: *Server,
+    tenant_id: []const u8,
+    col_name: []const u8,
+    col: *collection.Collection,
+    iter: *KeyIter,
+    as_of: ?i64,
+    op_name: []const u8,
+    start_ns: i128,
+    initial_bytes_read: usize,
+    compact: bool,
+) usize {
     const HEADER_RESERVE = 256;
     var resp = getRespBuf();
     var fbs = compat.fixedBufferStream(resp[HEADER_RESERVE..]);
     const w = fbs.writer();
-    compat.format(w, "{{\"tenant\":\"{s}\",\"collection\":\"{s}\",\"docs\":[",
-        .{ tenant_id, col_name }) catch return err(500, "response too large");
+    if (!compact) {
+        compat.format(w, "{{\"tenant\":\"{s}\",\"collection\":\"{s}\",\"docs\":[", .{ tenant_id, col_name }) catch return err(500, "response too large");
+    }
 
-    var iter = KeyIter.init(body);
     var found: usize = 0;
     var missing: usize = 0;
-    var bytes_read: usize = 0;
+    var bytes_read: usize = initial_bytes_read;
     var truncated = false;
     while (iter.next()) |key| {
         if (key.len == 0) continue;
@@ -589,29 +713,32 @@ fn handleBatchGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, bod
                 continue;
             });
 
-        const val = if (d.value.len > 0) d.value else "{}";
-        const is_json = isJsonValue(val);
-        const next_len = (if (found > 0) @as(usize, 1) else 0) + docJsonLen(d, val, is_json);
-        if (fbs.pos + next_len + 80 >= resp[HEADER_RESERVE..].len) {
-            truncated = true;
-            break;
+        if (!compact) {
+            const val = if (d.value.len > 0) d.value else "{}";
+            const is_json = isJsonValue(val);
+            const next_len = (if (found > 0) @as(usize, 1) else 0) + docJsonLen(d, val, is_json);
+            if (fbs.pos + next_len + 80 >= resp[HEADER_RESERVE..].len) {
+                truncated = true;
+                break;
+            }
+            if (found > 0) w.writeByte(',') catch return err(500, "response too large");
+            writeDocJson(w, d, val, is_json) catch return err(500, "response too large");
         }
-        if (found > 0) w.writeByte(',') catch return err(500, "response too large");
-        writeDocJson(w, d, val, is_json) catch return err(500, "response too large");
         found += 1;
         bytes_read += d.key.len + d.value.len;
     }
 
-    compat.format(w, "],\"count\":{d},\"missing\":{d},\"truncated\":{}}}",
-        .{ found, missing, truncated }) catch return err(500, "response too large");
+    if (compact) {
+        compat.format(w, "{{\"tenant\":\"{s}\",\"collection\":\"{s}\",\"count\":{d},\"missing\":{d},\"bytes_read\":{d},\"truncated\":{},\"mode\":\"count\"}}", .{ tenant_id, col_name, found, missing, bytes_read, truncated }) catch return err(500, "response too large");
+    } else {
+        compat.format(w, "],\"count\":{d},\"missing\":{d},\"truncated\":{}}}", .{ found, missing, truncated }) catch return err(500, "response too large");
+    }
     const body_len = fbs.pos;
 
-    srv.recordQueryCost(tenant_id, "batch_get", found + missing, bytes_read, start_ns);
+    srv.recordQueryCost(tenant_id, op_name, found + missing, bytes_read, start_ns);
 
     var hdr_fbs = compat.fixedBufferStream(resp[0..HEADER_RESERVE]);
-    compat.format(hdr_fbs.writer(),
-        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
-        .{body_len}) catch {};
+    compat.format(hdr_fbs.writer(), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n", .{body_len}) catch {};
     const hdr_len = hdr_fbs.pos;
     if (hdr_len < HEADER_RESERVE) {
         std.mem.copyForwards(u8, resp[hdr_len .. hdr_len + body_len], resp[HEADER_RESERVE .. HEADER_RESERVE + body_len]);
@@ -620,38 +747,36 @@ fn handleBatchGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, bod
 }
 
 fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, as_of: ?i64) usize {
-        const start_ns = compat.nanoTimestamp();
-        srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
-        const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
-        const d = if (as_of) |ts_ms|
-            (col.getAsOfTimestamp(key, ts_ms) orelse return err(404, "not found"))
-        else
-            (col.get(key) orelse return err(404, "not found"));
-        srv.recordQueryCost(tenant_id, "get", 1, d.key.len + d.value.len, start_ns);
+    const start_ns = compat.nanoTimestamp();
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+    const d = if (as_of) |ts_ms|
+        (col.getAsOfTimestamp(key, ts_ms) orelse return err(404, "not found"))
+    else
+        (col.get(key) orelse return err(404, "not found"));
+    srv.recordQueryCost(tenant_id, "get", 1, d.key.len + d.value.len, start_ns);
 
-        // Write JSON body directly into resp_buf at offset 256 (reserve space for headers)
-        const HEADER_RESERVE = 256;
-        var resp = getRespBuf();
-        var fbs = compat.fixedBufferStream(resp[HEADER_RESERVE..]);
-        const val = if (d.value.len > 0) d.value else "{}";
-        const is_json = isJsonValue(val);
-        const w = fbs.writer();
-        writeDocJson(w, d, val, is_json) catch return err(500, "response too large");
-        const body_len = fbs.pos;
+    // Write JSON body directly into resp_buf at offset 256 (reserve space for headers)
+    const HEADER_RESERVE = 256;
+    var resp = getRespBuf();
+    var fbs = compat.fixedBufferStream(resp[HEADER_RESERVE..]);
+    const val = if (d.value.len > 0) d.value else "{}";
+    const is_json = isJsonValue(val);
+    const w = fbs.writer();
+    writeDocJson(w, d, val, is_json) catch return err(500, "response too large");
+    const body_len = fbs.pos;
 
-        // Now write headers into the reserved space at the front
-        var hdr_fbs = compat.fixedBufferStream(resp[0..HEADER_RESERVE]);
-        compat.format(hdr_fbs.writer(),
-            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
-            .{body_len}) catch {};
-        const hdr_len = hdr_fbs.pos;
+    // Now write headers into the reserved space at the front
+    var hdr_fbs = compat.fixedBufferStream(resp[0..HEADER_RESERVE]);
+    compat.format(hdr_fbs.writer(), "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n", .{body_len}) catch {};
+    const hdr_len = hdr_fbs.pos;
 
-        // Move body right after headers (memmove if needed)
-        if (hdr_len < HEADER_RESERVE) {
-            std.mem.copyForwards(u8, resp[hdr_len .. hdr_len + body_len], resp[HEADER_RESERVE .. HEADER_RESERVE + body_len]);
-        }
-        return hdr_len + body_len;
+    // Move body right after headers (memmove if needed)
+    if (hdr_len < HEADER_RESERVE) {
+        std.mem.copyForwards(u8, resp[hdr_len .. hdr_len + body_len], resp[HEADER_RESERVE .. HEADER_RESERVE + body_len]);
     }
+    return hdr_len + body_len;
+}
 
 fn handleUpdate(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
     const start_ns = compat.nanoTimestamp();
@@ -670,9 +795,7 @@ fn handleUpdate(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: 
     srv.recordQueryCost(tenant_id, "upsert", 1, body.len, start_ns);
 
     var buf: [128]u8 = undefined;
-    const response = std.fmt.bufPrint(&buf,
-        "{{\"updated\":false,\"inserted\":true,\"doc_id\":{d}}}",
-        .{doc_id}) catch return err(500, "format failed");
+    const response = std.fmt.bufPrint(&buf, "{{\"updated\":false,\"inserted\":true,\"doc_id\":{d}}}", .{doc_id}) catch return err(500, "format failed");
     return ok(response);
 }
 
@@ -709,8 +832,7 @@ fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_s
 
     var fbs = compat.fixedBufferStream(getBodyBuf());
     const w = fbs.writer();
-    compat.format(w, "{{\"tenant\":\"{s}\",\"collection\":\"{s}\",\"count\":{d},\"docs\":[",
-        .{ tenant_id, col_name, emit_count }) catch {};
+    compat.format(w, "{{\"tenant\":\"{s}\",\"collection\":\"{s}\",\"count\":{d},\"docs\":[", .{ tenant_id, col_name, emit_count }) catch {};
     for (result.docs[0..emit_count], 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
         const val = if (d.value.len > 0) d.value else "{}";
@@ -723,7 +845,6 @@ fn handleScan(srv: *Server, tenant_id: []const u8, col_name: []const u8, query_s
     }
     w.writeAll("]}") catch {};
     return ok(getBodyBuf()[0..fbs.pos]);
-
 }
 
 fn scanEmitCount(tenant_id: []const u8, col_name: []const u8, docs: []const doc_mod.Doc) usize {
@@ -834,12 +955,12 @@ fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query
     // Write JSON header with escaped query string
     w.writeAll("{\"query\":\"") catch {};
     for (query) |ch| {
-        if (ch == '"' or ch == '\\') { w.writeByte('\\') catch {}; }
+        if (ch == '"' or ch == '\\') {
+            w.writeByte('\\') catch {};
+        }
         w.writeByte(ch) catch {};
     }
-    compat.format(w,
-        "\",\"hits\":{d},\"candidates\":{d},\"total_docs\":{d},\"total_files\":{d},\"results\":[",
-        .{ result.docs.len, result.candidate_paths.len, col.docCount(), result.total_files }) catch {};
+    compat.format(w, "\",\"hits\":{d},\"candidates\":{d},\"total_docs\":{d},\"total_files\":{d},\"results\":[", .{ result.docs.len, result.candidate_paths.len, col.docCount(), result.total_files }) catch {};
     for (result.docs, 0..) |d, i| {
         if (fbs.pos + 256 >= MAX_BODY) break;
         if (i > 0) w.writeByte(',') catch {};
@@ -853,7 +974,10 @@ fn handleSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8, query
             compat.format(w, "{d},\"key\":\"{s}\",\"value\":\"", .{ d.header.doc_id, d.key }) catch {};
             for (val) |ch| {
                 if (ch == '"' or ch == '\\') w.writeByte('\\') catch {};
-                if (ch == '\n') { w.writeAll("\\n") catch {}; continue; }
+                if (ch == '\n') {
+                    w.writeAll("\\n") catch {};
+                    continue;
+                }
                 w.writeByte(ch) catch {};
             }
             w.writeAll("\"}") catch {};
@@ -879,7 +1003,9 @@ fn handleDiscoverContext(srv: *Server, tenant_id: []const u8, col_name: []const 
     // Write JSON: matching_files
     w.writeAll("{\"query\":\"") catch {};
     for (query) |ch| {
-        if (ch == '"' or ch == '\\') { w.writeByte('\\') catch {}; }
+        if (ch == '"' or ch == '\\') {
+            w.writeByte('\\') catch {};
+        }
         w.writeByte(ch) catch {};
     }
     w.writeAll("\",\"matching_files\":[") catch {};
@@ -940,7 +1066,8 @@ fn handleBillingLog(srv: *Server) usize {
         const idx = (start_idx + i) % cap;
         const entry = srv.billing_ring[idx];
         if (i > 0) w.writeByte(',') catch {};
-        compat.format(w,
+        compat.format(
+            w,
             "{{\"tenant\":\"{s}\",\"op\":\"{s}\",\"rows_scanned\":{d},\"bytes_read\":{d},\"cpu_us\":{d},\"cost_nanos_usd\":{d}}}",
             .{
                 entry.tenant_id[0..entry.tenant_id_len],
@@ -985,7 +1112,8 @@ fn handleCdcEvents(srv: *Server, tenant_filter: ?[]const u8, alloc: std.mem.Allo
     w.writeAll("{\"events\":[") catch {};
     for (deliveries, 0..) |entry, i| {
         if (i > 0) w.writeByte(',') catch {};
-        compat.format(w,
+        compat.format(
+            w,
             "{{\"seq\":{d},\"tenant\":\"{s}\",\"collection\":\"{s}\",\"webhook_url\":\"{s}\",\"signature\":\"{s}\",\"payload\":{s}}}",
             .{
                 entry.seq,
@@ -1062,10 +1190,7 @@ fn handleBranchSearch(srv: *Server, tenant_id: []const u8, col_name: []const u8,
     compat.format(w, "{{\"branch\":\"{s}\",\"hits\":{d},\"results\":[", .{ branch_name, result.docs.len }) catch {};
     for (result.docs, 0..) |d, i| {
         if (i > 0) w.writeByte(',') catch {};
-        compat.format(w,
-            "{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":{s}}}",
-            .{ d.header.doc_id, d.key,
-               if (d.value.len > 0) d.value else "{}" }) catch {};
+        compat.format(w, "{{\"doc_id\":{d},\"key\":\"{s}\",\"value\":{s}}}", .{ d.header.doc_id, d.key, if (d.value.len > 0) d.value else "{}" }) catch {};
     }
     w.writeAll("]}") catch {};
     return ok(getBodyBuf()[0..fbs.pos]);
@@ -1128,6 +1253,14 @@ fn canWriteDb(auth_ctx: ?*const auth.AuthContext) bool {
 fn requestAsOf(raw: []const u8, query: []const u8) ?i64 {
     const value = header(raw, "X-As-Of: ") orelse qparam(query, "as_of") orelse return null;
     return parseAsOfTimestamp(value);
+}
+
+fn batchDocsCompact(query: []const u8) bool {
+    if (qparam(query, "mode")) |mode|
+        return std.mem.eql(u8, mode, "count") or std.mem.eql(u8, mode, "compact");
+    if (qparam(query, "docs")) |docs|
+        return std.mem.eql(u8, docs, "0") or std.mem.eql(u8, docs, "false");
+    return false;
 }
 
 fn header(raw: []const u8, needle: []const u8) ?[]const u8 {
@@ -1279,8 +1412,9 @@ const KeyIter = struct {
         while (self.pos < self.body.len) {
             while (self.pos < self.body.len and
                 (self.body[self.pos] == ' ' or self.body[self.pos] == '\t' or
-                self.body[self.pos] == '\r' or self.body[self.pos] == '\n' or
-                self.body[self.pos] == ',')) : (self.pos += 1) {}
+                    self.body[self.pos] == '\r' or self.body[self.pos] == '\n' or
+                    self.body[self.pos] == ',')) : (self.pos += 1)
+            {}
             if (self.pos >= self.body.len or self.body[self.pos] == ']') return null;
 
             if (self.body[self.pos] == '"') {
@@ -1307,6 +1441,59 @@ const KeyIter = struct {
             return raw_key;
         }
         return null;
+    }
+};
+
+const BatchUpdateLine = struct {
+    key: []const u8 = "",
+    value: []const u8 = "",
+    line_len: usize = 0,
+    valid: bool = false,
+};
+
+const BatchUpdateIter = struct {
+    body: []const u8,
+    pos: usize = 0,
+
+    fn init(body: []const u8) BatchUpdateIter {
+        return .{ .body = body };
+    }
+
+    fn next(self: *BatchUpdateIter) ?BatchUpdateLine {
+        while (self.pos < self.body.len) {
+            const line_end = std.mem.indexOfScalarPos(u8, self.body, self.pos, '\n') orelse self.body.len;
+            const line = std.mem.trim(u8, self.body[self.pos..line_end], " \t\r");
+            self.pos = if (line_end < self.body.len) line_end + 1 else line_end;
+            if (line.len == 0) continue;
+
+            const key = jsonStr(line, "key") orelse return .{ .line_len = line.len };
+            const value = jsonValue(line, "value") orelse return .{ .line_len = line.len };
+            return .{
+                .key = key,
+                .value = value,
+                .line_len = line.len,
+                .valid = true,
+            };
+        }
+        return null;
+    }
+};
+
+const JoinRequest = struct {
+    key: []const u8,
+    target_collection: []const u8,
+    field: []const u8,
+
+    fn parse(body: []const u8) ?JoinRequest {
+        const key = jsonStr(body, "key") orelse return null;
+        const target_collection = jsonStr(body, "target_collection") orelse return null;
+        const field = jsonStr(body, "field") orelse return null;
+        if (key.len == 0 or target_collection.len == 0 or field.len == 0) return null;
+        return .{
+            .key = key,
+            .target_collection = target_collection,
+            .field = field,
+        };
     }
 };
 
@@ -1342,7 +1529,10 @@ fn jsonValue(json: []const u8, key: []const u8) ?[]const u8 {
         // and re-emitted verbatim by handleGet.
         var i = start + 1;
         while (i < json.len) : (i += 1) {
-            if (json[i] == '\\' and i + 1 < json.len) { i += 1; continue; }
+            if (json[i] == '\\' and i + 1 < json.len) {
+                i += 1;
+                continue;
+            }
             if (json[i] == '"') return json[start .. i + 1]; // include both quotes
         }
         return null; // unterminated string — don't read past buffer
@@ -1353,8 +1543,14 @@ fn jsonValue(json: []const u8, key: []const u8) ?[]const u8 {
         var i = start + 1;
         var in_str = false;
         while (i < json.len and depth > 0) : (i += 1) {
-            if (json[i] == '\\' and in_str) { i += 1; continue; }
-            if (json[i] == '"') { in_str = !in_str; continue; }
+            if (json[i] == '\\' and in_str) {
+                i += 1;
+                continue;
+            }
+            if (json[i] == '"') {
+                in_str = !in_str;
+                continue;
+            }
             if (in_str) continue;
             if (json[i] == ch) depth += 1;
             if (json[i] == close) depth -= 1;
@@ -1456,7 +1652,10 @@ fn headerContains(raw: []const u8, name: []const u8, value: []const u8) bool {
                 const b = name[j];
                 const al = if (a >= 'A' and a <= 'Z') a + 32 else a;
                 const bl = if (b >= 'A' and b <= 'Z') b + 32 else b;
-                if (al != bl) { match = false; break; }
+                if (al != bl) {
+                    match = false;
+                    break;
+                }
             }
             if (!match) continue;
             if (headers[line_start + name.len] != ':') continue;
@@ -1473,7 +1672,10 @@ fn headerContains(raw: []const u8, name: []const u8, value: []const u8) bool {
                 const b = value[j];
                 const al = if (a >= 'A' and a <= 'Z') a + 32 else a;
                 const bl = if (b >= 'A' and b <= 'Z') b + 32 else b;
-                if (al != bl) { vmatch = false; break; }
+                if (al != bl) {
+                    vmatch = false;
+                    break;
+                }
             }
             if (vmatch) return true;
         }
@@ -1495,7 +1697,10 @@ fn headerValue(raw: []const u8, name: []const u8) ?[]const u8 {
                 const b = name[j];
                 const al = if (a >= 'A' and a <= 'Z') a + 32 else a;
                 const bl = if (b >= 'A' and b <= 'Z') b + 32 else b;
-                if (al != bl) { match = false; break; }
+                if (al != bl) {
+                    match = false;
+                    break;
+                }
             }
             if (!match) continue;
             if (headers[ls + name.len] != ':') continue;
@@ -1528,9 +1733,7 @@ fn handleWebSocket(srv: *Server, conn: compat.net.Server.Connection, initial: []
 
     // Send upgrade response
     var resp_buf: [256]u8 = undefined;
-    const resp_len = std.fmt.bufPrint(&resp_buf,
-        "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n",
-        .{accept}) catch return error.FormatFailed;
+    const resp_len = std.fmt.bufPrint(&resp_buf, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{accept}) catch return error.FormatFailed;
     conn.stream.writeAll(resp_len) catch return error.WriteFailed;
 
     // WebSocket frame loop — heap-allocate frame buffer (too large for stack).
@@ -1567,7 +1770,7 @@ fn handleWebSocket(srv: *Server, conn: compat.net.Server.Connection, initial: []
         }
 
         // Read mask key (4 bytes if masked)
-        var mask: [4]u8 = .{0, 0, 0, 0};
+        var mask: [4]u8 = .{ 0, 0, 0, 0 };
         if (masked) wsReadExact(conn, &mask) catch return;
 
         // Read payload
@@ -1610,9 +1813,7 @@ fn wsDispatch(srv: *Server, msg: []const u8) []const u8 {
     const http_buf = std.heap.page_allocator.alloc(u8, needed) catch
         return "{\"error\":\"request too large\"}";
     defer std.heap.page_allocator.free(http_buf);
-    const http_len = std.fmt.bufPrint(http_buf,
-        "{s} HTTP/1.1\r\nContent-Length: {d}\r\n\r\n{s}",
-        .{ req_line, body.len, body }) catch return "{\"error\":\"request too large\"}";
+    const http_len = std.fmt.bufPrint(http_buf, "{s} HTTP/1.1\r\nContent-Length: {d}\r\n\r\n{s}", .{ req_line, body.len, body }) catch return "{\"error\":\"request too large\"}";
 
     const resp_len = dispatch(srv, http_len, std.heap.page_allocator);
     const resp = getRespBuf()[0..resp_len];
@@ -1644,7 +1845,7 @@ fn wsWriteText(conn: compat.net.Server.Connection, payload: []const u8) !void {
 fn wsWriteClose(conn: compat.net.Server.Connection, code: u16) void {
     var frame: [4]u8 = undefined;
     frame[0] = 0x88; // FIN + close
-    frame[1] = 2;    // payload = 2 bytes (status code)
+    frame[1] = 2; // payload = 2 bytes (status code)
     std.mem.writeInt(u16, frame[2..4], code, .big);
     conn.stream.writeAll(&frame) catch {};
 }
@@ -1730,4 +1931,43 @@ test "KeyIter reads JSON arrays and keyed newline bodies" {
     try std.testing.expectEqualStrings("plain", line_iter.next().?);
     try std.testing.expectEqualStrings("quoted", line_iter.next().?);
     try std.testing.expect(line_iter.next() == null);
+}
+
+test "BatchUpdateIter reads NDJSON key value lines and flags invalid lines" {
+    var iter = BatchUpdateIter.init(
+        "{\"key\":\"a\",\"value\":{\"n\":1}}\n" ++
+            "{\"key\":\"b\",\"value\":\"text\"}\n" ++
+            "{\"key\":\"missing-value\"}\n",
+    );
+
+    const first = iter.next().?;
+    try std.testing.expect(first.valid);
+    try std.testing.expectEqualStrings("a", first.key);
+    try std.testing.expectEqualStrings("{\"n\":1}", first.value);
+
+    const second = iter.next().?;
+    try std.testing.expect(second.valid);
+    try std.testing.expectEqualStrings("b", second.key);
+    try std.testing.expectEqualStrings("\"text\"", second.value);
+
+    const third = iter.next().?;
+    try std.testing.expect(!third.valid);
+    try std.testing.expect(iter.next() == null);
+}
+
+test "JoinRequest parses required join fields" {
+    const req = JoinRequest.parse("{\"key\":\"customer-1\",\"target_collection\":\"orders\",\"field\":\"order_ids\"}").?;
+    try std.testing.expectEqualStrings("customer-1", req.key);
+    try std.testing.expectEqualStrings("orders", req.target_collection);
+    try std.testing.expectEqualStrings("order_ids", req.field);
+
+    try std.testing.expect(JoinRequest.parse("{\"key\":\"customer-1\",\"field\":\"order_ids\"}") == null);
+}
+
+test "batchDocsCompact detects compact response query options" {
+    try std.testing.expect(batchDocsCompact("mode=count"));
+    try std.testing.expect(batchDocsCompact("mode=compact&tenant=t1"));
+    try std.testing.expect(batchDocsCompact("tenant=t1&docs=0"));
+    try std.testing.expect(!batchDocsCompact("mode=full"));
+    try std.testing.expect(!batchDocsCompact(""));
 }

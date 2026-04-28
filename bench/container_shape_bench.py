@@ -69,6 +69,18 @@ def timed_loop(items: list[Any], fn: Callable[[Any], Any], extra: dict[str, Any]
     return metric(now() - start, len(items), latencies, extra)
 
 
+def timed_batch_loop(batches: list[list[Any]], fn: Callable[[list[Any]], Any], extra: dict[str, Any] | None = None) -> dict[str, Any]:
+    latencies: list[float] = []
+    ops = sum(len(batch) for batch in batches)
+    start = now()
+    for batch in batches:
+        op_start = now()
+        fn(batch)
+        batch_elapsed_ms = (now() - op_start) * 1000.0
+        latencies.extend([batch_elapsed_ms / len(batch)] * len(batch))
+    return metric(now() - start, ops, latencies, extra)
+
+
 def user_doc(user_id: int) -> dict[str, Any]:
     return {
         "id": user_id,
@@ -123,8 +135,8 @@ class TurboDBBench:
         self.batch_size = batch_size
         self.conn = http.client.HTTPConnection(host, port, timeout=10)
 
-    def request(self, method: str, path: str, body: bytes | None = None) -> bytes:
-        headers = {"content-type": "application/json"}
+    def request(self, method: str, path: str, body: bytes | None = None, content_type: str = "application/json") -> bytes:
+        headers = {"content-type": content_type}
         try:
             self.conn.request(method, path, body=body, headers=headers)
             resp = self.conn.getresponse()
@@ -164,6 +176,20 @@ class TurboDBBench:
         for key, value in rows:
             lines.append(json.dumps({"key": key, "value": value}, separators=(",", ":")))
         self.request("POST", f"/db/{collection}/bulk", ("\n".join(lines) + "\n").encode())
+
+    def batches(self, values: list[Any]) -> list[list[Any]]:
+        batch_size = max(self.batch_size, 1)
+        return [values[i:i + batch_size] for i in range(0, len(values), batch_size)]
+
+    def batch_update(self, collection: str, rows: list[tuple[str, dict[str, Any]]]) -> None:
+        lines = []
+        for key, value in rows:
+            lines.append(json.dumps({"key": key, "value": value}, separators=(",", ":")))
+        self.request("POST", f"/db/{collection}/batch_update", ("\n".join(lines) + "\n").encode(), "application/x-ndjson")
+
+    def batch_delete(self, collection: str, keys: list[int]) -> None:
+        body = ("\n".join(str(key) for key in keys) + "\n").encode()
+        self.request("POST", f"/db/{collection}/batch_delete", body, "text/plain")
 
     def ingest(self) -> dict[str, Any]:
         self.drop()
@@ -208,35 +234,48 @@ class TurboDBBench:
         body = json.dumps({"keys": [str(key) for key in keys]}, separators=(",", ":")).encode()
         return json.loads(self.request("POST", f"/db/{collection}/batch_get", body).decode())["docs"]
 
+    def batch_get_count(self, collection: str, keys: list[int]) -> None:
+        body = json.dumps({"keys": [str(key) for key in keys]}, separators=(",", ":")).encode()
+        self.request("POST", f"/db/{collection}/batch_get?mode=count", body)
+
     def point_get(self, samples: list[int]) -> dict[str, Any]:
         return timed_loop(samples, lambda uid: self.get_doc("bench_users", uid))
 
     def order_lookup(self, samples: list[int]) -> dict[str, Any]:
         def op(uid: int) -> None:
             edge = self.get_doc("bench_user_orders", uid)["value"]
-            self.batch_get_docs("bench_orders", edge["order_ids"])
+            self.batch_get_count("bench_orders", edge["order_ids"])
 
-        return timed_loop(samples, op, {"orders_per_lookup": self.shape.orders_per_user, "mode": "materialized_edge_batch_get"})
+        return timed_loop(samples, op, {"orders_per_lookup": self.shape.orders_per_user, "mode": "materialized_edge_batch_get_count"})
 
     def join_like(self, samples: list[int]) -> dict[str, Any]:
         def op(uid: int) -> None:
-            user = self.get_doc("bench_users", uid)["value"]
-            edge = self.get_doc("bench_user_orders", uid)["value"]
-            orders = self.batch_get_docs("bench_orders", edge["order_ids"])
-            _ = (user["email"], len(orders))
+            body = json.dumps({
+                "key": str(uid),
+                "target_collection": "bench_orders",
+                "field": "order_ids",
+            }, separators=(",", ":")).encode()
+            self.request("POST", "/db/bench_user_orders/join?mode=count", body)
 
-        return timed_loop(samples, op, {"mode": "materialized_edge_batch_get"})
+        return timed_loop(samples, op, {"mode": "server_join_edge_field_count"})
 
     def update_orders(self, samples: list[int]) -> dict[str, Any]:
-        def op(oid: int) -> None:
-            value = order_doc(oid, ((oid - 1) // self.shape.orders_per_user) + 1)
-            value["status"] = "updated"
-            self.request("PUT", f"/db/bench_orders/{oid}", json.dumps(value).encode())
+        def op(batch: list[int]) -> None:
+            rows = []
+            for oid in batch:
+                value = order_doc(oid, ((oid - 1) // self.shape.orders_per_user) + 1)
+                value["status"] = "updated"
+                rows.append((str(oid), value))
+            self.batch_update("bench_orders", rows)
 
-        return timed_loop(samples, op)
+        return timed_batch_loop(self.batches(samples), op, {"mode": "http_ndjson_batch_update", "latency_unit": "amortized_row"})
 
     def delete_orders(self, samples: list[int]) -> dict[str, Any]:
-        return timed_loop(samples, lambda oid: self.request("DELETE", f"/db/bench_orders/{oid}"))
+        return timed_batch_loop(
+            self.batches(samples),
+            lambda keys: self.batch_delete("bench_orders", keys),
+            {"mode": "http_newline_batch_delete", "latency_unit": "amortized_row"},
+        )
 
 
 class TurboDocResult(ctypes.Structure):

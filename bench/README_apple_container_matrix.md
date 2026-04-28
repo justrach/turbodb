@@ -14,8 +14,11 @@ another container, and does not publish database ports to macOS.
 - `orders`: keyed order records with `user_id`, amount, status, and JSON payload.
 - TurboDB stores `bench_users`, `bench_orders`, and a materialized
   `bench_user_orders` edge collection. The benchmark client uses persistent
-  HTTP plus `POST /db/:col/batch_get` for relationship fetches, so it does not
-  inflate TurboDB latency with one TCP/HTTP setup per document.
+  HTTP plus `POST /db/:col/batch_get?mode=count` for relationship fetches, so
+  lookup-heavy workloads do not pay to serialize document bodies they do not
+  consume. For the join-like, update, and delete workloads it assumes the
+  faster HTTP shapes exist and uses `POST /db/:edge_col/join?mode=count`,
+  `POST /db/:col/batch_update`, and `POST /db/:col/batch_delete`.
 - `turbodb_ffi` loads `/work/zig-out-ffi/lib/libturbodb.so` with Python `ctypes`.
   This is an embedded/raw-engine path, not a network database path, and exists
   to show the cost of HTTP/client transport separately from storage operations.
@@ -29,11 +32,17 @@ another container, and does not publish database ports to macOS.
 
 - `ingest`: create all users and orders.
 - `point_get`: read users by primary key.
-- `relationship_lookup`: fetch all orders/transfers for a user.
+- `relationship_lookup`: fetch all orders/transfers for a user. TurboDB HTTP
+  keeps this as a materialized edge read plus compact `batch_get`.
 - `join_or_join_like`: SQL join for PostgreSQL/MySQL, materialized edge fetches
-  for TurboDB, account transfer query for TigerBeetle.
+  for TurboDB FFI, compact `POST /db/:edge_col/join` for TurboDB HTTP, account
+  transfer query for TigerBeetle.
 - `update_orders`: update order status where the engine supports mutation.
 - `delete_orders`: delete orders where the engine supports deletion.
+
+TurboDB HTTP update/delete latency is reported as amortized row latency when
+the benchmark uses the batch endpoints; throughput remains row operations per
+second.
 
 ## Run
 
