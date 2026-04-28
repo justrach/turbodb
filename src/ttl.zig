@@ -8,6 +8,7 @@
 /// separate hash map keyed by doc_id. This avoids modifying the 32-byte
 /// DocHeader format.
 const std = @import("std");
+const compat = @import("compat");
 const Allocator = std.mem.Allocator;
 
 /// A TTL entry: document ID → expiry timestamp.
@@ -19,7 +20,7 @@ const TTLEntry = struct {
 /// TTL index for a single collection.
 pub const TTLIndex = struct {
     entries: std.ArrayListUnmanaged(TTLEntry) = .empty,
-    lock: std.Thread.RwLock = .{},
+    lock: compat.RwLock = .{},
 
     pub fn deinit(self: *TTLIndex, alloc: Allocator) void {
         self.entries.deinit(alloc);
@@ -27,7 +28,7 @@ pub const TTLIndex = struct {
 
     /// Set TTL for a document. `ttl_seconds` is relative to now.
     pub fn setTTL(self: *TTLIndex, alloc: Allocator, doc_id: u64, ttl_seconds: u64) !void {
-        const now: u64 = @intCast(@divFloor(std.time.milliTimestamp(), 1000));
+        const now: u64 = @intCast(@divFloor(compat.milliTimestamp(), 1000));
         const expires_at = now + ttl_seconds;
 
         self.lock.lock();
@@ -74,7 +75,7 @@ pub const TTLIndex = struct {
 
     /// Collect all expired doc_ids. Caller owns the returned slice.
     pub fn collectExpired(self: *TTLIndex, alloc: Allocator) ![]u64 {
-        const now: u64 = @intCast(@divFloor(std.time.milliTimestamp(), 1000));
+        const now: u64 = @intCast(@divFloor(compat.milliTimestamp(), 1000));
         var expired: std.ArrayListUnmanaged(u64) = .empty;
 
         self.lock.lockShared();
@@ -90,7 +91,7 @@ pub const TTLIndex = struct {
 
     /// Purge expired entries from the index (call after deleting the docs).
     pub fn purgeExpired(self: *TTLIndex) void {
-        const now: u64 = @intCast(@divFloor(std.time.milliTimestamp(), 1000));
+        const now: u64 = @intCast(@divFloor(compat.milliTimestamp(), 1000));
 
         self.lock.lock();
         defer self.lock.unlock();

@@ -7,6 +7,7 @@
 ///   Insert/delete prepend a delta record via CAS.
 ///   Consolidation merges delta chain into a new base page when chain > 8.
 const std = @import("std");
+const compat = @import("compat");
 
 // ─── Entry (22 bytes packed) ─────────────────────────────────────────────
 
@@ -51,7 +52,7 @@ pub const BwTree = struct {
     // Deferred reclamation: old chains retired after consolidation are parked here
     // and freed on the next consolidation or deinit (simple two-phase approach).
     retired: std.ArrayList(*Page),
-    retired_mu: std.Thread.Mutex,
+    retired_mu: compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator) !BwTree {
         var tree: BwTree = undefined;

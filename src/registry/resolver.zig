@@ -12,6 +12,7 @@
 ///   5. Cycle detection via visited set
 ///   6. Output: topologically sorted flat list
 const std = @import("std");
+const compat = @import("compat");
 const semver = @import("semver.zig");
 const registry_mod = @import("registry.zig");
 const manifest_mod = @import("manifest.zig");
@@ -135,7 +136,7 @@ pub const Resolver = struct {
 
     /// Generate a deterministic lockfile JSON.
     pub fn toLockfile(resolved: []const ResolvedDep, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
+        var fbs = compat.fixedBufferStream(buf);
         const w = fbs.writer();
 
         try w.writeAll("{\"locked\":[");
@@ -143,7 +144,7 @@ pub const Resolver = struct {
             if (i > 0) try w.writeAll(",");
             var ver_buf: [64]u8 = undefined;
             const ver_str = dep.version.format(&ver_buf) catch "0.0.0";
-            try std.fmt.format(w, "{{\"name\":\"{s}\",\"version\":\"{s}\",\"hash\":\"{s}\"}}", .{
+            try compat.format(w, "{{\"name\":\"{s}\",\"version\":\"{s}\",\"hash\":\"{s}\"}}", .{
                 dep.name,
                 ver_str,
                 dep.source_hash,
@@ -195,8 +196,8 @@ fn jsonGetField(json: []const u8, key: []const u8) ?[]const u8 {
 test "resolve pinned deps" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/zagdb-resolver-test";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
 
     var reg = try registry_mod.Registry.init(alloc, tmp_dir);
     defer reg.deinit();
@@ -218,8 +219,8 @@ test "resolve pinned deps" {
 test "conflicting versions error" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/zagdb-resolver-conflict";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
 
     var reg = try registry_mod.Registry.init(alloc, tmp_dir);
     defer reg.deinit();
@@ -258,8 +259,8 @@ test "lockfile generation" {
 test "resolve from registry" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/zagdb-resolver-reg";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
 
     var reg = try registry_mod.Registry.init(alloc, tmp_dir);
     defer reg.deinit();

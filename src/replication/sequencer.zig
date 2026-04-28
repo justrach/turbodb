@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 
 pub const TxnType = enum(u8) { put, delete, read };
 
@@ -45,7 +46,7 @@ pub const Sequencer = struct {
     next_seq: u64,
     current_epoch: u64,
     batch_window_ns: u64, // batching window in nanoseconds (default 5ms)
-    mu: std.Thread.Mutex,
+    mu: compat.Mutex,
 
     const default_batch_window_ns: u64 = 5_000_000; // 5ms
 

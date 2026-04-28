@@ -1,5 +1,6 @@
 /// TurboDB — 4KB page allocator
 const std = @import("std");
+const compat = @import("compat");
 const mmap = @import("mmap");
 pub const PAGE_SIZE: usize = 65536; // 64KB — supports code files up to ~65KB per doc
 pub const PAGE_HEADER_SIZE: usize = 32;
@@ -34,7 +35,7 @@ pub const PageFile = struct {
     mm: mmap.MmapFile,
     free_head: std.atomic.Value(u32),  // head of free-list (0 = empty)
     next_alloc: std.atomic.Value(u32), // next never-allocated page
-    mu: std.Thread.Mutex,
+    mu: compat.Mutex,
 
     pub fn open(path: []const u8) !PageFile {
         var path_buf: [std.fs.max_path_bytes + 1]u8 = undefined;

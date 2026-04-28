@@ -6,6 +6,7 @@
 /// Usage: zig build profile -- /path/to/codebase
 ///
 const std = @import("std");
+const compat = @import("compat");
 const collection_mod = @import("collection.zig");
 const codeindex = @import("codeindex.zig");
 const fast_index = @import("fast_index.zig");
@@ -34,10 +35,10 @@ const Timer = struct {
     start: i128 = 0,
 
     fn begin(self: *Timer) void {
-        self.start = std.time.nanoTimestamp();
+        self.start = compat.nanoTimestamp();
     }
     fn end(self: *Timer) void {
-        self.total_ns += std.time.nanoTimestamp() - self.start;
+        self.total_ns += compat.nanoTimestamp() - self.start;
         self.count += 1;
     }
     fn avgUs(self: *const Timer) f64 {
@@ -53,25 +54,14 @@ const Timer = struct {
     }
 };
 
-pub fn main() !void {
+pub fn main(init: std.process.Init) !void {
     // Use page_allocator for speed (no safety overhead in profiling mode)
     // Switch to GPA for leak/safety checks
-    var gpa = std.heap.GeneralPurposeAllocator(.{
-        .safety = true,
-        .never_unmap = true, // keeps freed pages mapped for use-after-free detection
-    }){};
-    defer {
-        const check = gpa.deinit();
-        if (check == .leak) {
-            std.debug.print("\n  ⚠ MEMORY LEAK DETECTED\n", .{});
-        } else {
-            std.debug.print("\n  ✓ No memory leaks\n", .{});
-        }
-    }
-    const alloc = gpa.allocator();
+    // smp_allocator for Zig 0.16 (no leak checking available)
+    const alloc = std.heap.smp_allocator;
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const args = try compat.argsAlloc(alloc, init);
+    defer compat.argsFree(alloc, args);
 
     if (args.len < 2) {
         std.debug.print("Usage: profile <codebase-dir>\n", .{});
@@ -95,24 +85,26 @@ pub fn main() !void {
         files.deinit(alloc);
     }
 
-    var dir = try std.fs.cwd().openDir(args[1], .{ .iterate = true });
+    var dir = try compat.cwd().openDir(args[1], .{ .iterate = true });
     defer dir.close();
-    var walker = try dir.walk(alloc);
-    defer walker.deinit();
+    var walker = dir.iterate();
+    // iterate() needs no deinit
 
     var total_bytes: u64 = 0;
     while (try walker.next()) |entry| {
         if (entry.kind != .file) continue;
-        if (!hasValidExt(entry.basename)) continue;
+        if (!hasValidExt(entry.name)) continue;
 
-        var file = dir.openFile(entry.path, .{}) catch continue;
+        var path_buf2: [4096]u8 = undefined;
+                const full_path = std.fmt.bufPrint(&path_buf2, "{s}/{s}", .{ args[1], entry.name }) catch continue;
+                var file = compat.cwd().openFile(full_path, .{}) catch continue;
         defer file.close();
         var buf: [8192]u8 = undefined;
         const n = file.read(&buf) catch continue;
         if (n < 3) continue;
 
         try files.append(alloc, .{
-            .path = try alloc.dupe(u8, entry.path),
+            .path = try alloc.dupe(u8, entry.name),
             .content = try alloc.dupe(u8, buf[0..n]),
         });
         total_bytes += n;
@@ -220,14 +212,14 @@ pub fn main() !void {
         t_build.end();
 
         const tmp = "/tmp/tdb_profile_disk";
-        std.fs.cwd().makeDir(tmp) catch |e| switch (e) {
+        compat.cwd().makeDir(tmp) catch |e| switch (e) {
             error.PathAlreadyExists => {
-                std.fs.cwd().deleteTree(tmp) catch {};
-                std.fs.cwd().makeDir(tmp) catch {};
+                compat.cwd().deleteTree(tmp) catch {};
+                compat.cwd().makeDir(tmp) catch {};
             },
             else => return e,
         };
-        defer std.fs.cwd().deleteTree(tmp) catch {};
+        defer compat.cwd().deleteTree(tmp) catch {};
 
         t_write.begin();
         const stats = try builder.writeToDisk(tmp);

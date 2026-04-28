@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const btree = @import("btree.zig");
 const BTreeEntry = btree.BTreeEntry;
 
@@ -82,81 +83,164 @@ pub const KVEntry = struct {
 // ─── MemTable ────────────────────────────────────────────────────────────────
 
 pub const MemTable = struct {
-    entries: std.ArrayList(KVEntry),
+    /// Pre-allocated slab. Capacity is fixed at init; never grows.
+    entries: []KVEntry,
+    count: u32,
     size_bytes: usize,
+
+    /// Sorted runs over `entries[0..count]`. Each run is a contiguous, ascending
+    /// range. New keys extend the last run when strictly greater than its tail;
+    /// out-of-order keys open a new run. On flush (or when MAX_RUNS is hit) we
+    /// stable-sort + dedup last-wins, collapsing back to a single run.
+    runs: [MAX_RUNS]Run,
+    run_count: u32,
+
     alloc: std.mem.Allocator,
 
-    const ENTRY_OVERHEAD = @sizeOf(KVEntry);
+    pub const MAX_RUNS: u32 = 64;
+    pub const ENTRY_OVERHEAD = @sizeOf(KVEntry);
 
-    pub fn init(alloc: std.mem.Allocator) MemTable {
+    pub const Run = struct {
+        start: u32,
+        end: u32, // exclusive
+    };
+
+    pub fn init(alloc: std.mem.Allocator) !MemTable {
+        // Capacity = ceil(MEMTABLE_SIZE / entry_size) + 1 slot of slack so the
+        // last put that pushes size_bytes >= MEMTABLE_SIZE still fits.
+        const target: usize = (LSMTree.MEMTABLE_SIZE + ENTRY_OVERHEAD - 1) / ENTRY_OVERHEAD;
+        const cap: u32 = @intCast(target + 1);
+        const buf = try alloc.alloc(KVEntry, cap);
         return .{
-            .entries = .empty,
+            .entries = buf,
+            .count = 0,
             .size_bytes = 0,
+            .runs = undefined,
+            .run_count = 0,
             .alloc = alloc,
         };
     }
 
     pub fn deinit(self: *MemTable) void {
-        self.entries.deinit(self.alloc);
+        if (self.entries.len > 0) self.alloc.free(self.entries);
+        self.entries = &.{};
+        self.count = 0;
+        self.run_count = 0;
         self.size_bytes = 0;
     }
 
-    /// Binary search for the index of key_hash. Returns the index if found, or
-    /// the insertion point if not.
-    fn findIndex(self: *const MemTable, key_hash: u64) struct { idx: usize, found: bool } {
-        const items = self.entries.items;
-        var lo: usize = 0;
-        var hi: usize = items.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (items[mid].key_hash < key_hash) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
+    /// Append a raw KVEntry. Extends the active run when key strictly increases;
+    /// otherwise opens a new run (collapsing first if MAX_RUNS is hit).
+    fn appendEntry(self: *MemTable, e: KVEntry) !void {
+        if (self.count >= self.entries.len) return error.MemTableFull;
+
+        if (self.run_count > 0) {
+            const last = &self.runs[self.run_count - 1];
+            // last.end > last.start is invariant for any tracked run.
+            if (self.entries[last.end - 1].key_hash < e.key_hash) {
+                self.entries[self.count] = e;
+                last.end = self.count + 1;
+                self.count += 1;
+                self.size_bytes += ENTRY_OVERHEAD;
+                return;
             }
         }
-        const found = lo < items.len and items[lo].key_hash == key_hash;
-        return .{ .idx = lo, .found = found };
+
+        if (self.run_count >= MAX_RUNS) {
+            // Collapse all runs into a single sorted+deduped run, then continue.
+            self.sortAndDedup();
+        }
+
+        self.entries[self.count] = e;
+        self.runs[self.run_count] = .{ .start = self.count, .end = self.count + 1 };
+        self.run_count += 1;
+        self.count += 1;
+        self.size_bytes += ENTRY_OVERHEAD;
     }
 
     pub fn put(self: *MemTable, key_hash: u64, entry: BTreeEntry) !void {
-        const result = self.findIndex(key_hash);
-        if (result.found) {
-            // Update in place — no size change.
-            self.entries.items[result.idx].value = .{ .live = entry };
-        } else {
-            try self.entries.insert(self.alloc, result.idx, .{
-                .key_hash = key_hash,
-                .value = .{ .live = entry },
-            });
-            self.size_bytes += ENTRY_OVERHEAD;
+        // Fast path: same key as the most recent entry — overwrite in place.
+        // Common in tight update loops; avoids opening a new run.
+        if (self.count > 0 and self.entries[self.count - 1].key_hash == key_hash) {
+            self.entries[self.count - 1].value = .{ .live = entry };
+            return;
         }
+        try self.appendEntry(.{ .key_hash = key_hash, .value = .{ .live = entry } });
+    }
+
+    pub fn delete(self: *MemTable, key_hash: u64) !void {
+        if (self.count > 0 and self.entries[self.count - 1].key_hash == key_hash) {
+            self.entries[self.count - 1].value = .tombstone;
+            return;
+        }
+        try self.appendEntry(.{ .key_hash = key_hash, .value = .tombstone });
+    }
+
+    /// Search runs newest-first. Returns the EntryValue at the first hit
+    /// (tombstone or live) so callers can distinguish "deleted here" from
+    /// "absent". Each run is sorted, so each lookup is O(log n) per run.
+    pub fn lookup(self: *const MemTable, key_hash: u64) ?KVEntry.EntryValue {
+        var ri = self.run_count;
+        while (ri > 0) {
+            ri -= 1;
+            const r = self.runs[ri];
+            var lo: u32 = r.start;
+            var hi: u32 = r.end;
+            while (lo < hi) {
+                const mid = lo + (hi - lo) / 2;
+                if (self.entries[mid].key_hash < key_hash) {
+                    lo = mid + 1;
+                } else {
+                    hi = mid;
+                }
+            }
+            if (lo < r.end and self.entries[lo].key_hash == key_hash) {
+                return self.entries[lo].value;
+            }
+        }
+        return null;
     }
 
     pub fn get(self: *const MemTable, key_hash: u64) ?BTreeEntry {
-        const result = self.findIndex(key_hash);
-        if (!result.found) return null;
-        return switch (self.entries.items[result.idx].value) {
+        return switch (self.lookup(key_hash) orelse return null) {
             .live => |e| e,
             .tombstone => null,
         };
     }
 
-    pub fn delete(self: *MemTable, key_hash: u64) !void {
-        const result = self.findIndex(key_hash);
-        if (result.found) {
-            self.entries.items[result.idx].value = .tombstone;
-        } else {
-            try self.entries.insert(self.alloc, result.idx, .{
-                .key_hash = key_hash,
-                .value = .tombstone,
-            });
-            self.size_bytes += ENTRY_OVERHEAD;
-        }
-    }
-
     pub fn isFull(self: *const MemTable) bool {
         return self.size_bytes >= LSMTree.MEMTABLE_SIZE;
+    }
+
+    /// Stable-sort `entries[0..count]` by key, then dedup last-wins. Stability
+    /// guarantees that equal-key duplicates retain insertion order, so the
+    /// last entry in each duplicate group is the newest write. Collapses to a
+    /// single run [0, count).
+    pub fn sortAndDedup(self: *MemTable) void {
+        if (self.count == 0) {
+            self.run_count = 0;
+            self.size_bytes = 0;
+            return;
+        }
+        std.mem.sort(KVEntry, self.entries[0..self.count], {}, KVEntry.orderByKey);
+
+        var w: u32 = 0;
+        var i: u32 = 0;
+        while (i < self.count) {
+            var j: u32 = i + 1;
+            while (j < self.count and self.entries[j].key_hash == self.entries[i].key_hash) {
+                j += 1;
+            }
+            // j-1 is the newest occurrence of this key (stable sort preserves
+            // insertion order among duplicates).
+            self.entries[w] = self.entries[j - 1];
+            w += 1;
+            i = j;
+        }
+        self.count = w;
+        self.size_bytes = @as(usize, w) * ENTRY_OVERHEAD;
+        self.runs[0] = .{ .start = 0, .end = w };
+        self.run_count = if (w > 0) 1 else 0;
     }
 
     pub const Iterator = struct {
@@ -171,8 +255,11 @@ pub const MemTable = struct {
         }
     };
 
-    pub fn iterator(self: *const MemTable) Iterator {
-        return .{ .items = self.entries.items, .pos = 0 };
+    /// Returns an iterator over a sorted, deduped view. Mutates the table to
+    /// collapse runs first (cheap if already sorted).
+    pub fn iterator(self: *MemTable) Iterator {
+        self.sortAndDedup();
+        return .{ .items = self.entries[0..self.count], .pos = 0 };
     }
 };
 
@@ -201,21 +288,21 @@ pub const SSTable = struct {
     const FLAG_TOMBSTONE: u8 = 0x00;
 
     /// Write a u64 in little-endian to a file.
-    fn writeU64(file: std.fs.File, val: u64) !void {
+    fn writeU64(file: compat.File, val: u64) !void {
         var buf: [8]u8 = undefined;
         std.mem.writeInt(u64, &buf, val, .little);
         try file.writeAll(&buf);
     }
 
     /// Write a u32 in little-endian to a file.
-    fn writeU32(file: std.fs.File, val: u32) !void {
+    fn writeU32(file: compat.File, val: u32) !void {
         var buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &buf, val, .little);
         try file.writeAll(&buf);
     }
 
     /// Read a u64 in little-endian from a file.
-    fn readU64(file: std.fs.File) !u64 {
+    fn readU64(file: compat.File) !u64 {
         var buf: [8]u8 = undefined;
         const n = try file.readAll(&buf);
         if (n < 8) return error.UnexpectedEof;
@@ -223,7 +310,7 @@ pub const SSTable = struct {
     }
 
     /// Read a u32 in little-endian from a file.
-    fn readU32(file: std.fs.File) !u32 {
+    fn readU32(file: compat.File) !u32 {
         var buf: [4]u8 = undefined;
         const n = try file.readAll(&buf);
         if (n < 4) return error.UnexpectedEof;
@@ -231,7 +318,7 @@ pub const SSTable = struct {
     }
 
     /// Read a single byte from a file.
-    fn readByte(file: std.fs.File) !u8 {
+    fn readByte(file: compat.File) !u8 {
         var buf: [1]u8 = undefined;
         const n = try file.readAll(&buf);
         if (n < 1) return error.UnexpectedEof;
@@ -269,11 +356,11 @@ pub const SSTable = struct {
         }
 
         // Write data file.
-        const data_file = try std.fs.cwd().createFile(dp, .{});
+        const data_file = try compat.cwd().createFile(dp, .{});
         defer data_file.close();
 
         // Write index file.
-        const idx_file = try std.fs.cwd().createFile(ip, .{});
+        const idx_file = try compat.cwd().createFile(ip, .{});
         defer idx_file.close();
 
         var data_offset: u64 = 0;
@@ -322,14 +409,14 @@ pub const SSTable = struct {
         // Range check.
         if (key_hash < self.min_key or key_hash > self.max_key) return null;
 
-        const data_file = try std.fs.cwd().openFile(
+        const data_file = try compat.cwd().openFile(
             self.data_path[0..self.data_path_len],
             .{},
         );
         defer data_file.close();
 
         // Load sparse index to find starting offset.
-        const idx_file = try std.fs.cwd().openFile(
+        const idx_file = try compat.cwd().openFile(
             self.index_path[0..self.index_path_len],
             .{},
         );
@@ -386,7 +473,7 @@ pub const SSTable = struct {
     }
 
     pub const Iterator = struct {
-        file: std.fs.File,
+        file: compat.File,
         remaining: u32,
 
         pub fn next(self: *Iterator) ?KVEntry {
@@ -417,7 +504,7 @@ pub const SSTable = struct {
 
     pub fn iterator(self: *const SSTable, alloc: std.mem.Allocator) !Iterator {
         _ = alloc;
-        const f = try std.fs.cwd().openFile(
+        const f = try compat.cwd().openFile(
             self.data_path[0..self.data_path_len],
             .{},
         );
@@ -442,7 +529,7 @@ pub const LSMTree = struct {
     data_dir: [256]u8,
     data_dir_len: usize,
     alloc: std.mem.Allocator,
-    flush_mu: std.Thread.Mutex,
+    flush_mu: compat.Mutex,
 
     pub const MAX_LEVELS = 7;
     pub const MEMTABLE_SIZE = 4 * 1024 * 1024; // 4MB
@@ -451,7 +538,7 @@ pub const LSMTree = struct {
 
     pub fn init(alloc: std.mem.Allocator, data_dir: []const u8) !LSMTree {
         var lsm: LSMTree = undefined;
-        lsm.active_mem = MemTable.init(alloc);
+        lsm.active_mem = try MemTable.init(alloc);
         lsm.immutable_mem = null;
         lsm.alloc = alloc;
         lsm.next_sst_id = 0;
@@ -467,7 +554,7 @@ pub const LSMTree = struct {
         }
 
         // Ensure data directory exists.
-        std.fs.cwd().makeDir(data_dir) catch |err| switch (err) {
+        compat.cwd().makeDir(data_dir) catch |err| switch (err) {
             error.PathAlreadyExists => {},
             else => return err,
         };
@@ -493,12 +580,22 @@ pub const LSMTree = struct {
     }
 
     pub fn get(self: *const LSMTree, key_hash: u64) ?BTreeEntry {
-        // 1. Check active memtable.
-        if (memtableSearch(self.active_mem.entries.items, key_hash)) |result| return result.entry;
+        // 1. Check active memtable. A tombstone shadows older SSTable entries.
+        if (self.active_mem.lookup(key_hash)) |v| {
+            return switch (v) {
+                .live => |bte| bte,
+                .tombstone => null,
+            };
+        }
 
-        // 2. Check immutable memtable.
-        if (self.immutable_mem) |imm| {
-            if (memtableSearch(imm.entries.items, key_hash)) |result| return result.entry;
+        // 2. Check immutable memtable (mid-flush).
+        if (self.immutable_mem) |*imm| {
+            if (imm.lookup(key_hash)) |v| {
+                return switch (v) {
+                    .live => |bte| bte,
+                    .tombstone => null,
+                };
+            }
         }
 
         // 3. Check SSTables level by level, newest first.
@@ -516,31 +613,6 @@ pub const LSMTree = struct {
         return null;
     }
 
-    /// Search helper for const memtable slices. Returns the BTreeEntry (or null
-    /// for tombstones). The outer ?FoundEntry is null when the key isn't present
-    /// at all — distinguishing "not here" from "deleted here".
-    const FoundEntry = struct { entry: ?BTreeEntry };
-
-    fn memtableSearch(items: []const KVEntry, key_hash: u64) ?FoundEntry {
-        var lo: usize = 0;
-        var hi: usize = items.len;
-        while (lo < hi) {
-            const mid = lo + (hi - lo) / 2;
-            if (items[mid].key_hash < key_hash) {
-                lo = mid + 1;
-            } else {
-                hi = mid;
-            }
-        }
-        if (lo < items.len and items[lo].key_hash == key_hash) {
-            return .{ .entry = switch (items[lo].value) {
-                .live => |e| e,
-                .tombstone => null,
-            } };
-        }
-        return null;
-    }
-
     pub fn delete(self: *LSMTree, key_hash: u64) !void {
         try self.active_mem.delete(key_hash);
     }
@@ -550,11 +622,14 @@ pub const LSMTree = struct {
         self.flush_mu.lock();
         defer self.flush_mu.unlock();
 
-        if (self.active_mem.entries.items.len == 0) return;
+        if (self.active_mem.count == 0) return;
 
-        // Rotate: move active → immutable.
+        // Collapse runs into a single sorted+deduped run for SSTable.create.
+        self.active_mem.sortAndDedup();
+
+        // Rotate: move active → immutable, install a fresh active.
         var old = self.active_mem;
-        self.active_mem = MemTable.init(self.alloc);
+        self.active_mem = try MemTable.init(self.alloc);
 
         defer {
             old.deinit();
@@ -566,7 +641,7 @@ pub const LSMTree = struct {
         const id = self.next_sst_id;
         self.next_sst_id += 1;
         const sst = try SSTable.create(
-            old.entries.items,
+            old.entries[0..old.count],
             0,
             id,
             self.data_dir[0..self.data_dir_len],
@@ -639,8 +714,8 @@ pub const LSMTree = struct {
         // Close and remove old SSTables at this level.
         for (src.items) |*sst| {
             // Delete files.
-            std.fs.cwd().deleteFile(sst.data_path[0..sst.data_path_len]) catch {};
-            std.fs.cwd().deleteFile(sst.index_path[0..sst.index_path_len]) catch {};
+            compat.cwd().deleteFile(sst.data_path[0..sst.data_path_len]) catch {};
+            compat.cwd().deleteFile(sst.index_path[0..sst.index_path_len]) catch {};
             sst.close();
         }
         src.clearRetainingCapacity();
@@ -659,7 +734,7 @@ fn testEntry(key: u64, doc: u64) BTreeEntry {
 }
 
 test "MemTable put/get/delete" {
-    var mt = MemTable.init(std.testing.allocator);
+    var mt = try MemTable.init(std.testing.allocator);
     defer mt.deinit();
 
     try mt.put(100, testEntry(100, 1));
@@ -687,7 +762,7 @@ test "MemTable put/get/delete" {
     try std.testing.expect(mt.get(777) == null);
 }
 test "MemTable isFull threshold" {
-    var mt = MemTable.init(std.testing.allocator);
+    var mt = try MemTable.init(std.testing.allocator);
     defer mt.deinit();
 
     try std.testing.expect(!mt.isFull());
@@ -702,7 +777,7 @@ test "MemTable isFull threshold" {
     try std.testing.expect(mt.isFull());
 }
 test "MemTable iterator order" {
-    var mt = MemTable.init(std.testing.allocator);
+    var mt = try MemTable.init(std.testing.allocator);
     defer mt.deinit();
 
     try mt.put(300, testEntry(300, 3));
@@ -745,11 +820,15 @@ test "BloomFilter add/mayContain" {
     try std.testing.expect(false_positives < 500);
 }
 
+fn testingTmpPath(alloc: std.mem.Allocator, tmp: *const std.testing.TmpDir) ![]u8 {
+    return std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+}
+
 test "SSTable create and read back" {
     // Use a tmp directory.
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = tmp_dir.dir.realpathAlloc(std.testing.allocator, ".") catch unreachable;
+    const tmp_path = testingTmpPath(std.testing.allocator, &tmp_dir) catch unreachable;
     defer std.testing.allocator.free(tmp_path);
 
     // Create sorted entries.
@@ -778,7 +857,7 @@ test "SSTable create and read back" {
 test "LSMTree put/get across memtable and SSTable" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = tmp_dir.dir.realpathAlloc(std.testing.allocator, ".") catch unreachable;
+    const tmp_path = testingTmpPath(std.testing.allocator, &tmp_dir) catch unreachable;
     defer std.testing.allocator.free(tmp_path);
 
     var lsm = try LSMTree.init(std.testing.allocator, tmp_path);
@@ -811,7 +890,7 @@ test "LSMTree put/get across memtable and SSTable" {
 test "LSMTree flush" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = tmp_dir.dir.realpathAlloc(std.testing.allocator, ".") catch unreachable;
+    const tmp_path = testingTmpPath(std.testing.allocator, &tmp_dir) catch unreachable;
     defer std.testing.allocator.free(tmp_path);
 
     var lsm = try LSMTree.init(std.testing.allocator, tmp_path);
@@ -822,7 +901,7 @@ test "LSMTree flush" {
     try lsm.flush();
 
     // Active memtable should be empty after flush.
-    try std.testing.expectEqual(@as(usize, 0), lsm.active_mem.entries.items.len);
+    try std.testing.expectEqual(@as(u32, 0), lsm.active_mem.count);
     // L0 should have one SSTable.
     try std.testing.expectEqual(@as(usize, 1), lsm.levels[0].items.len);
     // Data still readable.
@@ -832,7 +911,7 @@ test "LSMTree flush" {
 test "Tombstone handling" {
     var tmp_dir = std.testing.tmpDir(.{});
     defer tmp_dir.cleanup();
-    const tmp_path = tmp_dir.dir.realpathAlloc(std.testing.allocator, ".") catch unreachable;
+    const tmp_path = testingTmpPath(std.testing.allocator, &tmp_dir) catch unreachable;
     defer std.testing.allocator.free(tmp_path);
 
     var lsm = try LSMTree.init(std.testing.allocator, tmp_path);

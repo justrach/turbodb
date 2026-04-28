@@ -50,6 +50,23 @@ compare_branches → side-by-side multi-branch review
 - 6 HTTP endpoints (`/branch/:col/...`)
 - CDC auto-triggers on merge via existing insert→emitChange pipeline
 
+## TigerBeetle Contrast
+
+Reviewed against `tigerbeetle/tigerbeetle@210336d2dc3c68e56d285f0cf380b86cb54a7d28`
+through `codedb_remote`.
+
+| # | Title | What | Key Technique |
+|---|---|---|---|
+| [7](optimization7_tigerbeetle_resource_bounds.md) | Tenant Resource Bounds | Predictable multi-tenant agent load | API-key tenant context + bounded admission before allocation/mutation |
+| [8](optimization8_tigerbeetle_deterministic_recovery.md) | Deterministic Recovery Tests | Crash/fault confidence for WAL, branches, tenants | Seeded operation model + WAL truncation/corruption replay checks |
+| [9](optimization9_tigerbeetle_batch_wire.md) | Batch-Shaped Wire Path | Higher swarm throughput | Bounded binary batch op that amortizes parse, dispatch, WAL, and response writes |
+
+**Contrast point:** TigerBeetle is a specialized replicated ledger with
+deterministic physical repair, static resource bounds, and batch-first execution.
+TurboDB is a general document/code/vector database for agent workloads. The
+borrowed optimization is not the ledger data model; it is the discipline around
+bounded resources, deterministic replay tests, and batching.
+
 ## Architecture
 
 ```

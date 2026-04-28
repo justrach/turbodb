@@ -6,6 +6,7 @@
 /// Wire protocol: STATUS byte + 2-byte error code + message.
 /// HTTP: {"error": {"code": N, "message": "..."}}
 const std = @import("std");
+const compat = @import("compat");
 
 pub const ErrorCode = enum(u16) {
     // ── Success ──
@@ -94,7 +95,7 @@ pub const ErrorCode = enum(u16) {
 
 /// Format a JSON error response into a buffer.
 pub fn jsonError(buf: []u8, code: ErrorCode) []const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
+    var fbs = compat.fixedBufferStream(buf);
     const w = fbs.writer();
     w.print("{{\"error\":{{\"code\":{d},\"message\":\"{s}\"}}}}", .{
         @intFromEnum(code), code.message(),
@@ -104,7 +105,7 @@ pub fn jsonError(buf: []u8, code: ErrorCode) []const u8 {
 
 /// Format a JSON error with custom detail message.
 pub fn jsonErrorDetail(buf: []u8, code: ErrorCode, detail: []const u8) []const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
+    var fbs = compat.fixedBufferStream(buf);
     const w = fbs.writer();
     w.print("{{\"error\":{{\"code\":{d},\"message\":\"{s}\",\"detail\":\"{s}\"}}}}", .{
         @intFromEnum(code), code.message(), detail,

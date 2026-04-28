@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const btree = @import("btree.zig");
 pub const BTreeEntry = btree.BTreeEntry;
 
@@ -1106,7 +1107,7 @@ test "ART: concurrent insert and search" {
 
     // Serialize all writes with a mutex. ART's optimistic lock coupling
     // provides safe concurrent reads alongside a single writer.
-    var write_mu = std.Thread.Mutex{};
+    var write_mu = compat.Mutex{};
 
     // Pre-insert keys under mutex (single-threaded here, but same pattern)
     for (0..keys_per_thread) |i| {
@@ -1121,7 +1122,7 @@ test "ART: concurrent insert and search" {
     const Context = struct {
         tree: *ART,
         thread_id: usize,
-        mu: *std.Thread.Mutex,
+        mu: *compat.Mutex,
 
         fn insertWork(ctx: @This()) void {
             const base = (ctx.thread_id + 1) * 10000;

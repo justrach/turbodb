@@ -14,6 +14,7 @@
 //! Capacity: MAX_READERS concurrent reader threads.  Each occupies one 64-byte
 //! slot to avoid false sharing.
 const std = @import("std");
+const compat = @import("compat");
 
 pub const MAX_READERS:    usize = 1024;
 pub const EPOCH_INACTIVE: u64   = std.math.maxInt(u64);
@@ -37,7 +38,7 @@ pub const EpochManager = struct {
     slots: []Slot,
     allocator: std.mem.Allocator,
     timeline: std.ArrayList(EpochPoint),
-    timeline_mu: std.Thread.Mutex,
+    timeline_mu: compat.Mutex,
 
     pub fn init(allocator: std.mem.Allocator) !EpochManager {
         const slots = try allocator.alloc(Slot, MAX_READERS);
@@ -60,7 +61,7 @@ pub const EpochManager = struct {
 
     /// Called by a writer at commit.  Returns the new timestamp.
     pub fn advance(self: *EpochManager) u64 {
-        return self.advanceAt(std.time.milliTimestamp());
+        return self.advanceAt(compat.milliTimestamp());
     }
 
     pub fn advanceAt(self: *EpochManager, ts_ms: i64) u64 {

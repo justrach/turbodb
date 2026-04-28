@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const Allocator = std.mem.Allocator;
 
 /// Operation types for WAL entries.
@@ -13,13 +14,15 @@ pub const OpType = enum(u8) {
 const ENTRY_HEADER_SIZE = 13;
 
 /// Per-core WAL segment. Each segment owns a file and a page-aligned write
-/// buffer. Appends are lock-free: writers atomically reserve space via
-/// `fetchAdd` on `pos`.
+/// buffer. Appends reserve space with `pos`, then publish completed entries
+/// into `published_pos` in reservation order so flush never reads a partial
+/// entry.
 pub const WALSegment = struct {
     segment_id: u32,
-    fd: std.fs.File,
+    fd: compat.File,
     buf: []align(4096) u8,
     pos: std.atomic.Value(u32),
+    published_pos: std.atomic.Value(u32),
     flushed_pos: u32,
 
     pub const BUF_SIZE: u32 = 65536;
@@ -29,7 +32,7 @@ pub const WALSegment = struct {
         var path_buf: [512]u8 = undefined;
         const path = std.fmt.bufPrint(&path_buf, "{s}/wal_seg_{d:0>4}", .{ data_dir, id }) catch return error.PathTooLong;
 
-        const fd = try std.fs.cwd().createFile(path, .{ .truncate = true });
+        const fd = try compat.cwd().createFile(path, .{ .truncate = true });
 
         const buf = try alloc.alignedAlloc(u8, .fromByteUnits(4096), BUF_SIZE);
         @memset(buf, 0);
@@ -39,6 +42,7 @@ pub const WALSegment = struct {
             .fd = fd,
             .buf = buf,
             .pos = std.atomic.Value(u32).init(0),
+            .published_pos = std.atomic.Value(u32).init(0),
             .flushed_pos = 0,
         };
     }
@@ -51,32 +55,51 @@ pub const WALSegment = struct {
     /// Append an entry to the segment buffer. Returns the offset where data
     /// was written, or `error.SegmentFull` if the buffer cannot hold the entry.
     pub fn append(self: *WALSegment, op: OpType, key_hash: u64, data: []const u8) !u32 {
-        const total: u32 = ENTRY_HEADER_SIZE + @as(u32, @intCast(data.len));
+        if (data.len > @as(usize, BUF_SIZE - ENTRY_HEADER_SIZE)) return error.SegmentFull;
 
-        // Reserve space atomically — lock-free.
-        const offset = self.pos.fetchAdd(total, .monotonic);
-        if (offset + total > BUF_SIZE) {
-            // Roll back so other threads see accurate remaining space.
-            _ = self.pos.fetchSub(total, .monotonic);
-            return error.SegmentFull;
-        }
+        const data_len: u32 = @intCast(data.len);
+        const total: u32 = ENTRY_HEADER_SIZE + data_len;
+        const offset = try self.reserve(total);
 
         // Write header: [op:1][key_hash:8][len:4]
         self.buf[offset] = @intFromEnum(op);
         @memcpy(self.buf[offset + 1 .. offset + 9], std.mem.asBytes(&key_hash));
-        const data_len: u32 = @intCast(data.len);
         @memcpy(self.buf[offset + 9 .. offset + 13], std.mem.asBytes(&data_len));
 
         // Write payload.
         @memcpy(self.buf[offset + ENTRY_HEADER_SIZE .. offset + total], data);
 
+        self.publish(offset, offset + total);
         return offset;
+    }
+
+    fn reserve(self: *WALSegment, total: u32) !u32 {
+        while (true) {
+            const current = self.pos.load(.monotonic);
+            if (current > BUF_SIZE or total > BUF_SIZE - current) return error.SegmentFull;
+
+            if (self.pos.cmpxchgWeak(current, current + total, .monotonic, .monotonic) == null) {
+                return current;
+            }
+
+            std.atomic.spinLoopHint();
+        }
+    }
+
+    fn tryPublish(self: *WALSegment, offset: u32, end: u32) bool {
+        return self.published_pos.cmpxchgStrong(offset, end, .release, .acquire) == null;
+    }
+
+    fn publish(self: *WALSegment, offset: u32, end: u32) void {
+        while (!self.tryPublish(offset, end)) {
+            std.atomic.spinLoopHint();
+        }
     }
 
     /// Flush dirty bytes to the underlying file. Called by the group-commit
     /// flusher — NOT per-transaction.
     pub fn flush(self: *WALSegment) !void {
-        const current = self.pos.load(.acquire);
+        const current = self.published_pos.load(.acquire);
         if (current <= self.flushed_pos) return;
 
         const dirty = self.buf[self.flushed_pos..current];
@@ -99,7 +122,7 @@ pub const WALSegment = struct {
         data: []const u8,
         next_offset: u32,
     } {
-        const end = self.pos.load(.acquire);
+        const end = self.published_pos.load(.acquire);
         if (offset + ENTRY_HEADER_SIZE > end) return error.InvalidOffset;
 
         const op: OpType = @enumFromInt(self.buf[offset]);
@@ -229,7 +252,7 @@ pub const ParallelWAL = struct {
     fn flusherLoop(self: *ParallelWAL) void {
         while (self.running.load(.acquire) == 1) {
             self.groupCommit() catch {};
-            std.Thread.sleep(1 * std.time.ns_per_ms);
+            compat.sleep(1 * std.time.ns_per_ms);
         }
         // Final flush on shutdown.
         self.groupCommit() catch {};
@@ -240,13 +263,17 @@ pub const ParallelWAL = struct {
 // Tests
 // ---------------------------------------------------------------------------
 
+fn testingTmpPath(alloc: Allocator, tmp: *const std.testing.TmpDir) ![]u8 {
+    return std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+}
+
 test "WALSegment single-threaded append and read" {
     const alloc = std.testing.allocator;
 
     // Use a temp directory.
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
+    const tmp_path = try testingTmpPath(alloc, &tmp);
     defer alloc.free(tmp_path);
 
     var seg = try WALSegment.init(alloc, tmp_path, 0);
@@ -268,12 +295,88 @@ test "WALSegment single-threaded append and read" {
     try std.testing.expectEqualStrings("world", e2.data);
 }
 
+test "WALSegment publish requires contiguous offsets" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try testingTmpPath(alloc, &tmp);
+    defer alloc.free(tmp_path);
+
+    var seg = try WALSegment.init(alloc, tmp_path, 0);
+    defer seg.deinit(alloc);
+
+    const first_total: u32 = ENTRY_HEADER_SIZE + 5;
+    const second_total: u32 = ENTRY_HEADER_SIZE + 6;
+
+    try std.testing.expect(!seg.tryPublish(first_total, first_total + second_total));
+    try std.testing.expectEqual(@as(u32, 0), seg.published_pos.load(.acquire));
+
+    try std.testing.expect(seg.tryPublish(0, first_total));
+    try std.testing.expectEqual(first_total, seg.published_pos.load(.acquire));
+
+    try std.testing.expect(seg.tryPublish(first_total, first_total + second_total));
+    try std.testing.expectEqual(first_total + second_total, seg.published_pos.load(.acquire));
+}
+
+test "WALSegment flush ignores reserved unpublished bytes" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const tmp_path = try testingTmpPath(alloc, &tmp);
+    defer alloc.free(tmp_path);
+
+    var seg = try WALSegment.init(alloc, tmp_path, 0);
+    defer seg.deinit(alloc);
+
+    const payload = "complete";
+    const data_len: u32 = payload.len;
+    const total: u32 = ENTRY_HEADER_SIZE + data_len;
+    const key_hash: u64 = 0xABCDEF;
+
+    seg.pos.store(total, .release);
+    seg.buf[0] = @intFromEnum(OpType.put);
+    @memcpy(seg.buf[1..9], std.mem.asBytes(&key_hash));
+    @memcpy(seg.buf[9..13], std.mem.asBytes(&data_len));
+    @memcpy(seg.buf[ENTRY_HEADER_SIZE..@as(usize, total)], payload);
+
+    try std.testing.expectError(error.InvalidOffset, seg.readEntry(0));
+
+    try seg.flush();
+    try std.testing.expectEqual(@as(u32, 0), seg.flushed_pos);
+    var stat = try seg.fd.stat();
+    try std.testing.expectEqual(@as(u64, 0), stat.size);
+
+    seg.published_pos.store(total, .release);
+
+    const entry = try seg.readEntry(0);
+    try std.testing.expectEqual(OpType.put, entry.op);
+    try std.testing.expectEqual(key_hash, entry.key_hash);
+    try std.testing.expectEqualStrings(payload, entry.data);
+
+    try seg.flush();
+    try std.testing.expectEqual(total, seg.flushed_pos);
+    stat = try seg.fd.stat();
+    try std.testing.expectEqual(@as(u64, total), stat.size);
+
+    var persisted: [ENTRY_HEADER_SIZE + payload.len]u8 = undefined;
+    var path_buf: [512]u8 = undefined;
+    const wal_path = try std.fmt.bufPrint(&path_buf, "{s}/wal_seg_{d:0>4}", .{ tmp_path, 0 });
+    var read_file = try compat.cwd().openFile(wal_path, .{});
+    defer read_file.close();
+
+    const read = try read_file.readAll(persisted[0..]);
+    try std.testing.expectEqual(@as(usize, total), read);
+    try std.testing.expectEqualStrings(payload, persisted[ENTRY_HEADER_SIZE..]);
+}
+
 test "ParallelWAL multi-threaded writes" {
     const alloc = std.testing.allocator;
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
+    const tmp_path = try testingTmpPath(alloc, &tmp);
     defer alloc.free(tmp_path);
 
     const n_segments: u32 = 4;
@@ -309,13 +412,16 @@ test "ParallelWAL multi-threaded writes" {
     // Verify: total bytes written across all segments should account for
     // N_THREADS * WRITES_PER_THREAD entries.
     var total_bytes: u64 = 0;
+    var total_published_bytes: u64 = 0;
     var i: u32 = 0;
     while (i < n_segments) : (i += 1) {
         total_bytes += wal.segments[i].pos.load(.acquire);
+        total_published_bytes += wal.segments[i].published_pos.load(.acquire);
     }
 
     const expected_bytes: u64 = N_THREADS * WRITES_PER_THREAD * (ENTRY_HEADER_SIZE + 4); // "data" = 4 bytes
     try std.testing.expectEqual(expected_bytes, total_bytes);
+    try std.testing.expectEqual(expected_bytes, total_published_bytes);
 }
 
 test "ParallelWAL group commit advances epoch" {
@@ -323,7 +429,7 @@ test "ParallelWAL group commit advances epoch" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
+    const tmp_path = try testingTmpPath(alloc, &tmp);
     defer alloc.free(tmp_path);
 
     var wal = try ParallelWAL.init(alloc, tmp_path, 2);
@@ -345,7 +451,7 @@ test "ParallelWAL background flusher runs" {
 
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
-    const tmp_path = try tmp.dir.realpathAlloc(alloc, ".");
+    const tmp_path = try testingTmpPath(alloc, &tmp);
     defer alloc.free(tmp_path);
 
     var wal = try ParallelWAL.init(alloc, tmp_path, 2);
@@ -357,7 +463,7 @@ test "ParallelWAL background flusher runs" {
     _ = try wal.write(.put, 99, "flusher-test");
 
     // Sleep a bit to let the flusher run at least once (~1 ms interval).
-    std.Thread.sleep(10 * std.time.ns_per_ms);
+    compat.sleep(10 * std.time.ns_per_ms);
 
     const epoch = wal.current_epoch.load(.acquire);
     try std.testing.expect(epoch >= 1);

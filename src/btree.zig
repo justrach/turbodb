@@ -11,6 +11,7 @@
 ///   BTreeEntry = {key_hash u64, page_no u32, page_off u16, doc_id u64} = 22 bytes
 ///   max entries per leaf = (PAGE_USABLE - 2) / 22 = 184
 const std = @import("std");
+const compat = @import("compat");
 const page_mod = @import("page.zig");
 const PageFile = page_mod.PageFile;
 const PAGE_USABLE = page_mod.PAGE_USABLE;
@@ -37,7 +38,7 @@ const MIN_KEYS: usize = MAX_KEYS_PER_INTERNAL / 2;
 pub const BTree = struct {
     pf: *PageFile,
     root: u32,   // root page number (0 = not yet created)
-    mu: std.Thread.RwLock,
+    mu: compat.RwLock,
 
     pub fn init(pf: *PageFile, root_page: u32) BTree {
         return .{ .pf = pf, .root = root_page, .mu = .{} };

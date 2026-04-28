@@ -13,6 +13,7 @@
 ///   audit                    Verify all dep signatures and hashes
 ///   keygen                   Generate Ed25519 keypair
 const std = @import("std");
+const compat = @import("compat");
 const manifest_mod = @import("manifest.zig");
 const sign_mod = @import("sign.zig");
 const hash_mod = @import("hash.zig");
@@ -25,13 +26,13 @@ const DEFAULT_REGISTRY = "http://localhost:8080";
 const ZAG_DIR = ".zag";
 const GLOBAL_DIR = ".zag"; // ~/.zag/
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    // GPA replaced by smp_allocator for Zig 0.16
 
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const alloc = std.heap.smp_allocator;
+
+    const args = try compat.argsAlloc(alloc, init);
+    defer compat.argsFree(alloc, args);
 
     if (args.len < 2) {
         printUsage();
@@ -105,28 +106,28 @@ fn cmdInit(alloc: std.mem.Allocator, args: []const []const u8) !void {
     }
 
     // Check if zag.json already exists
-    std.fs.cwd().access("zag.json", .{}) catch |e| {
+    compat.cwd().access("zag.json", .{}) catch |e| {
         if (e == error.FileNotFound) {
             var buf: [2048]u8 = undefined;
-            var fbs = std.io.fixedBufferStream(&buf);
+            var fbs = compat.fixedBufferStream(&buf);
             const w = fbs.writer();
 
             try w.writeAll("{\n");
-            try std.fmt.format(w, "  \"name\": \"{s}\",\n", .{name});
+            try compat.format(w, "  \"name\": \"{s}\",\n", .{name});
             try w.writeAll("  \"version\": \"0.1.0\",\n");
             try w.writeAll("  \"description\": \"\",\n");
-            try std.fmt.format(w, "  \"visibility\": \"{s}\",\n", .{if (private) "private" else "public"});
+            try compat.format(w, "  \"visibility\": \"{s}\",\n", .{if (private) "private" else "public"});
             if (org) |o| {
-                try std.fmt.format(w, "  \"org\": \"{s}\",\n", .{o});
+                try compat.format(w, "  \"org\": \"{s}\",\n", .{o});
             }
             try w.writeAll("  \"license\": \"MIT\",\n");
-            try w.writeAll("  \"zig_version\": \"0.15.0\",\n");
+            try w.writeAll("  \"zig_version\": \"0.16.0\",\n");
             try w.writeAll("  \"dependencies\": {},\n");
             try w.writeAll("  \"dev_dependencies\": {}\n");
             try w.writeAll("}");
 
             const content = fbs.getWritten();
-            const file = try std.fs.cwd().createFile("zag.json", .{});
+            const file = try compat.cwd().createFile("zag.json", .{});
             defer file.close();
             try file.writeAll(content);
 
@@ -143,7 +144,7 @@ fn cmdInit(alloc: std.mem.Allocator, args: []const []const u8) !void {
 }
 
 fn cmdKeygen() !void {
-    const home = std.posix.getenv("HOME") orelse "/tmp";
+    const home = blk: { const e = std.c.getenv("HOME"); break :blk if (e) |p| std.mem.sliceTo(p, 0) else "/tmp"; };
     var path_buf: [512]u8 = undefined;
     const keys_dir = try std.fmt.bufPrint(&path_buf, "{s}/.zag/keys", .{home});
 
@@ -190,7 +191,7 @@ fn cmdSearch(alloc: std.mem.Allocator, args: []const []const u8) !void {
 
 fn cmdPublish(alloc: std.mem.Allocator) !void {
     // Read zag.json
-    const manifest_content = std.fs.cwd().readFileAlloc(alloc, "zag.json", 64 * 1024) catch {
+    const manifest_content = compat.cwd().readFileAlloc(alloc, "zag.json", 64 * 1024) catch {
         std.debug.print("No zag.json found. Run 'zag init' first.\n", .{});
         return;
     };
@@ -217,7 +218,7 @@ fn cmdPublish(alloc: std.mem.Allocator) !void {
 
 fn cmdAudit(alloc: std.mem.Allocator) !void {
     // Read lockfile
-    const lockfile = std.fs.cwd().readFileAlloc(alloc, ".zag/lock.json", 1024 * 1024) catch {
+    const lockfile = compat.cwd().readFileAlloc(alloc, ".zag/lock.json", 1024 * 1024) catch {
         std.debug.print("No .zag/lock.json found. Run 'zag install' first.\n", .{});
         return;
     };
@@ -236,7 +237,7 @@ fn cmdLogin(args: []const []const u8) !void {
     const url = args[0];
 
     // Generate or load keypair
-    const home = std.posix.getenv("HOME") orelse "/tmp";
+    const home = blk: { const e = std.c.getenv("HOME"); break :blk if (e) |p| std.mem.sliceTo(p, 0) else "/tmp"; };
     var keys_buf: [512]u8 = undefined;
     const keys_dir = try std.fmt.bufPrint(&keys_buf, "{s}/.zag/keys", .{home});
 

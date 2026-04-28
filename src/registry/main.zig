@@ -4,20 +4,21 @@
 ///
 /// Starts the ZagDB package registry HTTP server backed by TurboDB.
 const std = @import("std");
+const compat = @import("compat");
 const api = @import("api.zig");
 const registry_mod = @import("registry.zig");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    // GPA replaced by smp_allocator for Zig 0.16
+
+    const alloc = std.heap.smp_allocator;
 
     var port: u16 = 8080;
     var data_dir: []const u8 = "./zagdb-data";
 
     // Parse CLI args
-    const args = try std.process.argsAlloc(alloc);
-    defer std.process.argsFree(alloc, args);
+    const args = try compat.argsAlloc(alloc, init);
+    defer compat.argsFree(alloc, args);
 
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
@@ -56,7 +57,7 @@ pub fn main() !void {
     }
 
     // Ensure data directory exists
-    std.fs.cwd().makeDir(data_dir) catch |e| switch (e) {
+    compat.cwd().makeDir(data_dir) catch |e| switch (e) {
         error.PathAlreadyExists => {},
         else => return e,
     };

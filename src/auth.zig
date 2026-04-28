@@ -8,6 +8,7 @@
 ///
 /// No auth configured → open access (dev mode).
 const std = @import("std");
+const compat = @import("compat");
 const crypto = @import("crypto.zig");
 const Allocator = std.mem.Allocator;
 
@@ -45,7 +46,7 @@ pub const AuthStore = struct {
     keys: [MAX_KEYS]KeyEntry = undefined,
     count: u32 = 0,
     enabled: bool = false,
-    lock: std.Thread.RwLock = .{},
+    lock: compat.RwLock = .{},
 
     /// Add an API key. Returns the BLAKE3 hash for storage.
     pub fn addKey(self: *AuthStore, raw_key: []const u8, name: []const u8, perm: Permission) [32]u8 {

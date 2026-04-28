@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 
 pub const NodeId = u16;
 pub const PartitionId = u16;
@@ -137,7 +138,7 @@ pub const ShardManager = struct {
     ring: HashRing,
     local_node_id: NodeId,
     alloc: std.mem.Allocator,
-    mu: std.Thread.RwLock,
+    mu: compat.RwLock,
     migrations: std.ArrayListUnmanaged(Migration),
 
     pub fn init(alloc: std.mem.Allocator, local_node_id: NodeId) ShardManager {

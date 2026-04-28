@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const collection_mod = @import("collection.zig");
 const partition_mod = @import("partition.zig");
 const doc_mod = @import("doc.zig");
@@ -74,7 +75,7 @@ fn record(name_src: []const u8, json_src: []const u8, ops: usize, elapsed_ns: i1
 // ─── Timing helper ──────────────────────────────────────────────────────────
 
 inline fn now() i128 {
-    return std.time.nanoTimestamp();
+    return compat.nanoTimestamp();
 }
 
 // ─── Partition benchmark for a given partition count ─────────────────────────
@@ -84,10 +85,10 @@ fn benchPartitionCount(n_partitions: u16) !void {
     const data_dir = std.fmt.bufPrint(&dir_buf, "/tmp/turbodb_partition_bench_{d}", .{n_partitions}) catch return;
 
     // Cleanup any previous run
-    std.fs.cwd().deleteTree(data_dir) catch {};
+    compat.cwd().deleteTree(data_dir) catch {};
 
     // Create data dir
-    std.fs.cwd().makeDir(data_dir) catch |e| switch (e) {
+    compat.cwd().makeDir(data_dir) catch |e| switch (e) {
         error.PathAlreadyExists => {},
         else => return e,
     };
@@ -181,14 +182,14 @@ fn benchPartitionCount(n_partitions: u16) !void {
     pc.close();
     wal_log.close();
     epochs.deinit();
-    std.fs.cwd().deleteTree(data_dir) catch {};
+    compat.cwd().deleteTree(data_dir) catch {};
 }
 
 // ─── JSON emitter ───────────────────────────────────────────────────────────
 
 fn emitJSON() void {
     // Timestamp
-    const ts = std.time.timestamp();
+    const ts = compat.timestamp();
     const epoch_secs: u64 = @intCast(ts);
     const secs_in_day: u64 = 86400;
     const days = epoch_secs / secs_in_day;
@@ -224,7 +225,7 @@ fn emitJSON() void {
 
     // Also write to a JSON file for CI consumption
     const json_path = "/tmp/turbodb_shard_bench.json";
-    const file = std.fs.cwd().createFile(json_path, .{}) catch return;
+    const file = compat.cwd().createFile(json_path, .{}) catch return;
     defer file.close();
 
     var buf: [16384]u8 = undefined;
@@ -282,6 +283,6 @@ pub fn main() !void {
     for (partition_counts) |n| {
         var dir_buf: [128]u8 = undefined;
         const data_dir = std.fmt.bufPrint(&dir_buf, "/tmp/turbodb_partition_bench_{d}", .{n}) catch continue;
-        std.fs.cwd().deleteTree(data_dir) catch {};
+        compat.cwd().deleteTree(data_dir) catch {};
     }
 }

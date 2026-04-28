@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const branching = @import("branching.zig");
 const collection = @import("collection.zig");
 const doc_mod = @import("doc.zig");
@@ -53,7 +54,7 @@ pub const Marketplace = struct {
         try copyDirRecursive(self.alloc, snapshot.parent_path, base_dir);
         try copyDirRecursive(self.alloc, snapshot.overlay_dir, overlay_dir);
 
-        const created_at_ms = std.time.milliTimestamp();
+        const created_at_ms = compat.milliTimestamp();
         try self.writeManifest(release_root, snapshot, description, base_dir, overlay_dir, version, created_at_ms);
         return .{
             .dataset_name = try self.alloc.dupe(u8, snapshot.dataset_name),
@@ -78,7 +79,7 @@ pub const Marketplace = struct {
         const dataset_dir = try std.fmt.allocPrint(self.alloc, "{s}/{s}", .{ self.root_dir, dataset_name });
         defer self.alloc.free(dataset_dir);
 
-        var dir = try std.fs.openDirAbsolute(dataset_dir, .{ .iterate = true });
+        var dir = try compat.openDirAbsolute(dataset_dir, .{ .iterate = true });
         defer dir.close();
 
         var versions: std.ArrayList(u32) = .empty;
@@ -111,7 +112,7 @@ pub const Marketplace = struct {
         try copyDirRecursive(self.alloc, release.base_dir, base_dir);
         try copyDirRecursive(self.alloc, release.overlay_dir, overlay_dir);
 
-        var manifest = try std.fs.createFileAbsolute(manifest_path, .{ .truncate = true });
+        var manifest = try compat.createFileAbsolute(manifest_path, .{ .truncate = true });
         defer manifest.close();
         try manifest.writeAll(base_dir);
 
@@ -155,7 +156,7 @@ pub const Marketplace = struct {
         );
         defer self.alloc.free(content);
 
-        var file = try std.fs.createFileAbsolute(manifest_path, .{ .truncate = true });
+        var file = try compat.createFileAbsolute(manifest_path, .{ .truncate = true });
         defer file.close();
         try file.writeAll(content);
     }
@@ -197,20 +198,13 @@ fn parseManifest(alloc: std.mem.Allocator, raw: []const u8) !Release {
 }
 
 fn ensureDir(path: []const u8) !void {
-    if (std.fs.path.isAbsolute(path)) {
-        var root = try std.fs.openDirAbsolute("/", .{});
-        defer root.close();
-        const rel = std.mem.trimLeft(u8, path, "/");
-        if (rel.len > 0) try root.makePath(rel);
-    } else {
-        try std.fs.cwd().makePath(path);
-    }
+    try compat.cwd().makePath(path);
 }
 
 fn copyDirRecursive(alloc: std.mem.Allocator, src_dir: []const u8, dst_dir: []const u8) !void {
     try ensureDir(dst_dir);
 
-    var dir = try std.fs.openDirAbsolute(src_dir, .{ .iterate = true });
+    var dir = try compat.openDirAbsolute(src_dir, .{ .iterate = true });
     defer dir.close();
 
     var it = dir.iterate();
@@ -224,27 +218,36 @@ fn copyDirRecursive(alloc: std.mem.Allocator, src_dir: []const u8, dst_dir: []co
             .directory => try copyDirRecursive(alloc, src_path, dst_path),
             .file => {
                 if (!std.mem.endsWith(u8, entry.name, ".pages")) continue;
-                try copyFileAbsolute(src_path, dst_path);
+                try copyFileAbsolute(alloc, src_path, dst_path);
             },
             else => {},
         }
     }
 }
 
-fn copyFileAbsolute(src_path: []const u8, dst_path: []const u8) !void {
-    var src = try std.fs.openFileAbsolute(src_path, .{});
+fn copyFileAbsolute(alloc: std.mem.Allocator, src_path: []const u8, dst_path: []const u8) !void {
+    var src = try compat.openFileAbsolute(src_path, .{});
     defer src.close();
-    var dst = try std.fs.createFileAbsolute(dst_path, .{ .truncate = true });
+    var dst = try compat.createFileAbsolute(dst_path, .{ .truncate = true });
     defer dst.close();
 
     const stat = try src.stat();
-    _ = try src.copyRangeAll(0, dst, 0, stat.size);
+    const buf_len: usize = @min(@as(usize, 64 * 1024), @max(@as(usize, 1), @as(usize, @intCast(stat.size))));
+    const buf = try alloc.alloc(u8, buf_len);
+    defer alloc.free(buf);
+
+    var remaining = stat.size;
+    while (remaining > 0) {
+        const want: usize = @intCast(@min(remaining, buf.len));
+        const n = try src.read(buf[0..want]);
+        if (n == 0) return error.UnexpectedEof;
+        try dst.writeAll(buf[0..n]);
+        remaining -= @intCast(n);
+    }
 }
 
 fn readFileAbsoluteAlloc(alloc: std.mem.Allocator, path: []const u8, max_bytes: usize) ![]u8 {
-    const file = try std.fs.openFileAbsolute(path, .{});
-    defer file.close();
-    return try file.readToEndAlloc(alloc, max_bytes);
+    return try compat.cwd().readFileAlloc(alloc, path, max_bytes);
 }
 
 test "marketplace publish and install keeps snapshot immutable" {
@@ -252,14 +255,14 @@ test "marketplace publish and install keeps snapshot immutable" {
     const tmp_dir = "/tmp/turbodb_marketplace_publish";
     const market_dir = "/tmp/turbodb_marketplace_catalog";
     const install_dir = "/tmp/turbodb_marketplace_install";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    std.fs.cwd().deleteTree(market_dir) catch {};
-    std.fs.cwd().deleteTree(install_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(market_dir) catch {};
+    compat.cwd().deleteTree(install_dir) catch {};
     try ensureDir(tmp_dir);
     try ensureDir(market_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(market_dir) catch {};
-    defer std.fs.cwd().deleteTree(install_dir) catch {};
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
+    defer compat.cwd().deleteTree(market_dir) catch {};
+    defer compat.cwd().deleteTree(install_dir) catch {};
 
     const base = try collection.Database.open(alloc, tmp_dir);
     defer base.close();
@@ -300,16 +303,16 @@ test "marketplace keeps multiple release versions installable" {
     const market_dir = "/tmp/turbodb_marketplace_versions_catalog";
     const install_v1_dir = "/tmp/turbodb_marketplace_versions_install_v1";
     const install_v2_dir = "/tmp/turbodb_marketplace_versions_install_v2";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    std.fs.cwd().deleteTree(market_dir) catch {};
-    std.fs.cwd().deleteTree(install_v1_dir) catch {};
-    std.fs.cwd().deleteTree(install_v2_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(market_dir) catch {};
+    compat.cwd().deleteTree(install_v1_dir) catch {};
+    compat.cwd().deleteTree(install_v2_dir) catch {};
     try ensureDir(tmp_dir);
     try ensureDir(market_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(market_dir) catch {};
-    defer std.fs.cwd().deleteTree(install_v1_dir) catch {};
-    defer std.fs.cwd().deleteTree(install_v2_dir) catch {};
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
+    defer compat.cwd().deleteTree(market_dir) catch {};
+    defer compat.cwd().deleteTree(install_v1_dir) catch {};
+    defer compat.cwd().deleteTree(install_v2_dir) catch {};
 
     const base = try collection.Database.open(alloc, tmp_dir);
     defer base.close();
@@ -354,11 +357,11 @@ test "marketplace rejects missing releases" {
     const alloc = std.testing.allocator;
     const market_dir = "/tmp/turbodb_marketplace_missing_catalog";
     const install_dir = "/tmp/turbodb_marketplace_missing_install";
-    std.fs.cwd().deleteTree(market_dir) catch {};
-    std.fs.cwd().deleteTree(install_dir) catch {};
+    compat.cwd().deleteTree(market_dir) catch {};
+    compat.cwd().deleteTree(install_dir) catch {};
     try ensureDir(market_dir);
-    defer std.fs.cwd().deleteTree(market_dir) catch {};
-    defer std.fs.cwd().deleteTree(install_dir) catch {};
+    defer compat.cwd().deleteTree(market_dir) catch {};
+    defer compat.cwd().deleteTree(install_dir) catch {};
 
     var marketplace = try Marketplace.init(alloc, market_dir);
     defer marketplace.deinit();

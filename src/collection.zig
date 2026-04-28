@@ -1,5 +1,6 @@
 /// TurboDB — Collection (MVCC document store + query engine)
 const std = @import("std");
+const compat = @import("compat");
 const doc_mod   = @import("doc.zig");
 const page_mod  = @import("page.zig");
 const btree_mod = @import("btree.zig");
@@ -25,6 +26,15 @@ const WordIndex = codeindex.WordIndex;
 pub const DEFAULT_TENANT = "default";
 pub const MAX_TENANT_ID_LEN: usize = 64;
 pub const MAX_COLLECTION_NAME_LEN: usize = 64;
+
+fn writeCommittedDocumentWal(wal_log: *WAL, op: wal_mod.OpCode, payload: []const u8) !void {
+    const txn = wal_log.next_lsn.load(.monotonic);
+    if (comptime @hasDecl(WAL, "writeCommitted")) {
+        _ = try wal_log.writeCommitted(txn, op, wal_mod.DB_TAG_DOC, payload);
+    } else {
+        _ = try wal_log.write(txn, op, wal_mod.DB_TAG_DOC, wal_mod.FLAG_COMMIT, payload);
+    }
+}
 
 // ─── IndexQueue ──────────────────────────────────────────────────────────
 // Lock-free MPSC queue for deferring trigram+word index builds to a background thread.
@@ -178,7 +188,10 @@ pub const Collection = struct {
     next_doc_id: std.atomic.Value(u64),
     // Record-level latching: 1024 stripe locks replace single write_mu.
     // Two writers to different keys proceed in parallel; same-key writes serialize.
-    stripe_locks: [STRIPE_COUNT]std.Thread.Mutex,
+    stripe_locks: [STRIPE_COUNT]compat.Mutex,
+    // Protects shared page/index/MVCC metadata that is not internally thread-safe.
+    meta_mu: compat.Mutex,
+    cache_mu: compat.Mutex,
     hash_idx: std.AutoHashMap(u64, BTreeEntry),
     key_doc_ids: std.AutoHashMap(u64, u64),
     /// Per-key modification epoch — tracks when each key was last written on main.
@@ -240,6 +253,8 @@ pub const Collection = struct {
         for (&col.stripe_locks) |*lock| {
             lock.* = .{};
         }
+        col.meta_mu = .{};
+        col.cache_mu = .{};
         col.hash_idx = std.AutoHashMap(u64, BTreeEntry).init(alloc);
         col.key_doc_ids = std.AutoHashMap(u64, u64).init(alloc);
         col.key_epochs = std.AutoHashMap(u64, u64).init(alloc);
@@ -305,6 +320,9 @@ pub const Collection = struct {
     }
 
     pub fn configureVectors(self: *Collection, dims: u32, field_name: []const u8) !void {
+        self.meta_mu.lock();
+        defer self.meta_mu.unlock();
+
         if (self.vectors) |old| {
             old.deinit(self.alloc);
             self.alloc.destroy(old);
@@ -325,7 +343,7 @@ pub const Collection = struct {
     pub fn flushIndex(self: *Collection) void {
         var waited: u32 = 0;
         while ((self.index_queue.len() > 0 or self.index_queue2.len() > 0 or self.indexing_count.load(.acquire) > 0) and waited < 300_000) : (waited += 1) {
-            std.Thread.sleep(100_000); // 100µs
+            compat.sleep(100_000); // 100µs
         }
     }
 
@@ -377,85 +395,89 @@ pub const Collection = struct {
         };
         const enc = try d.encodeBuf(buf);
 
-        // Write to WAL buffer (background flusher will commit periodically).
-        const txn = self.wal_log.next_lsn.load(.monotonic);
-        _ = try self.wal_log.write(txn, .doc_insert, 0, 0, enc);
+        // Single-entry document writes are self-committed for recovery.
+        try writeCommittedDocumentWal(self.wal_log, .doc_insert, enc);
 
-        // Find (or allocate) a leaf page with enough space.
-        const pno = try self.findOrAllocLeaf(enc.len);
-        const page_off = self.pf.leafAppend(pno, enc) orelse
-            return error.PageFull;
+        self.meta_mu.lock();
+        {
+            defer self.meta_mu.unlock();
 
-        // Index the document.
-        const entry = BTreeEntry{
-            .key_hash = hdr.key_hash,
-            .doc_id   = doc_id,
-            .page_no  = pno,
-            .page_off = page_off,
-        };
-        try self.idx.insert(entry);
-        self.hash_idx.put(hdr.key_hash, entry) catch {};
+            // Find (or allocate) a leaf page with enough space.
+            const pno = try self.findOrAllocLeaf(enc.len);
+            const page_off = self.pf.leafAppend(pno, enc) orelse
+                return error.PageFull;
 
-        // MVCC: register version in the version chain.
-        const epoch = self.epochs.advance();
-        self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
-        self.key_doc_ids.put(hdr.key_hash, doc_id) catch {};
-        self.key_epochs.put(hdr.key_hash, doc_id) catch {}; // epoch = doc_id (monotonic)
+            // Index the document.
+            const entry = BTreeEntry{
+                .key_hash = hdr.key_hash,
+                .doc_id   = doc_id,
+                .page_no  = pno,
+                .page_off = page_off,
+            };
+            try self.idx.insert(entry);
+            self.hash_idx.put(hdr.key_hash, entry) catch {};
 
-        // Async trigram + word indexing — push to background queue, sync fallback if full or no worker.
-        if (value.len >= 3) {
-            if (self.index_thread == null) {
-                // No background worker — index synchronously to avoid losing data.
-                self.tri.indexFile(key, value) catch {};
-                self.words.indexFile(key, value) catch {};
-            } else {
-                const owned_key = self.alloc.dupe(u8, key) catch null;
-                const owned_val = self.alloc.dupe(u8, value) catch null;
-                if (owned_key != null and owned_val != null) {
-                    const q = &self.index_queue;
-                    var retries: u32 = 0;
-                    while (!q.push(owned_key.?, owned_val.?)) {
-                        retries += 1;
-                        if (retries > 1000) {
-                            // Queue full — fall back to synchronous indexing.
-                            self.tri.indexFile(owned_key.?, owned_val.?) catch {};
-                            self.words.indexFile(owned_key.?, owned_val.?) catch {};
-                            self.alloc.free(owned_key.?);
-                            self.alloc.free(owned_val.?);
-                            break;
+            // MVCC: register version in the version chain.
+            const epoch = self.epochs.advance();
+            self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
+            self.key_doc_ids.put(hdr.key_hash, doc_id) catch {};
+            self.key_epochs.put(hdr.key_hash, doc_id) catch {}; // epoch = doc_id (monotonic)
+
+            // Async trigram + word indexing — push to background queue, sync fallback if full or no worker.
+            if (value.len >= 3) {
+                if (self.index_thread == null) {
+                    // No background worker — index synchronously to avoid losing data.
+                    self.tri.indexFile(key, value) catch {};
+                    self.words.indexFile(key, value) catch {};
+                } else {
+                    const owned_key = self.alloc.dupe(u8, key) catch null;
+                    const owned_val = self.alloc.dupe(u8, value) catch null;
+                    if (owned_key != null and owned_val != null) {
+                        const q = &self.index_queue;
+                        var retries: u32 = 0;
+                        while (!q.push(owned_key.?, owned_val.?)) {
+                            retries += 1;
+                            if (retries > 1000) {
+                                // Queue full — fall back to synchronous indexing.
+                                self.tri.indexFile(owned_key.?, owned_val.?) catch {};
+                                self.words.indexFile(owned_key.?, owned_val.?) catch {};
+                                self.alloc.free(owned_key.?);
+                                self.alloc.free(owned_val.?);
+                                break;
+                            }
+                            std.Thread.yield() catch {};
                         }
-                        std.Thread.yield() catch {};
                     }
                 }
             }
-        }
 
-        // Extract and store vector embedding if configured.
-        // Uses stack buffer to avoid heap allocation per insert.
-        if (self.vectors) |vc| {
-            const field = self.vector_field[0..self.vector_field_len];
-            const dims: usize = vc.dims;
-            var embed_stack: [4096]f32 = undefined;
-            const emb = if (dims <= 4096) embed_stack[0..dims] else blk: {
-                break :blk self.alloc.alloc(f32, dims) catch null;
-            };
-            if (emb) |e| {
-                defer if (dims > 4096) self.alloc.free(e);
-                if (extractJsonFloatArray(value, field, e)) |count| {
-                    if (count == dims) {
-                        vc.append(self.alloc, e) catch {};
-                        self.vec_entries.append(self.alloc, entry) catch {};
+            // Extract and store vector embedding if configured.
+            // Uses stack buffer to avoid heap allocation per insert.
+            if (self.vectors) |vc| {
+                const field = self.vector_field[0..self.vector_field_len];
+                const dims: usize = vc.dims;
+                var embed_stack: [4096]f32 = undefined;
+                const emb = if (dims <= 4096) embed_stack[0..dims] else blk: {
+                    break :blk self.alloc.alloc(f32, dims) catch null;
+                };
+                if (emb) |e| {
+                    defer if (dims > 4096) self.alloc.free(e);
+                    if (extractJsonFloatArray(value, field, e)) |count| {
+                        if (count == dims) {
+                            vc.append(self.alloc, e) catch {};
+                            self.vec_entries.append(self.alloc, entry) catch {};
+                        }
                     }
                 }
+            }
+
+            // Periodic MVCC version chain GC to prevent unbounded memory growth.
+            if (self.gc_counter.fetchAdd(1, .monotonic) % GC_INTERVAL == GC_INTERVAL - 1) {
+                _ = self.versions.gc(self.alloc);
             }
         }
 
         emitChange(self, .insert, key, value, doc_id);
-
-        // Periodic MVCC version chain GC to prevent unbounded memory growth.
-        if (self.gc_counter.fetchAdd(1, .monotonic) % GC_INTERVAL == GC_INTERVAL - 1) {
-            _ = self.gcVersions();
-        }
 
         return doc_id;
     }
@@ -466,6 +488,8 @@ pub const Collection = struct {
         const doc_id = self.insert(key, value) catch |e| return e;
         // insert() already handles vector extraction from JSON, but if embedding
         // was passed directly AND the JSON extraction didn't find it, append now.
+        self.meta_mu.lock();
+        defer self.meta_mu.unlock();
         if (self.vectors) |vc| {
             // Check if insert() already appended (vec_entries grew)
             // vec_entries.len should equal vc.count after insert if JSON had embedding
@@ -490,28 +514,39 @@ pub const Collection = struct {
     /// The Doc's key/value slices are valid until the next write to this collection.
     pub fn get(self: *Collection, key: []const u8) ?Doc {
         const key_hash = doc_mod.fnv1a(key);
+        self.meta_mu.lock();
+        defer self.meta_mu.unlock();
 
         // L1: Hot cache (O(1), no hash table overhead)
-        if (self.cache.lookup(key_hash)) |loc| {
+        self.cache_mu.lock();
+        const cached = self.cache.lookup(key_hash);
+        self.cache_mu.unlock();
+        if (cached) |loc| {
             if (self.readLoc(loc.page_no, loc.page_off)) |d| return d;
         }
 
         // L2: Hash index (O(1), but hash table lookup)
         if (self.hash_idx.get(key_hash)) |entry| {
             if (self.readEntry(entry)) |d| {
+                self.cache_mu.lock();
                 self.cache.insert(key_hash, entry.page_no, entry.page_off);
+                self.cache_mu.unlock();
                 return d;
             }
         }
         // L3: B-tree (O(log n))
         const entry = self.idx.search(key_hash) orelse return null;
         const d = self.readEntry(entry) orelse return null;
+        self.cache_mu.lock();
         self.cache.insert(key_hash, entry.page_no, entry.page_off);
+        self.cache_mu.unlock();
         return d;
     }
 
     pub fn getAsOfEpoch(self: *Collection, key: []const u8, epoch: u64) ?Doc {
         const key_hash = doc_mod.fnv1a(key);
+        self.meta_mu.lock();
+        defer self.meta_mu.unlock();
         const doc_id = self.key_doc_ids.get(key_hash) orelse return null;
         const ver = self.versions.getAtEpoch(doc_id, epoch) orelse return null;
         return self.readLoc(ver.page_no, ver.page_off);
@@ -524,6 +559,8 @@ pub const Collection = struct {
 
     /// Look up a document by doc_id using a linear scan of the index.
     pub fn getById(self: *Collection, doc_id: u64) ?Doc {
+        self.meta_mu.lock();
+        defer self.meta_mu.unlock();
         const total_pages = self.pf.next_alloc.load(.acquire);
         var pno: u32 = 0;
         while (pno < total_pages) : (pno += 1) {
@@ -553,37 +590,44 @@ pub const Collection = struct {
         self.stripe_locks[stripe].lock();
         defer self.stripe_locks[stripe].unlock();
 
-        const old_entry = self.idx.search(key_hash) orelse return false;
-        const old_doc = self.readEntry(old_entry) orelse return false;
+        var doc_id: u64 = undefined;
+        {
+            self.meta_mu.lock();
+            defer self.meta_mu.unlock();
 
-        const doc_id = old_doc.header.doc_id;
-        var new_hdr = doc_mod.newHeader(doc_id, key, new_value);
-        new_hdr.version = old_doc.header.version +% 1;
-        // MVCC: encode old location into next_ver field.
-        new_hdr.next_ver = (@as(u64, old_entry.page_no) << 16) | old_entry.page_off;
+            const old_entry = self.idx.search(key_hash) orelse return false;
+            const old_doc = self.readEntry(old_entry) orelse return false;
 
-        const d = Doc{ .header = new_hdr, .key = key, .value = new_value };
-        var enc_buf: [65536]u8 = undefined;
-        const enc = try d.encodeBuf(&enc_buf);
+            doc_id = old_doc.header.doc_id;
+            var new_hdr = doc_mod.newHeader(doc_id, key, new_value);
+            new_hdr.version = old_doc.header.version +% 1;
+            // MVCC: encode old location into next_ver field.
+            new_hdr.next_ver = (@as(u64, old_entry.page_no) << 16) | old_entry.page_off;
 
-        const txn = self.wal_log.next_lsn.load(.monotonic);
-        _ = try self.wal_log.write(txn, .doc_update, 0, 0, enc);
+            const d = Doc{ .header = new_hdr, .key = key, .value = new_value };
+            var enc_buf: [65536]u8 = undefined;
+            const enc = try d.encodeBuf(&enc_buf);
 
-        const pno = try self.findOrAllocLeaf(enc.len);
-        const page_off = self.pf.leafAppend(pno, enc) orelse return error.PageFull;
+            try writeCommittedDocumentWal(self.wal_log, .doc_update, enc);
 
-        const new_entry = BTreeEntry{
-            .key_hash = key_hash,
-            .doc_id   = doc_id,
-            .page_no  = pno,
-            .page_off = page_off,
-        };
-        self.hash_idx.put(key_hash, new_entry) catch {};
-        self.cache.invalidate(key_hash);
+            const pno = try self.findOrAllocLeaf(enc.len);
+            const page_off = self.pf.leafAppend(pno, enc) orelse return error.PageFull;
 
-        // MVCC: register new version in the version chain (links to old automatically).
-        const epoch = self.epochs.advance();
-        self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
+            const new_entry = BTreeEntry{
+                .key_hash = key_hash,
+                .doc_id   = doc_id,
+                .page_no  = pno,
+                .page_off = page_off,
+            };
+            self.hash_idx.put(key_hash, new_entry) catch {};
+            self.cache_mu.lock();
+            self.cache.invalidate(key_hash);
+            self.cache_mu.unlock();
+
+            // MVCC: register new version in the version chain (links to old automatically).
+            const epoch = self.epochs.advance();
+            self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
+        }
         emitChange(self, .update, key, new_value, doc_id);
 
         return true;
@@ -597,26 +641,34 @@ pub const Collection = struct {
         self.stripe_locks[stripe].lock();
         defer self.stripe_locks[stripe].unlock();
 
-        const entry = self.idx.search(key_hash) orelse return false;
+        var doc_id: u64 = undefined;
+        {
+            self.meta_mu.lock();
+            defer self.meta_mu.unlock();
 
-        const old_doc = self.readEntry(entry) orelse return false;
-        var tomb_hdr = doc_mod.newHeader(old_doc.header.doc_id, key, "");
-        tomb_hdr.flags |= DocHeader.DELETED;
-        tomb_hdr.version = old_doc.header.version +% 1;
-        tomb_hdr.next_ver = (@as(u64, entry.page_no) << 16) | entry.page_off;
-        const txn = self.wal_log.next_lsn.load(.monotonic);
-        _ = try self.wal_log.write(txn, .doc_delete, 0, 0, std.mem.asBytes(&tomb_hdr));
-        const tomb_doc = Doc{ .header = tomb_hdr, .key = key, .value = "" };
-        var enc_buf: [65536]u8 = undefined;
-        const enc = try tomb_doc.encodeBuf(&enc_buf);
-        const pno = try self.findOrAllocLeaf(enc.len);
-        const page_off = self.pf.leafAppend(pno, enc) orelse return error.PageFull;
-        const epoch = self.epochs.advance();
-        self.versions.appendVersion(self.alloc, old_doc.header.doc_id, pno, page_off, epoch) catch {};
-        self.idx.delete(key_hash);
-        _ = self.hash_idx.remove(key_hash);
-        self.cache.invalidate(key_hash);
-        emitChange(self, .delete, key, "", old_doc.header.doc_id);
+            const entry = self.idx.search(key_hash) orelse return false;
+
+            const old_doc = self.readEntry(entry) orelse return false;
+            doc_id = old_doc.header.doc_id;
+            var tomb_hdr = doc_mod.newHeader(doc_id, key, "");
+            tomb_hdr.flags |= DocHeader.DELETED;
+            tomb_hdr.version = old_doc.header.version +% 1;
+            tomb_hdr.next_ver = (@as(u64, entry.page_no) << 16) | entry.page_off;
+            const tomb_doc = Doc{ .header = tomb_hdr, .key = key, .value = "" };
+            var enc_buf: [65536]u8 = undefined;
+            const enc = try tomb_doc.encodeBuf(&enc_buf);
+            try writeCommittedDocumentWal(self.wal_log, .doc_delete, enc);
+            const pno = try self.findOrAllocLeaf(enc.len);
+            const page_off = self.pf.leafAppend(pno, enc) orelse return error.PageFull;
+            const epoch = self.epochs.advance();
+            self.versions.appendVersion(self.alloc, doc_id, pno, page_off, epoch) catch {};
+            self.idx.delete(key_hash);
+            _ = self.hash_idx.remove(key_hash);
+            self.cache_mu.lock();
+            self.cache.invalidate(key_hash);
+            self.cache_mu.unlock();
+        }
+        emitChange(self, .delete, key, "", doc_id);
         return true;
     }
 
@@ -804,8 +856,15 @@ pub const Collection = struct {
         offset: u32,
         alloc: std.mem.Allocator,
     ) !ScanResult {
+        if (limit == 0) {
+            return ScanResult{ .docs = try alloc.alloc(Doc, 0), .alloc = alloc };
+        }
+
         var results: std.ArrayList(Doc) = .empty;
         errdefer results.deinit(alloc);
+
+        self.meta_mu.lock();
+        defer self.meta_mu.unlock();
 
         const total_pages = self.pf.next_alloc.load(.acquire);
         var skipped: u32 = 0;
@@ -830,8 +889,15 @@ pub const Collection = struct {
     }
 
     pub fn scanAsOfEpoch(self: *Collection, epoch: u64, limit: u32, offset: u32, alloc: std.mem.Allocator) !ScanResult {
+        if (limit == 0) {
+            return ScanResult{ .docs = try alloc.alloc(Doc, 0), .alloc = alloc };
+        }
+
         var results: std.ArrayList(Doc) = .empty;
         errdefer results.deinit(alloc);
+
+        self.meta_mu.lock();
+        defer self.meta_mu.unlock();
 
         var skipped: u32 = 0;
         var it = self.key_doc_ids.iterator();
@@ -1476,7 +1542,7 @@ pub const Database = struct {
     data_dir_buf: [256]u8,
     data_dir_len: usize,
     alloc: std.mem.Allocator,
-    mu: std.Thread.RwLock,
+    mu: compat.RwLock,
     auth: @import("auth.zig").AuthStore,
 
     pub const TenantQuota = struct {
@@ -1609,7 +1675,7 @@ pub const Database = struct {
         const storage_name = makeStorageName(&storage_name_buf, tenant_id, name) catch return;
         var path_buf: [512]u8 = undefined;
         const page_path = std.fmt.bufPrint(&path_buf, "{s}/{s}.pages", .{ self.dataDir(), storage_name }) catch return;
-        std.fs.cwd().deleteFile(page_path) catch {};
+        compat.cwd().deleteFile(page_path) catch {};
     }
 
     pub fn listCollectionsForTenant(self: *Database, tenant_id: []const u8, alloc: std.mem.Allocator) !std.ArrayList([]const u8) {
@@ -1659,7 +1725,7 @@ pub const Database = struct {
         const quota = self.tenant_quotas.get(tenant_id) orelse return;
         if (quota.max_ops_per_second == std.math.maxInt(u32)) return;
 
-        const now_ms: i64 = std.time.milliTimestamp();
+        const now_ms: i64 = compat.milliTimestamp();
         const window_ms = now_ms - @mod(now_ms, 1000);
         const usage = try self.getOrCreateTenantUsageLocked(tenant_id);
         if (usage.ops_window_ms != window_ms) {
@@ -1745,7 +1811,7 @@ fn validateCollectionComponent(name: []const u8) !void {
 }
 
 fn makeStorageName(buf: []u8, tenant_id: []const u8, collection_name: []const u8) ![]const u8 {
-    var fbs = std.io.fixedBufferStream(buf);
+    var fbs = compat.fixedBufferStream(buf);
     const w = fbs.writer();
     try appendSanitizedComponent(w, tenant_id);
     try w.writeAll("__");
@@ -1765,32 +1831,92 @@ fn appendSanitizedComponent(writer: anytype, input: []const u8) !void {
 
 fn ensureDataDir(alloc: std.mem.Allocator, data_dir: []const u8) ![]u8 {
     try ensureDirPath(data_dir);
-    return try std.fs.realpathAlloc(alloc, data_dir);
+    return blk: {
+        var buf: [4096]u8 = undefined;
+        var z_buf: [4096]u8 = undefined;
+        @memcpy(z_buf[0..data_dir.len], data_dir);
+        z_buf[data_dir.len] = 0;
+        const rp = std.c.realpath(@ptrCast(&z_buf), @ptrCast(&buf));
+        if (rp == null) break :blk error.FileNotFound;
+        const len = std.mem.indexOfScalar(u8, &buf, 0) orelse buf.len;
+        break :blk try alloc.dupe(u8, buf[0..len]);
+    };
 }
 
 fn ensureDirPath(data_dir: []const u8) !void {
-    if (std.fs.path.isAbsolute(data_dir)) {
-        var root = try std.fs.openDirAbsolute("/", .{});
-        defer root.close();
-        const rel = std.mem.trimLeft(u8, data_dir, "/");
-        if (rel.len > 0) root.makePath(rel) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
-    } else {
-        std.fs.cwd().makePath(data_dir) catch |err| switch (err) {
-            error.PathAlreadyExists => {},
-            else => return err,
-        };
-    }
+    compat.cwd().makePath(data_dir) catch return error.MkdirError;
 }
+
+const CollectionWalReplayProbe = struct {
+    const MAX_ENTRIES = 8;
+
+    var count: usize = 0;
+    var ops: [MAX_ENTRIES]wal_mod.OpCode = undefined;
+    var flags: [MAX_ENTRIES]u16 = undefined;
+    var delete_payload: [256]u8 = undefined;
+    var delete_payload_len: usize = 0;
+
+    fn reset() void {
+        count = 0;
+        delete_payload_len = 0;
+    }
+
+    fn apply(entry: wal_mod.Entry) !void {
+        switch (entry.op_code) {
+            .doc_insert, .doc_update, .doc_delete => {},
+            else => return,
+        }
+
+        if (count >= MAX_ENTRIES) return error.TooManyCollectionWalEntries;
+        ops[count] = entry.op_code;
+        flags[count] = entry.flags;
+        count += 1;
+
+        if (entry.op_code == .doc_delete) {
+            if (entry.payload.len > delete_payload.len) return error.DeletePayloadTooLarge;
+            delete_payload_len = entry.payload.len;
+            @memcpy(delete_payload[0..delete_payload_len], entry.payload);
+        }
+    }
+
+    fn deletePayload() []const u8 {
+        return delete_payload[0..delete_payload_len];
+    }
+};
+
+const ConcurrentInsertProbe = struct {
+    const inserts_per_worker = 128;
+
+    col: *Collection,
+    worker_id: usize,
+    errors: *std.atomic.Value(u32),
+
+    fn run(self: *ConcurrentInsertProbe) void {
+        var i: usize = 0;
+        while (i < inserts_per_worker) : (i += 1) {
+            var key_buf: [64]u8 = undefined;
+            var value_buf: [96]u8 = undefined;
+            const key = std.fmt.bufPrint(&key_buf, "worker-{d}-doc-{d}", .{ self.worker_id, i }) catch {
+                _ = self.errors.fetchAdd(1, .monotonic);
+                continue;
+            };
+            const value = std.fmt.bufPrint(&value_buf, "{{\"worker\":{d},\"doc\":{d}}}", .{ self.worker_id, i }) catch {
+                _ = self.errors.fetchAdd(1, .monotonic);
+                continue;
+            };
+            _ = self.col.insert(key, value) catch {
+                _ = self.errors.fetchAdd(1, .monotonic);
+            };
+        }
+    }
+};
 
 test "tenant collections are isolated" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_multi_tenant_test";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    try compat.cwd().makePath(tmp_dir);
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1810,9 +1936,9 @@ test "tenant collections are isolated" {
 test "tenant collection quota limits new collections" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_tenant_quota_test";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    try compat.cwd().makePath(tmp_dir);
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1825,9 +1951,9 @@ test "tenant collection quota limits new collections" {
 test "tenant ops quota is enforced per second" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_tenant_ops_test";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    try compat.cwd().makePath(tmp_dir);
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1838,12 +1964,89 @@ test "tenant ops quota is enforced per second" {
     try std.testing.expectError(error.TenantOpsQuotaExceeded, db.recordTenantOperation("tenant-a"));
 }
 
+test "collection WAL replays committed document writes and full tombstone" {
+    const alloc = std.testing.allocator;
+    const tmp_dir = "/tmp/turbodb_collection_wal_committed";
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    try compat.cwd().makePath(tmp_dir);
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
+
+    {
+        const db = try Database.open(alloc, tmp_dir);
+        defer db.close();
+
+        const col = try db.collection("users");
+        _ = try col.insert("u1", "{\"name\":\"alice\"}");
+        try std.testing.expect(try col.update("u1", "{\"name\":\"alice-v2\"}"));
+        try std.testing.expect(try col.delete("u1"));
+    }
+
+    var path_buf: [512]u8 = undefined;
+    const wal_path = try std.fmt.bufPrintZ(&path_buf, "{s}/doc.wal", .{tmp_dir});
+    var wal = try WAL.open(wal_path, alloc);
+    defer wal.close();
+
+    CollectionWalReplayProbe.reset();
+    try wal.recover(0, CollectionWalReplayProbe.apply, alloc);
+
+    try std.testing.expectEqual(@as(usize, 3), CollectionWalReplayProbe.count);
+    try std.testing.expectEqual(wal_mod.OpCode.doc_insert, CollectionWalReplayProbe.ops[0]);
+    try std.testing.expectEqual(wal_mod.OpCode.doc_update, CollectionWalReplayProbe.ops[1]);
+    try std.testing.expectEqual(wal_mod.OpCode.doc_delete, CollectionWalReplayProbe.ops[2]);
+    for (CollectionWalReplayProbe.flags[0..CollectionWalReplayProbe.count]) |flags| {
+        try std.testing.expect(flags & wal_mod.FLAG_COMMIT != 0);
+    }
+
+    const decoded = try doc_mod.decode(CollectionWalReplayProbe.deletePayload());
+    try std.testing.expect(decoded.doc.isDeleted());
+    try std.testing.expectEqualStrings("u1", decoded.doc.key);
+    try std.testing.expectEqualStrings("", decoded.doc.value);
+    try std.testing.expectEqual(DocHeader.size + "u1".len, decoded.consumed);
+}
+
+test "collection concurrent inserts keep shared indexes stable" {
+    const alloc = std.testing.allocator;
+    const tmp_dir = "/tmp/turbodb_collection_concurrent_insert";
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    try compat.cwd().makePath(tmp_dir);
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
+
+    const db = try Database.open(alloc, tmp_dir);
+    defer db.close();
+
+    const col = try db.collection("load");
+    const worker_count = 8;
+    var errors = std.atomic.Value(u32).init(0);
+    var probes: [worker_count]ConcurrentInsertProbe = undefined;
+    var threads: [worker_count]std.Thread = undefined;
+
+    for (&probes, 0..) |*probe, i| {
+        probe.* = .{
+            .col = col,
+            .worker_id = i,
+            .errors = &errors,
+        };
+        threads[i] = try std.Thread.spawn(.{}, ConcurrentInsertProbe.run, .{probe});
+    }
+    for (threads) |thread| thread.join();
+
+    try std.testing.expectEqual(@as(u32, 0), errors.load(.acquire));
+    col.flushIndex();
+
+    const expected = worker_count * ConcurrentInsertProbe.inserts_per_worker;
+    const scan = try col.scan(expected, 0, alloc);
+    defer scan.deinit();
+    try std.testing.expectEqual(@as(usize, expected), scan.docs.len);
+    try std.testing.expect(col.get("worker-0-doc-0") != null);
+    try std.testing.expect(col.get("worker-7-doc-127") != null);
+}
+
 test "time travel get returns historical version after update" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_time_travel_update";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    try compat.cwd().makePath(tmp_dir);
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1861,9 +2064,9 @@ test "time travel get returns historical version after update" {
 test "time travel get survives delete" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_time_travel_delete";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    try compat.cwd().makePath(tmp_dir);
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1880,9 +2083,9 @@ test "time travel get survives delete" {
 test "time travel scan uses historical snapshot" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_time_travel_scan";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    try compat.cwd().makePath(tmp_dir);
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1902,9 +2105,9 @@ test "time travel scan uses historical snapshot" {
 test "cdc emits signed ordered deliveries for tenant mutations" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_cdc_integration";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    try compat.cwd().makePath(tmp_dir);
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1914,7 +2117,7 @@ test "cdc emits signed ordered deliveries for tenant mutations" {
     _ = try col.insert("u1", "{\"name\":\"alice\"}");
     _ = try col.update("u1", "{\"name\":\"alice-2\"}");
     try std.testing.expect(try col.delete("u1"));
-    std.Thread.sleep(20_000_000);
+    compat.sleep(20_000_000);
 
     const deliveries = try db.listWebhookDeliveries(alloc, "tenant-a");
     defer alloc.free(deliveries);
@@ -1929,9 +2132,9 @@ test "cdc emits signed ordered deliveries for tenant mutations" {
 test "tenant collections isolate keys and listings" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_tenant_isolation";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    try compat.cwd().makePath(tmp_dir);
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();
@@ -1956,12 +2159,30 @@ test "tenant collections isolate keys and listings" {
     try std.testing.expectEqualStrings("users", tenant_a_cols.items[0]);
 }
 
+test "collection scan limit zero returns no documents" {
+    const alloc = std.testing.allocator;
+    const tmp_dir = "/tmp/turbodb_collection_scan_limit_zero";
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    try compat.cwd().makePath(tmp_dir);
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
+
+    const db = try Database.open(alloc, tmp_dir);
+    defer db.close();
+
+    const col = try db.collection("users");
+    _ = try col.insert("u1", "{\"name\":\"one\"}");
+
+    var result = try col.scan(0, 0, alloc);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 0), result.docs.len);
+}
+
 test "tenant quotas apply per tenant" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_tenant_quotas";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    try compat.cwd().makePath(tmp_dir);
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
 
     const db = try Database.open(alloc, tmp_dir);
     defer db.close();

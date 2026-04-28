@@ -4,6 +4,7 @@
 /// The signing target is the BLAKE3 hash of the source tarball.
 /// Keypairs are stored at ~/.zag/keys/
 const std = @import("std");
+const compat = @import("compat");
 const Ed25519 = std.crypto.sign.Ed25519;
 
 pub const KeyPair = struct {
@@ -12,7 +13,9 @@ pub const KeyPair = struct {
 
     /// Generate a new random Ed25519 keypair.
     pub fn generate() KeyPair {
-        const kp = Ed25519.KeyPair.generate();
+        var seed: [32]u8 = undefined;
+        compat.randomBytes(&seed);
+        const kp = Ed25519.KeyPair.generateDeterministic(seed) catch unreachable;
         return .{
             .public_key = kp.public_key.toBytes(),
             .secret_key = kp.secret_key.toBytes(),
@@ -98,16 +101,15 @@ fn hexDecode64(hex: []const u8) ![64]u8 {
 /// Creates: <dir>/default.pub (64 hex chars) and <dir>/default.sec (128 hex chars)
 pub fn saveKeyPair(kp: KeyPair, dir_path: []const u8) !void {
     // Ensure directory exists
-    std.fs.cwd().makePath(dir_path) catch {};
-
-    var dir = try std.fs.cwd().openDir(dir_path, .{});
-    defer dir.close();
+    compat.cwd().makePath(dir_path) catch {};
 
     // Write public key
     {
         var hex: [64]u8 = undefined;
         hexEncode32(kp.public_key, &hex);
-        const file = try dir.createFile("default.pub", .{});
+        var pub_path: [600]u8 = undefined;
+        const pub_p = std.fmt.bufPrint(&pub_path, "{s}/default.pub", .{dir_path}) catch return error.NameTooLong;
+        const file = try compat.cwd().createFile(pub_p, .{});
         defer file.close();
         try file.writeAll(&hex);
         try file.writeAll("\n");
@@ -117,7 +119,9 @@ pub fn saveKeyPair(kp: KeyPair, dir_path: []const u8) !void {
     {
         var hex: [128]u8 = undefined;
         hexEncode64(kp.secret_key, &hex);
-        const file = try dir.createFile("default.sec", .{});
+        var sec_path: [600]u8 = undefined;
+        const sec_p = std.fmt.bufPrint(&sec_path, "{s}/default.sec", .{dir_path}) catch return error.NameTooLong;
+        const file = try compat.cwd().createFile(sec_p, .{});
         defer file.close();
         try file.writeAll(&hex);
         try file.writeAll("\n");
@@ -126,7 +130,7 @@ pub fn saveKeyPair(kp: KeyPair, dir_path: []const u8) !void {
 
 /// Load keypair from directory.
 pub fn loadKeyPair(dir_path: []const u8) !KeyPair {
-    var dir = try std.fs.cwd().openDir(dir_path, .{});
+    var dir = try compat.cwd().openDir(dir_path, .{});
     defer dir.close();
 
     // Read public key
@@ -207,7 +211,7 @@ test "save and load keypair" {
     const tmp_dir = "/tmp/zag-test-keys";
 
     // Clean up from previous runs
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
 
     try saveKeyPair(kp, tmp_dir);
     const loaded = try loadKeyPair(tmp_dir);
@@ -220,7 +224,7 @@ test "save and load keypair" {
     try std.testing.expect(verify("test", sig, loaded.public_key));
 
     // Clean up
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
 }
 
 test "pubkey and signature hex" {

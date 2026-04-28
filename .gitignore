@@ -10,5 +10,6 @@ __pycache__/
 access/
 preprocessed_configs/
 
-# Optimization docs (tracked)
-# optimizations/
+# Local agent/MCP workspaces
+optimizations/
+MCP/

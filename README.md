@@ -7,7 +7,7 @@
   <p align="center">
     <a href="https://pypi.org/project/turbodatabase/"><img src="https://img.shields.io/pypi/v/turbodatabase?color=3776AB&logo=python&label=PyPI" alt="PyPI"></a>
     <a href="https://www.npmjs.com/package/turbodatabase"><img src="https://img.shields.io/npm/v/turbodatabase?color=339933&logo=npm&label=npm" alt="npm"></a>
-    <img src="https://img.shields.io/badge/zig-0.15-F7A41D?logo=zig" alt="Zig 0.15">
+    <img src="https://img.shields.io/badge/zig-0.16-F7A41D?logo=zig" alt="Zig 0.16">
     <img src="https://img.shields.io/badge/license-MIT-blue" alt="MIT">
     <img src="https://img.shields.io/badge/status-alpha-orange" alt="Alpha">
   </p>
@@ -118,7 +118,7 @@ npm install turbodatabase     # Node.js
 ### Build from source
 
 ```bash
-# Requires Zig 0.15+
+# Requires Zig 0.16+
 git clone https://github.com/justrach/turbodb
 cd turbodb
 zig build
@@ -353,7 +353,7 @@ bash bench/setup_shard_bench.sh         # Full shard comparison (needs Docker + 
 
 ## Contributing
 
-Contributions welcome! TurboDB is written in Zig 0.15 with no external dependencies.
+Contributions welcome! TurboDB is written in Zig 0.16 with no external dependencies.
 
 ## License
 

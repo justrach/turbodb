@@ -4,35 +4,53 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    // ── Compat module (Zig 0.16 compatibility layer) ─────────────────────────
+    const compat_mod = b.createModule(.{
+        .root_source_file = b.path("src/compat.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+
     // ── Storage modules (WAL, mmap, epoch, seqlock) ─────────────────────────
     const mmap_mod = b.createModule(.{
         .root_source_file = b.path("src/storage/mmap.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    mmap_mod.addImport("compat", compat_mod);
     const seqlock_mod = b.createModule(.{
         .root_source_file = b.path("src/storage/seqlock.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    seqlock_mod.addImport("compat", compat_mod);
     const epoch_mod = b.createModule(.{
         .root_source_file = b.path("src/storage/epoch.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    epoch_mod.addImport("compat", compat_mod);
     const wal_mod = b.createModule(.{
         .root_source_file = b.path("src/storage/wal.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    wal_mod.addImport("compat", compat_mod);
+
 
     // ── Helper: wire storage imports into a module ──────────────────────────
     const wireStorage = struct {
-        fn f(mod: *std.Build.Module, mmap: *std.Build.Module, wal: *std.Build.Module, epoch: *std.Build.Module, seqlock: *std.Build.Module) void {
+        fn f(mod: *std.Build.Module, mmap: *std.Build.Module, wal: *std.Build.Module, epoch: *std.Build.Module, seqlock: *std.Build.Module, compat: *std.Build.Module) void {
             mod.addImport("mmap", mmap);
             mod.addImport("wal", wal);
             mod.addImport("epoch", epoch);
             mod.addImport("seqlock", seqlock);
+            mod.addImport("compat", compat);
         }
     }.f;
 
@@ -43,7 +61,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    wireStorage(turbodb_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+    wireStorage(turbodb_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod, compat_mod);
 
     const turbodb = b.addExecutable(.{
         .name = "turbodb",
@@ -58,7 +76,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    wireStorage(tdb_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+    wireStorage(tdb_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod, compat_mod);
 
     const tdb = b.addExecutable(.{
         .name = "tdb",
@@ -78,7 +96,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    wireStorage(ffi_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+    wireStorage(ffi_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod, compat_mod);
 
     const lib = b.addLibrary(.{
         .linkage = .dynamic,
@@ -97,6 +115,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    zagdb_mod.addImport("compat", compat_mod);
 
     const zagdb = b.addExecutable(.{
         .name = "zagdb",
@@ -116,6 +135,7 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    reg_test_mod.addImport("compat", compat_mod);
     const reg_tests = b.addTest(.{
         .name = "zagdb-tests",
         .root_module = reg_test_mod,
@@ -131,6 +151,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
+    zag_mod.addImport("compat", compat_mod);
 
     const zag_exe = b.addExecutable(.{
         .name = "zag",
@@ -156,7 +177,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    wireStorage(scale_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+    wireStorage(scale_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod, compat_mod);
 
     const scale_exe = b.addExecutable(.{
         .name = "scale-bench",
@@ -177,7 +198,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseSafe,  // ALWAYS safe — catches segfaults
         .link_libc = true,
     });
-    wireStorage(profile_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+    wireStorage(profile_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod, compat_mod);
 
     const profile_exe = b.addExecutable(.{
         .name = "profile",
@@ -198,7 +219,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    wireStorage(bench_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+    wireStorage(bench_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod, compat_mod);
 
     const bench_exe = b.addExecutable(.{
         .name = "bench-native",
@@ -211,6 +232,24 @@ pub fn build(b: *std.Build) void {
     const bench_step = b.step("bench", "Run native Zig benchmark");
     bench_step.dependOn(&bench_run.step);
 
+    // ── WAL microbenchmark ──────────────────────────────────────────────────
+    const walbench_mod = b.createModule(.{
+        .root_source_file = b.path("src/bench_wal.zig"),
+        .target = target,
+        .optimize = .ReleaseFast,
+        .link_libc = true,
+    });
+    wireStorage(walbench_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod, compat_mod);
+
+    const walbench_exe = b.addExecutable(.{
+        .name = "bench-wal",
+        .root_module = walbench_mod,
+    });
+
+    const walbench_run = b.addRunArtifact(walbench_exe);
+    const walbench_step = b.step("bench-wal", "Run WAL microbenchmark");
+    walbench_step.dependOn(&walbench_run.step);
+
     // ── Regression benchmark ────────────────────────────────────────────────
     const regbench_mod = b.createModule(.{
         .root_source_file = b.path("src/bench_regression.zig"),
@@ -218,7 +257,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
         .link_libc = true,
     });
-    wireStorage(regbench_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+    wireStorage(regbench_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod, compat_mod);
 
     const regbench_exe = b.addExecutable(.{
         .name = "bench-regression",
@@ -238,7 +277,7 @@ pub fn build(b: *std.Build) void {
         .optimize = .ReleaseFast,
         .link_libc = true,
     });
-    wireStorage(partbench_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+    wireStorage(partbench_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod, compat_mod);
 
     const partbench_exe = b.addExecutable(.{
         .name = "bench-partition",
@@ -258,7 +297,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
         .link_libc = true,
     });
-    wireStorage(calvin_test_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+    wireStorage(calvin_test_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod, compat_mod);
 
     const calvin_test_exe = b.addExecutable(.{
         .name = "test-calvin",
@@ -276,16 +315,18 @@ pub fn build(b: *std.Build) void {
 
     // Helper: add a test module with storage imports
     const addTestMod = struct {
-        fn f(b2: *std.Build, src: []const u8, tgt: std.Build.ResolvedTarget, opt: std.builtin.OptimizeMode, mm: *std.Build.Module, wl: *std.Build.Module, ep: *std.Build.Module, sl: *std.Build.Module) *std.Build.Step.Compile {
+        fn f(b2: *std.Build, src: []const u8, tgt: std.Build.ResolvedTarget, opt: std.builtin.OptimizeMode, mm: *std.Build.Module, wl: *std.Build.Module, ep: *std.Build.Module, sl: *std.Build.Module, cm: *std.Build.Module) *std.Build.Step.Compile {
             const mod = b2.createModule(.{
                 .root_source_file = b2.path(src),
                 .target = tgt,
                 .optimize = opt,
+                .link_libc = true,
             });
             mod.addImport("mmap", mm);
             mod.addImport("wal", wl);
             mod.addImport("epoch", ep);
             mod.addImport("seqlock", sl);
+                mod.addImport("compat", cm);
             // Extract just the filename without path for the test name.
             const basename = std.fs.path.stem(src);
             return b2.addTest(.{ .name = basename, .root_module = mod });
@@ -297,7 +338,9 @@ pub fn build(b: *std.Build) void {
         .root_source_file = b.path("src/doc.zig"),
         .target = target,
         .optimize = optimize,
+        .link_libc = true,
     });
+    test_mod.addImport("compat", compat_mod);
     const unit_tests = b.addTest(.{
         .name = "turbodb-tests",
         .root_module = test_mod,
@@ -341,18 +384,18 @@ pub fn build(b: *std.Build) void {
     test_all_step.dependOn(&run_tests.step);
 
     for (new_test_files) |src| {
-        const t = addTestMod(b, src, target, optimize, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+        const t = addTestMod(b, src, target, optimize, mmap_mod, wal_mod, epoch_mod, seqlock_mod, compat_mod);
         const run_t = b.addRunArtifact(t);
         test_all_step.dependOn(&run_t.step);
     }
 
     // Also add collection test with storage imports
-    const col_test = addTestMod(b, "src/collection.zig", target, optimize, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+    const col_test = addTestMod(b, "src/collection.zig", target, optimize, mmap_mod, wal_mod, epoch_mod, seqlock_mod, compat_mod);
     const run_col_test = b.addRunArtifact(col_test);
     test_all_step.dependOn(&run_col_test.step);
 
     // Parallel WAL test
-    const pwal_test = addTestMod(b, "src/storage/parallel_wal.zig", target, optimize, mmap_mod, wal_mod, epoch_mod, seqlock_mod);
+    const pwal_test = addTestMod(b, "src/storage/parallel_wal.zig", target, optimize, mmap_mod, wal_mod, epoch_mod, seqlock_mod, compat_mod);
     const run_pwal_test = b.addRunArtifact(pwal_test);
     test_all_step.dependOn(&run_pwal_test.step);
 }

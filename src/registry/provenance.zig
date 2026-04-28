@@ -4,6 +4,7 @@
 /// by a specific builder, at a specific time. Users can verify the chain:
 ///   source → build → artifact
 const std = @import("std");
+const compat = @import("compat");
 const sign_mod = @import("sign.zig");
 const hash_mod = @import("hash.zig");
 
@@ -28,7 +29,7 @@ pub fn createAttestation(
     buf: *AttestationBuf,
 ) Provenance {
     const pubkey_hex = sign_mod.pubkeyHex(keypair.public_key);
-    const now = std.time.timestamp();
+    const now = compat.timestamp();
 
     // Build message to sign
     const msg = std.fmt.bufPrint(&buf.msg_buf, "provenance:{s}:{s}:{s}", .{
@@ -114,7 +115,7 @@ test "create and verify attestation" {
         "abc123source",
         "aarch64-macos",
         "def456artifact",
-        "0.15.0",
+        "0.16.0",
         kp,
         &att_buf,
     );
@@ -134,7 +135,7 @@ test "attestation fails with wrong key" {
         "src_hash",
         "x86_64-linux",
         "art_hash",
-        "0.15.0",
+        "0.16.0",
         kp1,
         &att_buf,
     );
@@ -151,7 +152,7 @@ test "attestation toJson" {
         "source123",
         "aarch64-macos",
         "artifact456",
-        "0.15.0",
+        "0.16.0",
         kp,
         &att_buf,
     );
@@ -162,5 +163,5 @@ test "attestation toJson" {
     try std.testing.expect(std.mem.indexOf(u8, json, "source123") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "aarch64-macos") != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "artifact456") != null);
-    try std.testing.expect(std.mem.indexOf(u8, json, "0.15.0") != null);
+    try std.testing.expect(std.mem.indexOf(u8, json, "0.16.0") != null);
 }

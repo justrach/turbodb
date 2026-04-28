@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const collection = @import("collection.zig");
 const cdc_mod = @import("cdc.zig");
 const doc_mod = @import("doc.zig");
@@ -116,20 +117,11 @@ pub const BranchedDatabase = struct {
 
         const branches_dir = try std.fmt.allocPrint(alloc, "{s}/branches", .{base_data_dir});
         defer alloc.free(branches_dir);
-        std.fs.cwd().makePath(branches_dir) catch |e| switch (e) {
-            error.PathAlreadyExists => {},
-            else => return e,
-        };
-        std.fs.cwd().makePath(branch_root) catch |e| switch (e) {
-            error.PathAlreadyExists => {},
-            else => return e,
-        };
-        std.fs.cwd().makePath(overlay_dir) catch |e| switch (e) {
-            error.PathAlreadyExists => {},
-            else => return e,
-        };
+        try compat.cwd().makePath(branches_dir);
+        try compat.cwd().makePath(branch_root);
+        try compat.cwd().makePath(overlay_dir);
 
-        var file = try std.fs.createFileAbsolute(manifest_path, .{ .truncate = true });
+        var file = try compat.createFileAbsolute(manifest_path, .{ .truncate = true });
         defer file.close();
         try file.writeAll(base_data_dir);
 
@@ -142,7 +134,7 @@ pub const BranchedDatabase = struct {
     pub fn open(alloc: std.mem.Allocator, branch_root: []const u8) !BranchedDatabase {
         const manifest_path = try std.fmt.allocPrint(alloc, "{s}/manifest.txt", .{branch_root});
         defer alloc.free(manifest_path);
-        const parent_path = try std.fs.cwd().readFileAlloc(alloc, manifest_path, 4096);
+        const parent_path = try compat.cwd().readFileAlloc(alloc, manifest_path, 4096);
         errdefer alloc.free(parent_path);
         const overlay_dir = try std.fmt.allocPrint(alloc, "{s}/overlay", .{branch_root});
         errdefer alloc.free(overlay_dir);
@@ -188,7 +180,7 @@ pub const BranchedDatabase = struct {
         const snapshot_overlay = try std.fmt.allocPrint(self.alloc, "{s}/overlay", .{snapshot_root});
         errdefer self.alloc.free(snapshot_overlay);
 
-        try std.fs.cwd().makePath(snapshot_overlay);
+        try compat.cwd().makePath(snapshot_overlay);
         try copyDirFilesAbsolute(self.overlay_dir, snapshot_overlay);
 
         return .{
@@ -222,7 +214,7 @@ pub const PublishedSnapshot = struct {
         const manifest_path = try std.fmt.allocPrint(alloc, "{s}/manifest.txt", .{replica_root});
         defer alloc.free(manifest_path);
 
-        try std.fs.cwd().makePath(replica_overlay);
+        try compat.cwd().makePath(replica_overlay);
         try writeFileAbsolute(manifest_path, self.parent_path);
         try copyDirFilesAbsolute(self.overlay_dir, replica_overlay);
 
@@ -236,7 +228,7 @@ fn branchNameFromRoot(branch_root: []const u8) []const u8 {
 }
 
 fn copyDirFilesAbsolute(src_dir: []const u8, dest_dir: []const u8) !void {
-    var src = try std.fs.openDirAbsolute(src_dir, .{ .iterate = true });
+    var src = try compat.openDirAbsolute(src_dir, .{ .iterate = true });
     defer src.close();
 
     var it = src.iterate();
@@ -253,17 +245,28 @@ fn copyDirFilesAbsolute(src_dir: []const u8, dest_dir: []const u8) !void {
 }
 
 fn copyFileAbsolute(src_path: []const u8, dest_path: []const u8) !void {
-    var src_file = try std.fs.openFileAbsolute(src_path, .{});
+    var src_file = try compat.openFileAbsolute(src_path, .{});
     defer src_file.close();
-    var dst_file = try std.fs.createFileAbsolute(dest_path, .{ .truncate = true });
+    var dst_file = try compat.createFileAbsolute(dest_path, .{ .truncate = true });
     defer dst_file.close();
 
     const stat = try src_file.stat();
-    _ = try src_file.copyRangeAll(0, dst_file, 0, stat.size);
+    const buf_len: usize = @min(@as(usize, 64 * 1024), @max(@as(usize, 1), @as(usize, @intCast(stat.size))));
+    const buf = try std.heap.page_allocator.alloc(u8, buf_len);
+    defer std.heap.page_allocator.free(buf);
+
+    var remaining = stat.size;
+    while (remaining > 0) {
+        const want: usize = @intCast(@min(remaining, buf.len));
+        const n = try src_file.read(buf[0..want]);
+        if (n == 0) return error.UnexpectedEof;
+        try dst_file.writeAll(buf[0..n]);
+        remaining -= @intCast(n);
+    }
 }
 
 fn writeFileAbsolute(path: []const u8, content: []const u8) !void {
-    var file = try std.fs.createFileAbsolute(path, .{ .truncate = true });
+    var file = try compat.createFileAbsolute(path, .{ .truncate = true });
     defer file.close();
     try file.writeAll(content);
 }
@@ -271,9 +274,9 @@ fn writeFileAbsolute(path: []const u8, content: []const u8) !void {
 test "branched database reads from base and writes to overlay" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_branching_test";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    try compat.cwd().makePath(tmp_dir);
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
 
     const base = try Database.open(alloc, tmp_dir);
     defer base.close();
@@ -296,9 +299,9 @@ test "branched database reads from base and writes to overlay" {
 test "published snapshot retains branch source metadata" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_branch_publish";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    try compat.cwd().makePath(tmp_dir);
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
 
     const base = try Database.open(alloc, tmp_dir);
     defer base.close();
@@ -317,11 +320,11 @@ test "published snapshot materializes embedded replica state" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/turbodb_branch_replica";
     const replica_root = "/tmp/turbodb_branch_replica_embedded";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
-    std.fs.cwd().deleteTree(replica_root) catch {};
-    try std.fs.cwd().makePath(tmp_dir);
-    defer std.fs.cwd().deleteTree(tmp_dir) catch {};
-    defer std.fs.cwd().deleteTree(replica_root) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(replica_root) catch {};
+    try compat.cwd().makePath(tmp_dir);
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
+    defer compat.cwd().deleteTree(replica_root) catch {};
 
     const base = try Database.open(alloc, tmp_dir);
     defer base.close();

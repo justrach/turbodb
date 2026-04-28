@@ -17,10 +17,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Zig 0.15
+      - name: Install Zig 0.16
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
 
       - name: Build (Debug)
         run: zig build
@@ -53,10 +53,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Zig 0.15
+      - name: Install Zig 0.16
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
 
       - name: Build shared library
         run: zig build
@@ -78,10 +78,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Zig 0.15
+      - name: Install Zig 0.16
         uses: mlugg/setup-zig@v2
         with:
-          version: 0.15.2
+          version: 0.16.0
 
       - name: Build (ReleaseFast)
         run: zig build -Doptimize=ReleaseFast

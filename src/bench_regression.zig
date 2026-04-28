@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const client = @import("client.zig");
 const compression = @import("compression.zig");
 const art_mod = @import("art.zig");
@@ -57,13 +58,13 @@ fn record(name: []const u8, json_key: []const u8, ops: usize, elapsed_ns: i128) 
 // ─── Timing helper ──────────────────────────────────────────────────────────
 
 inline fn now() i128 {
-    return std.time.nanoTimestamp();
+    return compat.nanoTimestamp();
 }
 
 // ─── Benchmark: Core Path (INSERT / GET / UPDATE / DELETE) ──────────────────
 
 fn benchCorePath() !void {
-    std.fs.cwd().deleteTree(DATA_DIR) catch {};
+    compat.cwd().deleteTree(DATA_DIR) catch {};
     var db = try client.Db.open(alloc, DATA_DIR);
     defer db.close();
 
@@ -114,7 +115,7 @@ fn benchCorePath() !void {
         record("Core DELETE", "core_delete_ops_sec", N, now() - t0);
     }
 
-    std.fs.cwd().deleteTree(DATA_DIR) catch {};
+    compat.cwd().deleteTree(DATA_DIR) catch {};
 }
 
 // ─── Benchmark: Compression ─────────────────────────────────────────────────
@@ -251,11 +252,11 @@ fn benchQuery() void {
 fn benchLSM() !void {
     const N: usize = 100_000;
 
-    std.fs.cwd().deleteTree(LSM_DIR) catch {};
+    compat.cwd().deleteTree(LSM_DIR) catch {};
     var lsm = try lsm_mod.LSMTree.init(alloc, LSM_DIR);
     defer {
         lsm.deinit();
-        std.fs.cwd().deleteTree(LSM_DIR) catch {};
+        compat.cwd().deleteTree(LSM_DIR) catch {};
     }
 
     // Put
@@ -288,7 +289,7 @@ fn benchLSM() !void {
     {
         // Re-init with fresh data for flush timing
         lsm.deinit();
-        std.fs.cwd().deleteTree(LSM_DIR) catch {};
+        compat.cwd().deleteTree(LSM_DIR) catch {};
         lsm = try lsm_mod.LSMTree.init(alloc, LSM_DIR);
 
         // Fill memtable to ~4MB
@@ -408,7 +409,7 @@ fn benchMVCC() !void {
 
 fn emitJSON() void {
     // Timestamp
-    const ts = std.time.timestamp();
+    const ts = compat.timestamp();
     const epoch_secs: u64 = @intCast(ts);
     const secs_in_day: u64 = 86400;
     const days = epoch_secs / secs_in_day;
@@ -436,7 +437,7 @@ fn emitJSON() void {
 
     // Also write to a JSON file for CI consumption using fmt.bufPrint + writeAll
     const json_path = "/tmp/turbodb_regression_bench.json";
-    const file = std.fs.cwd().createFile(json_path, .{}) catch return;
+    const file = compat.cwd().createFile(json_path, .{}) catch return;
     defer file.close();
 
     var buf: [8192]u8 = undefined;
@@ -501,6 +502,6 @@ pub fn main() !void {
     emitJSON();
 
     // Cleanup
-    std.fs.cwd().deleteTree(DATA_DIR) catch {};
-    std.fs.cwd().deleteTree(LSM_DIR) catch {};
+    compat.cwd().deleteTree(DATA_DIR) catch {};
+    compat.cwd().deleteTree(LSM_DIR) catch {};
 }

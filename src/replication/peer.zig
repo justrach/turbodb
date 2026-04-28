@@ -6,6 +6,7 @@
 ///
 /// Protocol: simple framed TCP — [4-byte big-endian length][batch payload]
 const std = @import("std");
+const compat = @import("compat");
 const sequencer = @import("sequencer.zig");
 const calvin = @import("calvin.zig");
 
@@ -51,15 +52,15 @@ pub const PeerSender = struct {
 
     fn sendToPeer(peer: *const PeerAddr, payload: []const u8) !void {
         // Parse IP address
-        const addr = try std.net.Address.parseIp(peer.hostSlice(), peer.port);
-        const stream = try std.net.tcpConnectToAddress(addr);
+        const addr = try compat.net.Address.parseIp(peer.hostSlice(), peer.port);
+        const stream = try compat.net.tcpConnectToAddress(addr);
         defer stream.close();
 
         // Write length-prefixed frame
         var len_buf: [4]u8 = undefined;
         std.mem.writeInt(u32, &len_buf, @intCast(payload.len), .big);
-        _ = try stream.write(&len_buf);
-        _ = try stream.write(payload);
+        try stream.writeAll(&len_buf);
+        try stream.writeAll(payload);
     }
 };
 
@@ -86,7 +87,7 @@ pub const PeerReceiver = struct {
     }
 
     pub fn run(self: *PeerReceiver) !void {
-        const addr = try std.net.Address.parseIp("0.0.0.0", self.port);
+        const addr = try compat.net.Address.parseIp("0.0.0.0", self.port);
         var listener = try addr.listen(.{ .reuse_address = true });
         defer listener.deinit();
 
@@ -107,7 +108,7 @@ pub const PeerReceiver = struct {
         self.running.store(false, .release);
     }
 
-    fn handlePeerConn(self: *PeerReceiver, conn: std.net.Server.Connection) void {
+    fn handlePeerConn(self: *PeerReceiver, conn: compat.net.Server.Connection) void {
         defer conn.stream.close();
 
         // Read length-prefixed frame

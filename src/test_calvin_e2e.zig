@@ -7,6 +7,7 @@
 ///   4. Both nodes execute deterministically
 ///   5. Verify both databases have identical state
 const std = @import("std");
+const compat = @import("compat");
 const collection_mod = @import("collection.zig");
 const doc_mod = @import("doc.zig");
 const sequencer = @import("replication/sequencer.zig");
@@ -89,17 +90,17 @@ fn makeTxn(alloc: std.mem.Allocator, txn_id: u64, txn_type: sequencer.TxnType, c
 }
 
 pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const alloc = gpa.allocator();
+    // GPA replaced by smp_allocator for Zig 0.16
+
+    const alloc = std.heap.smp_allocator;
 
     // Clean up any previous test data
-    std.fs.cwd().deleteTree("/tmp/calvin_test_leader") catch {};
-    std.fs.cwd().deleteTree("/tmp/calvin_test_replica") catch {};
+    compat.cwd().deleteTree("/tmp/calvin_test_leader") catch {};
+    compat.cwd().deleteTree("/tmp/calvin_test_replica") catch {};
 
     // Create data directories
-    std.fs.makeDirAbsolute("/tmp/calvin_test_leader") catch {};
-    std.fs.makeDirAbsolute("/tmp/calvin_test_replica") catch {};
+    compat.cwd().makeDir("/tmp/calvin_test_leader") catch {};
+    compat.cwd().makeDir("/tmp/calvin_test_replica") catch {};
 
     // ── Step 1: Open two separate databases ──────────────────────────────
     std.debug.print("\n=== TurboDB Calvin Replication E2E Test ===\n\n", .{});
@@ -236,6 +237,6 @@ pub fn main() !void {
     }
 
     // Cleanup
-    std.fs.cwd().deleteTree("/tmp/calvin_test_leader") catch {};
-    std.fs.cwd().deleteTree("/tmp/calvin_test_replica") catch {};
+    compat.cwd().deleteTree("/tmp/calvin_test_leader") catch {};
+    compat.cwd().deleteTree("/tmp/calvin_test_replica") catch {};
 }

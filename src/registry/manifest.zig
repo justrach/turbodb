@@ -12,13 +12,14 @@
 ///   "author": "Alice",
 ///   "license": "MIT",
 ///   "tags": ["web", "http", "framework"],
-///   "zig_version": "0.15.0",
+///   "zig_version": "0.16.0",
 ///   "dependencies": {
 ///     "router": "^1.0.0",
 ///     "json": {"version": "^0.5.0", "hash": "a3f9c8..."}
 ///   }
 /// }
 const std = @import("std");
+const compat = @import("compat");
 
 pub const Dependency = struct {
     name: []const u8,
@@ -39,12 +40,12 @@ pub const Manifest = struct {
     tags: []const []const u8 = &.{},
     dependencies: []const Dependency = &.{},
     dev_dependencies: []const Dependency = &.{},
-    zig_version: []const u8 = "0.15.0",
+    zig_version: []const u8 = "0.16.0",
 
     /// Serialize manifest to JSON for TurboDB storage.
     /// Returns a slice into buf.
     pub fn toJson(self: Manifest, buf: []u8) ![]const u8 {
-        var fbs = std.io.fixedBufferStream(buf);
+        var fbs = compat.fixedBufferStream(buf);
         const w = fbs.writer();
 
         try w.writeAll("{");
@@ -111,7 +112,7 @@ pub fn template(name: []const u8, buf: []u8) ![]const u8 {
         \\  "description": "",
         \\  "author": "",
         \\  "license": "MIT",
-        \\  "zig_version": "0.15.0",
+        \\  "zig_version": "0.16.0",
         \\  "tags": [],
         \\  "dependencies": {{}},
         \\  "dev_dependencies": {{}}
@@ -158,7 +159,7 @@ pub fn parse(alloc: std.mem.Allocator, source: []const u8) !Manifest {
         .license = jsonGetStr(source, "license") orelse "",
         .visibility = jsonGetStr(source, "visibility") orelse "public",
         .org = jsonGetStr(source, "org"),
-        .zig_version = jsonGetStr(source, "zig_version") orelse "0.15.0",
+        .zig_version = jsonGetStr(source, "zig_version") orelse "0.16.0",
     };
 }
 

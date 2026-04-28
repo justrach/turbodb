@@ -1,4 +1,5 @@
 const std = @import("std");
+const compat = @import("compat");
 const sequencer = @import("sequencer.zig");
 
 pub const NodeId = u16;
@@ -48,7 +49,7 @@ pub const CalvinExecutor = struct {
 
     // Execution state
     last_executed_epoch: u64,
-    execute_mu: std.Thread.Mutex,
+    execute_mu: compat.Mutex,
 
     pub fn init(alloc: std.mem.Allocator, node_id: NodeId) CalvinExecutor {
         return .{
@@ -112,7 +113,7 @@ pub const CalvinExecutor = struct {
     /// Each txn: [txn_id:u64][type:u8][partition:u16][key_hash:u64]
     ///           [data_len:u32][data...][rs_len:u32][rs...][ws_len:u32][ws...]
     pub fn serializeBatch(batch: *const sequencer.Batch, buf: []u8) !usize {
-        var fbs = std.io.fixedBufferStream(buf);
+        var fbs = compat.fixedBufferStream(buf);
         const w = fbs.writer();
 
         try w.writeInt(u64, batch.epoch, .little);
@@ -143,7 +144,7 @@ pub const CalvinExecutor = struct {
 
     /// Deserialize a batch from network bytes.
     pub fn deserializeBatch(data: []const u8, alloc: std.mem.Allocator) !sequencer.Batch {
-        var fbs = std.io.fixedBufferStream(data);
+        var fbs = compat.constFixedBufferStream(data);
         const r = fbs.reader();
 
         const epoch = try r.readInt(u64, .little);

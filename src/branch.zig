@@ -5,6 +5,7 @@
 //! Merging applies branch changes to main with conflict detection.
 
 const std = @import("std");
+const compat = @import("compat");
 const Allocator = std.mem.Allocator;
 
 pub const BranchStatus = enum(u8) {
@@ -431,7 +432,7 @@ pub const BranchManager = struct {
             .name = undefined,
             .name_len = name_len,
             .base_epoch = self.next_epoch.load(.acquire),
-            .created_at = std.time.milliTimestamp(),
+            .created_at = compat.milliTimestamp(),
             .status = .active,
             .agent_id = undefined,
             .agent_id_len = aid_len,

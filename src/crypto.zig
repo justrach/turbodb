@@ -8,6 +8,7 @@
 ///
 /// Uses Zig's std.crypto — no external dependencies, no OpenSSL.
 const std = @import("std");
+const compat = @import("compat");
 
 // ── Hash algorithms ──────────────────────────────────────────────────────────
 
@@ -82,7 +83,9 @@ pub const KeyPair = struct {
     secret_key: [64]u8,
 
     pub fn generate() KeyPair {
-        const kp = Ed25519.KeyPair.generate();
+        var seed: [32]u8 = undefined;
+        compat.randomBytes(&seed);
+        const kp = Ed25519.KeyPair.generateDeterministic(seed) catch unreachable;
         return .{
             .public_key = kp.public_key.toBytes(),
             .secret_key = kp.secret_key.toBytes(),

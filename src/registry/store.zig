@@ -6,6 +6,7 @@
 /// TurboDB's `blobs` collection tracks metadata only (hash, size, disk path).
 /// Deduplication is automatic: same content → same hash → same file.
 const std = @import("std");
+const compat = @import("compat");
 const hash_mod = @import("hash.zig");
 
 /// BlobStore manages content-addressed blob storage.
@@ -18,7 +19,7 @@ pub const BlobStore = struct {
         // Ensure blobs directory exists
         var path_buf: [512]u8 = undefined;
         const blobs_dir = try std.fmt.bufPrint(&path_buf, "{s}/blobs", .{data_dir});
-        try std.fs.cwd().makePath(blobs_dir);
+        try compat.cwd().makePath(blobs_dir);
 
         return .{
             .data_dir = data_dir,
@@ -44,22 +45,22 @@ pub const BlobStore = struct {
         if (self.existsPath(file_path)) return content_hash;
 
         // Create prefix directory
-        std.fs.cwd().makePath(prefix_dir) catch {};
+        compat.cwd().makePath(prefix_dir) catch {};
 
         // Write blob atomically: write to .tmp, then rename
         var tmp_buf: [512]u8 = undefined;
         const tmp_path = try std.fmt.bufPrint(&tmp_buf, "{s}.tmp", .{file_path});
 
         {
-            const file = try std.fs.cwd().createFile(tmp_path, .{});
+            const file = try compat.cwd().createFile(tmp_path, .{});
             defer file.close();
             try file.writeAll(data);
         }
 
         // Atomic rename
-        std.fs.cwd().rename(tmp_path, file_path) catch |err| {
+        compat.cwd().rename(tmp_path, file_path) catch |err| {
             // If rename fails, try to clean up tmp
-            std.fs.cwd().deleteFile(tmp_path) catch {};
+            compat.cwd().deleteFile(tmp_path) catch {};
             return err;
         };
 
@@ -88,7 +89,7 @@ pub const BlobStore = struct {
             hash_hex[0..],
         }) catch return null;
 
-        const file = std.fs.cwd().openFile(path, .{}) catch return null;
+        const file = compat.cwd().openFile(path, .{}) catch return null;
         defer file.close();
         const stat = file.stat() catch return null;
         return stat.size;
@@ -103,11 +104,11 @@ pub const BlobStore = struct {
             hash_hex[0..2],
             hash_hex[0..],
         });
-        return std.fs.cwd().readFileAlloc(self.alloc, path, 256 * 1024 * 1024);
+        return compat.cwd().readFileAlloc(self.alloc, path, 256 * 1024 * 1024);
     }
 
     /// Open a blob file for streaming reads. Caller owns the file handle.
-    pub fn openBlob(self: *BlobStore, hash_hex: []const u8) !std.fs.File {
+    pub fn openBlob(self: *BlobStore, hash_hex: []const u8) !compat.File {
         if (hash_hex.len != 64) return error.InvalidHash;
         var path_buf: [512]u8 = undefined;
         const path = try std.fmt.bufPrint(&path_buf, "{s}/blobs/{s}/{s}.tar.zst", .{
@@ -115,7 +116,7 @@ pub const BlobStore = struct {
             hash_hex[0..2],
             hash_hex[0..],
         });
-        return std.fs.cwd().openFile(path, .{});
+        return compat.cwd().openFile(path, .{});
     }
 
     /// Get the filesystem path for a blob (for serving over HTTP).
@@ -135,14 +136,14 @@ pub const BlobStore = struct {
             hash_hex[0..2],
             hash_hex[0..],
         });
-        const now = std.time.timestamp();
+        const now = compat.timestamp();
         return std.fmt.bufPrint(buf,
             \\{{"hash":"{s}","size":{d},"content_type":"application/zstd","disk_path":"{s}","uploaded_at":{d},"ref_count":1}}
         , .{ hash_hex, data_len, disk_path, now });
     }
 
     fn existsPath(_: *BlobStore, path: []const u8) bool {
-        std.fs.cwd().access(path, .{}) catch return false;
+        compat.cwd().access(path, .{}) catch return false;
         return true;
     }
 };
@@ -152,7 +153,7 @@ pub const BlobStore = struct {
 test "put and read blob" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/zagdb-store-test";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
 
     var store = try BlobStore.init(alloc, tmp_dir);
 
@@ -172,13 +173,13 @@ test "put and read blob" {
     // Size should match
     try std.testing.expectEqual(@as(u64, data.len), store.blobSize(&hex).?);
 
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
 }
 
 test "put deduplicates" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/zagdb-store-dedup";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
 
     var store = try BlobStore.init(alloc, tmp_dir);
 
@@ -189,13 +190,13 @@ test "put deduplicates" {
     // Same hash
     try std.testing.expectEqual(h1, h2);
 
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
 }
 
 test "different content different hash" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/zagdb-store-diff";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
 
     var store = try BlobStore.init(alloc, tmp_dir);
 
@@ -212,13 +213,13 @@ test "different content different hash" {
     try std.testing.expect(store.exists(&hex1));
     try std.testing.expect(store.exists(&hex2));
 
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
 }
 
 test "nonexistent blob" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/zagdb-store-none";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
 
     var store = try BlobStore.init(alloc, tmp_dir);
 
@@ -226,13 +227,13 @@ test "nonexistent blob" {
     try std.testing.expect(!store.exists(fake_hex));
     try std.testing.expectEqual(@as(?u64, null), store.blobSize(fake_hex));
 
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
 }
 
 test "metadata json" {
     const alloc = std.testing.allocator;
     const tmp_dir = "/tmp/zagdb-store-meta";
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
 
     var store = try BlobStore.init(alloc, tmp_dir);
 
@@ -248,5 +249,5 @@ test "metadata json" {
     try std.testing.expect(std.mem.indexOf(u8, json, &hex) != null);
     try std.testing.expect(std.mem.indexOf(u8, json, "\"size\":9") != null);
 
-    std.fs.cwd().deleteTree(tmp_dir) catch {};
+    compat.cwd().deleteTree(tmp_dir) catch {};
 }

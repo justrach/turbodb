@@ -18,6 +18,7 @@
 ///   - Simple dispatch routing
 ///   - JSON responses
 const std = @import("std");
+const compat = @import("compat");
 const registry_mod = @import("registry.zig");
 const sign_mod = @import("sign.zig");
 const hash_mod = @import("hash.zig");
@@ -61,7 +62,7 @@ pub const RegistryServer = struct {
     }
 
     pub fn run(self: *RegistryServer) !void {
-        const addr = try std.net.Address.parseIp("0.0.0.0", self.port);
+        const addr = try compat.net.Address.parseIp("0.0.0.0", self.port);
         var listener = try addr.listen(.{
             .reuse_address = true,
             .kernel_backlog = 256,
@@ -87,7 +88,7 @@ pub const RegistryServer = struct {
     }
 };
 
-fn handleConn(srv: *RegistryServer, conn: std.net.Server.Connection) void {
+fn handleConn(srv: *RegistryServer, conn: compat.net.Server.Connection) void {
     defer conn.stream.close();
 
     const bufs = std.heap.page_allocator.create(ConnBufs) catch return;
@@ -107,7 +108,7 @@ fn handleConn(srv: *RegistryServer, conn: std.net.Server.Connection) void {
 
 fn dispatch(srv: *RegistryServer, raw: []const u8) usize {
     const nl = std.mem.indexOfScalar(u8, raw, '\n') orelse return err(400, "bad request");
-    const req_line = std.mem.trimRight(u8, raw[0..nl], "\r");
+    const req_line = std.mem.trimEnd(u8, raw[0..nl], "\r");
     var parts = std.mem.splitScalar(u8, req_line, ' ');
     const method = parts.next() orelse return err(400, "bad request");
     const full_path = parts.next() orelse return err(400, "bad request");
@@ -131,8 +132,8 @@ fn dispatch(srv: *RegistryServer, raw: []const u8) usize {
 
     // ─── /metrics ───────────────────────────────────────────────────────
     if (std.mem.eql(u8, path, "/metrics")) {
-        var fbs = std.io.fixedBufferStream(getBodyBuf());
-        std.fmt.format(fbs.writer(), "{{\"requests\":{d},\"errors\":{d}}}", .{
+        var fbs = compat.fixedBufferStream(getBodyBuf());
+        compat.format(fbs.writer(), "{{\"requests\":{d},\"errors\":{d}}}", .{
             srv.req_count.load(.acquire),
             srv.err_count.load(.acquire),
         }) catch {};
@@ -215,18 +216,18 @@ fn handleSearch(srv: *RegistryServer, query_str: []const u8, auth: AuthContext) 
     var results: [50]registry_mod.PackageInfo = undefined;
     const count = srv.registry.searchAuth(q, capped, &results, auth) catch return err(500, "search failed");
 
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
+    var fbs = compat.fixedBufferStream(getBodyBuf());
     const w = fbs.writer();
     w.writeAll("{\"results\":[") catch {};
     for (0..count) |i| {
         if (i > 0) w.writeAll(",") catch {};
-        std.fmt.format(w, "{{\"name\":\"{s}\",\"description\":\"{s}\",\"version\":\"{s}\"}}", .{
+        compat.format(w, "{{\"name\":\"{s}\",\"description\":\"{s}\",\"version\":\"{s}\"}}", .{
             results[i].name,
             results[i].description,
             results[i].version,
         }) catch {};
     }
-    std.fmt.format(w, "],\"count\":{d}}}", .{count}) catch {};
+    compat.format(w, "],\"count\":{d}}}", .{count}) catch {};
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 
@@ -255,8 +256,8 @@ fn handlePublish(srv: *RegistryServer, body: []const u8) usize {
         };
     };
 
-    var fbs = std.io.fixedBufferStream(getBodyBuf());
-    std.fmt.format(fbs.writer(), "{{\"ok\":true,\"name\":\"{s}\",\"version\":\"{s}\",\"hash\":\"{s}\"}}", .{
+    var fbs = compat.fixedBufferStream(getBodyBuf());
+    compat.format(fbs.writer(), "{{\"ok\":true,\"name\":\"{s}\",\"version\":\"{s}\",\"hash\":\"{s}\"}}", .{
         result.package_name,
         result.version,
         result.source_hash_hex,
@@ -318,8 +319,8 @@ fn handleDownload(srv: *RegistryServer, hash_hex: []const u8) usize {
     // For blobs, return raw data (not JSON)
     if (data.len > MAX_RESP - 256) return err(413, "blob too large for response buffer");
 
-    var fbs = std.io.fixedBufferStream(getRespBuf());
-    std.fmt.format(fbs.writer(), "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n", .{data.len}) catch {};
+    var fbs = compat.fixedBufferStream(getRespBuf());
+    compat.format(fbs.writer(), "HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n", .{data.len}) catch {};
     const header_len = fbs.pos;
     if (header_len + data.len <= MAX_RESP) {
         @memcpy(getRespBuf()[header_len..][0..data.len], data);
@@ -361,8 +362,8 @@ fn err(code: u16, msg: []const u8) usize {
 }
 
 fn respond(code: u16, status: []const u8, body: []const u8) usize {
-    var fbs = std.io.fixedBufferStream(getRespBuf());
-    std.fmt.format(fbs.writer(), "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}", .{ code, status, body.len, body }) catch {};
+    var fbs = compat.fixedBufferStream(getRespBuf());
+    compat.format(fbs.writer(), "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n{s}", .{ code, status, body.len, body }) catch {};
     return fbs.pos;
 }
 
