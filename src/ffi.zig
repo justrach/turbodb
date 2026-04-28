@@ -160,6 +160,44 @@ export fn turbodb_insert(
     return 0;
 }
 
+/// Bulk insert NDJSON lines shaped as {"key":"...","value":...}.
+/// Returns 0 if the request was processed; per-row failures are counted.
+export fn turbodb_insert_bulk_ndjson(
+    col_handle: *anyopaque,
+    body: [*]const u8,
+    body_len: usize,
+    out_inserted: *u32,
+    out_errors: *u32,
+) c_int {
+    const col = validateColHandle(col_handle) orelse return -1;
+    var inserted: u32 = 0;
+    var errors: u32 = 0;
+    const input = body[0..body_len];
+
+    var pos: usize = 0;
+    while (pos < input.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, input, pos, '\n') orelse input.len;
+        const line = std.mem.trim(u8, input[pos..line_end], " \t\r");
+        pos = if (line_end < input.len) line_end + 1 else line_end;
+        if (line.len == 0) continue;
+
+        const key = jsonStr(line, "key") orelse {
+            errors += 1;
+            continue;
+        };
+        const value = jsonValue(line, "value") orelse line;
+        _ = col.insert(key, value) catch {
+            errors += 1;
+            continue;
+        };
+        inserted += 1;
+    }
+
+    out_inserted.* = inserted;
+    out_errors.* = errors;
+    return 0;
+}
+
 /// Insert with a pre-computed embedding (no JSON parsing). Fast path for vector inserts.
 export fn turbodb_insert_with_embedding(
     col_handle: *anyopaque,
@@ -186,6 +224,38 @@ export fn turbodb_get(
     const col = validateColHandle(col_handle) orelse return -1;
     const d = col.get(key[0..key_len]) orelse return -1;
     out.* = docToResult(d);
+    return 0;
+}
+
+/// Read many newline-delimited or JSON-array keys in one FFI call.
+/// The output reports found/missing counts and total key+value bytes read.
+export fn turbodb_get_many_keys(
+    col_handle: *anyopaque,
+    keys_body: [*]const u8,
+    keys_len: usize,
+    out_found: *u32,
+    out_missing: *u32,
+    out_bytes: *usize,
+) c_int {
+    const col = validateColHandle(col_handle) orelse return -1;
+    var iter = KeyIter.init(keys_body[0..keys_len]);
+    var found: u32 = 0;
+    var missing: u32 = 0;
+    var bytes_read: usize = 0;
+
+    while (iter.next()) |key| {
+        if (key.len == 0) continue;
+        if (col.get(key)) |d| {
+            found += 1;
+            bytes_read += d.key.len + d.value.len;
+        } else {
+            missing += 1;
+        }
+    }
+
+    out_found.* = found;
+    out_missing.* = missing;
+    out_bytes.* = bytes_read;
     return 0;
 }
 
@@ -268,6 +338,139 @@ fn docToResult(d: Doc) TurboDocResult {
         .doc_id = d.header.doc_id,
         .version = d.header.version,
     };
+}
+
+const KeyIter = struct {
+    body: []const u8,
+    pos: usize = 0,
+    array_mode: bool = false,
+
+    fn init(body: []const u8) KeyIter {
+        const trimmed = std.mem.trim(u8, body, " \t\r\n");
+        if (trimmed.len == 0) return .{ .body = trimmed };
+        if (trimmed[0] == '{') {
+            if (jsonValue(trimmed, "keys")) |keys| {
+                if (keys.len > 0 and keys[0] == '[') {
+                    return .{ .body = keys, .pos = 1, .array_mode = true };
+                }
+            }
+        }
+        if (trimmed[0] == '[') return .{ .body = trimmed, .pos = 1, .array_mode = true };
+        return .{ .body = trimmed };
+    }
+
+    fn next(self: *KeyIter) ?[]const u8 {
+        if (self.array_mode) return self.nextArray();
+        return self.nextLine();
+    }
+
+    fn nextLine(self: *KeyIter) ?[]const u8 {
+        while (self.pos < self.body.len) {
+            const line_end = std.mem.indexOfScalarPos(u8, self.body, self.pos, '\n') orelse self.body.len;
+            const raw_line = std.mem.trim(u8, self.body[self.pos..line_end], " \t\r");
+            self.pos = if (line_end < self.body.len) line_end + 1 else line_end;
+            if (raw_line.len == 0) continue;
+            if (raw_line[0] == '{') return jsonStr(raw_line, "key") orelse continue;
+            if (raw_line.len >= 2 and raw_line[0] == '"' and raw_line[raw_line.len - 1] == '"')
+                return raw_line[1 .. raw_line.len - 1];
+            return raw_line;
+        }
+        return null;
+    }
+
+    fn nextArray(self: *KeyIter) ?[]const u8 {
+        while (self.pos < self.body.len) {
+            while (self.pos < self.body.len and
+                (self.body[self.pos] == ' ' or self.body[self.pos] == '\t' or
+                self.body[self.pos] == '\r' or self.body[self.pos] == '\n' or
+                self.body[self.pos] == ',')) : (self.pos += 1) {}
+            if (self.pos >= self.body.len or self.body[self.pos] == ']') return null;
+
+            if (self.body[self.pos] == '"') {
+                const start = self.pos + 1;
+                var i = start;
+                while (i < self.body.len) : (i += 1) {
+                    if (self.body[i] == '\\' and i + 1 < self.body.len) {
+                        i += 1;
+                        continue;
+                    }
+                    if (self.body[i] == '"') {
+                        self.pos = i + 1;
+                        return self.body[start..i];
+                    }
+                }
+                self.pos = self.body.len;
+                return null;
+            }
+
+            const start = self.pos;
+            while (self.pos < self.body.len and self.body[self.pos] != ',' and self.body[self.pos] != ']') : (self.pos += 1) {}
+            const raw_key = std.mem.trim(u8, self.body[start..self.pos], " \t\r\n");
+            if (raw_key.len == 0) continue;
+            return raw_key;
+        }
+        return null;
+    }
+};
+
+fn jsonStr(json: []const u8, key: []const u8) ?[]const u8 {
+    var kbuf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&kbuf, "\"{s}\":", .{key}) catch return null;
+    const pos = std.mem.indexOf(u8, json, needle) orelse return null;
+    var start = pos + needle.len;
+    while (start < json.len and (json[start] == ' ' or json[start] == '\t')) start += 1;
+    if (start >= json.len or json[start] != '"') return null;
+    start += 1;
+    const end = std.mem.indexOfScalarPos(u8, json, start, '"') orelse return null;
+    return json[start..end];
+}
+
+fn jsonValue(json: []const u8, key: []const u8) ?[]const u8 {
+    var kbuf: [64]u8 = undefined;
+    const needle = std.fmt.bufPrint(&kbuf, "\"{s}\":", .{key}) catch return null;
+    const pos = std.mem.indexOf(u8, json, needle) orelse return null;
+    var start = pos + needle.len;
+    while (start < json.len and (json[start] == ' ' or json[start] == '\t')) start += 1;
+    if (start >= json.len) return null;
+
+    const ch = json[start];
+    if (ch == '"') {
+        var i = start + 1;
+        while (i < json.len) : (i += 1) {
+            if (json[i] == '\\' and i + 1 < json.len) {
+                i += 1;
+                continue;
+            }
+            if (json[i] == '"') return json[start .. i + 1];
+        }
+        return null;
+    } else if (ch == '{' or ch == '[') {
+        const close: u8 = if (ch == '{') '}' else ']';
+        var depth: u32 = 1;
+        var i = start + 1;
+        var in_str = false;
+        while (i < json.len and depth > 0) : (i += 1) {
+            if (json[i] == '\\' and in_str) {
+                i += 1;
+                continue;
+            }
+            if (json[i] == '"') {
+                in_str = !in_str;
+                continue;
+            }
+            if (in_str) continue;
+            if (json[i] == ch) depth += 1;
+            if (json[i] == close) {
+                depth -= 1;
+                if (depth == 0) return json[start .. i + 1];
+            }
+        }
+        return null;
+    } else {
+        var end = start;
+        while (end < json.len and json[end] != ',' and json[end] != '}' and json[end] != '\n' and json[end] != '\r') : (end += 1) {}
+        return std.mem.trim(u8, json[start..end], " \t");
+    }
 }
 
 // ── Search (trigram-indexed) ─────────────────────────────────────────────────

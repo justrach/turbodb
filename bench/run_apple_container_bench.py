@@ -152,8 +152,12 @@ def logs_tail(name: str, lines: int = 120) -> str:
     return (proc.stdout or "").strip()
 
 
-def build_turbodb(target: str) -> None:
-    run(["zig", "build", f"-Dtarget={target}"])
+def build_turbodb(target: str, prefix: str | None = None) -> None:
+    argv = ["zig", "build"]
+    if prefix:
+        argv.extend(["--prefix", prefix])
+    argv.append(f"-Dtarget={target}")
+    run(argv)
 
 
 @dataclass
@@ -188,6 +192,9 @@ class BenchRun:
 
         if not self.args.skip_turbodb:
             build_turbodb(self.args.turbodb_target)
+        if not self.args.skip_turbodb_ffi:
+            build_turbodb(self.args.turbodb_ffi_target, self.args.turbodb_ffi_prefix)
+        if not self.args.skip_turbodb:
             services["turbodb"] = self.start_turbodb()
         if not self.args.skip_postgres:
             services["postgres"] = self.start_postgres()
@@ -325,6 +332,11 @@ class BenchRun:
 
         if (svc := services.get("turbodb")) and not svc.error:
             args.extend(["--turbodb-host", svc.host])
+        if not self.args.skip_turbodb_ffi:
+            args.extend([
+                "--turbodb-ffi-lib", self.args.turbodb_ffi_lib,
+                "--turbodb-ffi-dir", self.args.turbodb_ffi_dir,
+            ])
         if (svc := services.get("postgres")) and not svc.error:
             deps.append("psycopg[binary]")
             args.extend(["--postgres-host", svc.host])
@@ -336,7 +348,8 @@ class BenchRun:
             deps.append("tigerbeetle")
             args.extend(["--tigerbeetle-host", svc.host])
 
-        if not any(services.get(engine) and not services[engine].error for engine in services):
+        has_service_engine = any(services.get(engine) and not services[engine].error for engine in services)
+        if not has_service_engine and self.args.skip_turbodb_ffi:
             raise RuntimeError("no benchmark services started successfully")
 
         client_name = self.name("client")
@@ -378,12 +391,17 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--run-id")
     ap.add_argument("--network")
     ap.add_argument("--turbodb-target", default="aarch64-linux-musl")
+    ap.add_argument("--turbodb-ffi-target", default="aarch64-linux-gnu")
+    ap.add_argument("--turbodb-ffi-prefix", default="zig-out-ffi")
+    ap.add_argument("--turbodb-ffi-lib", default="/work/zig-out-ffi/lib/libturbodb.so")
+    ap.add_argument("--turbodb-ffi-dir", default="/tmp/turbodb_ffi_shape_bench")
     ap.add_argument("--python-image", default="python:3.12-slim")
     ap.add_argument("--postgres-image", default="postgres:18")
     ap.add_argument("--mysql-image", default="mysql:8.4")
     ap.add_argument("--tigerbeetle-image", default="ghcr.io/tigerbeetle/tigerbeetle:latest")
     ap.add_argument("--tigerbeetle-memory", default="2G")
     ap.add_argument("--skip-turbodb", action="store_true")
+    ap.add_argument("--skip-turbodb-ffi", action="store_true")
     ap.add_argument("--skip-postgres", action="store_true")
     ap.add_argument("--skip-mysql", action="store_true")
     ap.add_argument("--skip-tigerbeetle", action="store_true")

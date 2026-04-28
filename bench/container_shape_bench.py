@@ -8,10 +8,13 @@ run_apple_container_bench.py. It connects only to private container IPs.
 from __future__ import annotations
 
 import argparse
+import ctypes
 import http.client
 import json
 import math
+import os
 import random
+import shutil
 import sys
 import time
 from dataclasses import dataclass
@@ -234,6 +237,203 @@ class TurboDBBench:
 
     def delete_orders(self, samples: list[int]) -> dict[str, Any]:
         return timed_loop(samples, lambda oid: self.request("DELETE", f"/db/bench_orders/{oid}"))
+
+
+class TurboDocResult(ctypes.Structure):
+    _fields_ = [
+        ("key_ptr", ctypes.c_void_p),
+        ("key_len", ctypes.c_size_t),
+        ("val_ptr", ctypes.c_void_p),
+        ("val_len", ctypes.c_size_t),
+        ("doc_id", ctypes.c_uint64),
+        ("version", ctypes.c_uint8),
+        ("_pad", ctypes.c_uint8 * 7),
+    ]
+
+
+class TurboDBFFIBench:
+    name = "turbodb_ffi"
+
+    def __init__(self, lib_path: str, data_dir: str, shape: Shape, batch_size: int):
+        self.shape = shape
+        self.batch_size = batch_size
+        self.data_dir = data_dir
+        shutil.rmtree(data_dir, ignore_errors=True)
+        os.makedirs(data_dir, exist_ok=True)
+
+        self.lib = ctypes.CDLL(lib_path)
+        self._bind()
+        data_dir_b = data_dir.encode()
+        self.db = self.lib.turbodb_open(data_dir_b, len(data_dir_b))
+        if not self.db:
+            raise RuntimeError(f"failed to open TurboDB FFI database at {data_dir}")
+        self.collections: dict[str, ctypes.c_void_p] = {}
+
+    def _bind(self) -> None:
+        lib = self.lib
+        lib.turbodb_open.argtypes = [ctypes.c_char_p, ctypes.c_size_t]
+        lib.turbodb_open.restype = ctypes.c_void_p
+        lib.turbodb_close.argtypes = [ctypes.c_void_p]
+        lib.turbodb_close.restype = None
+        lib.turbodb_collection.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+        lib.turbodb_collection.restype = ctypes.c_void_p
+        lib.turbodb_drop_collection.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+        lib.turbodb_drop_collection.restype = None
+        lib.turbodb_insert.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+            ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_uint64),
+        ]
+        lib.turbodb_insert.restype = ctypes.c_int
+        lib.turbodb_insert_bulk_ndjson.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32),
+        ]
+        lib.turbodb_insert_bulk_ndjson.restype = ctypes.c_int
+        lib.turbodb_get.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.POINTER(TurboDocResult)]
+        lib.turbodb_get.restype = ctypes.c_int
+        lib.turbodb_get_many_keys.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_size_t),
+        ]
+        lib.turbodb_get_many_keys.restype = ctypes.c_int
+        lib.turbodb_update.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t]
+        lib.turbodb_update.restype = ctypes.c_int
+        lib.turbodb_delete.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
+        lib.turbodb_delete.restype = ctypes.c_int
+
+    def close(self) -> None:
+        if getattr(self, "db", None):
+            self.lib.turbodb_close(self.db)
+            self.db = None
+
+    def wait(self) -> None:
+        pass
+
+    def collection(self, name: str) -> ctypes.c_void_p:
+        if name in self.collections:
+            return self.collections[name]
+        name_b = name.encode()
+        handle = self.lib.turbodb_collection(self.db, name_b, len(name_b))
+        if not handle:
+            raise RuntimeError(f"failed to open FFI collection {name}")
+        self.collections[name] = handle
+        return handle
+
+    def drop(self) -> None:
+        self.collections.clear()
+        for col in ("bench_users", "bench_orders", "bench_user_orders"):
+            col_b = col.encode()
+            self.lib.turbodb_drop_collection(self.db, col_b, len(col_b))
+
+    def bulk(self, collection: str, rows: list[tuple[str, dict[str, Any]]]) -> tuple[int, int]:
+        lines = []
+        for key, value in rows:
+            lines.append(json.dumps({"key": key, "value": value}, separators=(",", ":")))
+        body = ("\n".join(lines) + "\n").encode()
+        inserted = ctypes.c_uint32(0)
+        errors = ctypes.c_uint32(0)
+        rc = self.lib.turbodb_insert_bulk_ndjson(
+            self.collection(collection), body, len(body), ctypes.byref(inserted), ctypes.byref(errors)
+        )
+        if rc != 0:
+            raise RuntimeError(f"FFI bulk insert failed for {collection}")
+        return int(inserted.value), int(errors.value)
+
+    def ingest(self) -> dict[str, Any]:
+        self.drop()
+
+        def run() -> None:
+            rows: list[tuple[str, dict[str, Any]]] = []
+            for uid in self.shape.user_ids():
+                rows.append((str(uid), user_doc(uid)))
+                if len(rows) >= self.batch_size:
+                    self.bulk("bench_users", rows)
+                    rows.clear()
+            if rows:
+                self.bulk("bench_users", rows)
+
+            rows.clear()
+            for uid in self.shape.user_ids():
+                for oid in self.shape.order_ids_for_user(uid):
+                    rows.append((str(oid), order_doc(oid, uid)))
+                    if len(rows) >= self.batch_size:
+                        self.bulk("bench_orders", rows)
+                        rows.clear()
+            if rows:
+                self.bulk("bench_orders", rows)
+
+            rows.clear()
+            for uid in self.shape.user_ids():
+                rows.append((str(uid), {"user_id": uid, "order_ids": self.shape.order_ids_for_user(uid)}))
+                if len(rows) >= self.batch_size:
+                    self.bulk("bench_user_orders", rows)
+                    rows.clear()
+            if rows:
+                self.bulk("bench_user_orders", rows)
+
+        logical = self.shape.users + self.shape.orders
+        physical = logical + self.shape.users
+        return timed(run, logical, {"physical_writes": physical, "mode": "embedded_c_abi"})
+
+    def get_key(self, collection: str, key: int) -> TurboDocResult:
+        key_b = str(key).encode()
+        out = TurboDocResult()
+        rc = self.lib.turbodb_get(self.collection(collection), key_b, len(key_b), ctypes.byref(out))
+        if rc != 0:
+            raise RuntimeError(f"FFI get failed for {collection}/{key}")
+        return out
+
+    def batch_get_keys(self, collection: str, keys: list[int]) -> tuple[int, int, int]:
+        body = ("\n".join(str(key) for key in keys) + "\n").encode()
+        found = ctypes.c_uint32(0)
+        missing = ctypes.c_uint32(0)
+        bytes_read = ctypes.c_size_t(0)
+        rc = self.lib.turbodb_get_many_keys(
+            self.collection(collection), body, len(body),
+            ctypes.byref(found), ctypes.byref(missing), ctypes.byref(bytes_read),
+        )
+        if rc != 0:
+            raise RuntimeError(f"FFI batch get failed for {collection}")
+        return int(found.value), int(missing.value), int(bytes_read.value)
+
+    def point_get(self, samples: list[int]) -> dict[str, Any]:
+        return timed_loop(samples, lambda uid: self.get_key("bench_users", uid), {"mode": "embedded_c_abi"})
+
+    def order_lookup(self, samples: list[int]) -> dict[str, Any]:
+        def op(uid: int) -> None:
+            self.get_key("bench_user_orders", uid)
+            self.batch_get_keys("bench_orders", self.shape.order_ids_for_user(uid))
+
+        return timed_loop(samples, op, {"orders_per_lookup": self.shape.orders_per_user, "mode": "embedded_c_abi_batch_get"})
+
+    def join_like(self, samples: list[int]) -> dict[str, Any]:
+        def op(uid: int) -> None:
+            self.get_key("bench_users", uid)
+            self.get_key("bench_user_orders", uid)
+            self.batch_get_keys("bench_orders", self.shape.order_ids_for_user(uid))
+
+        return timed_loop(samples, op, {"mode": "embedded_c_abi_materialized_edge_batch_get"})
+
+    def update_orders(self, samples: list[int]) -> dict[str, Any]:
+        def op(oid: int) -> None:
+            key_b = str(oid).encode()
+            value = order_doc(oid, ((oid - 1) // self.shape.orders_per_user) + 1)
+            value["status"] = "updated"
+            value_b = json.dumps(value, separators=(",", ":")).encode()
+            rc = self.lib.turbodb_update(self.collection("bench_orders"), key_b, len(key_b), value_b, len(value_b))
+            if rc != 0:
+                raise RuntimeError(f"FFI update failed for order {oid}")
+
+        return timed_loop(samples, op, {"mode": "embedded_c_abi"})
+
+    def delete_orders(self, samples: list[int]) -> dict[str, Any]:
+        def op(oid: int) -> None:
+            key_b = str(oid).encode()
+            rc = self.lib.turbodb_delete(self.collection("bench_orders"), key_b, len(key_b))
+            if rc != 0:
+                raise RuntimeError(f"FFI delete failed for order {oid}")
+
+        return timed_loop(samples, op, {"mode": "embedded_c_abi"})
 
 
 class PostgresBench:
@@ -583,6 +783,8 @@ def main() -> int:
     ap.add_argument("--output", default="/work/benchmark-results/container-shape-bench.json")
     ap.add_argument("--turbodb-host")
     ap.add_argument("--turbodb-port", type=int, default=27017)
+    ap.add_argument("--turbodb-ffi-lib")
+    ap.add_argument("--turbodb-ffi-dir", default="/tmp/turbodb_ffi_shape_bench")
     ap.add_argument("--postgres-host")
     ap.add_argument("--mysql-host")
     ap.add_argument("--tigerbeetle-host")
@@ -610,6 +812,8 @@ def main() -> int:
     engines: list[Any] = []
     if args.turbodb_host:
         engines.append(TurboDBBench(args.turbodb_host, args.turbodb_port, shape, args.batch_size))
+    if args.turbodb_ffi_lib:
+        engines.append(TurboDBFFIBench(args.turbodb_ffi_lib, args.turbodb_ffi_dir, shape, args.batch_size))
     if args.postgres_host:
         engines.append(PostgresBench(args.postgres_host, shape, args.batch_size))
     if args.mysql_host:
@@ -624,6 +828,10 @@ def main() -> int:
         except Exception as exc:
             results["errors"][engine.name] = repr(exc)
             print(f"{engine.name} failed: {exc}", file=sys.stderr)
+        finally:
+            close = getattr(engine, "close", None)
+            if callable(close):
+                close()
 
     print_summary(results)
 

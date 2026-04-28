@@ -1,7 +1,8 @@
 # Apple Container Benchmark Matrix
 
 This harness compares TurboDB against PostgreSQL 18, MySQL, and optionally
-TigerBeetle using the same generated application shape.
+TigerBeetle using the same generated application shape. TurboDB is measured two
+ways: over HTTP and through the embedded C ABI/FFI bridge.
 
 It must be run through Apple `container`. The runner creates a private container
 network, starts each database in a container, runs the Python benchmark client in
@@ -15,6 +16,9 @@ another container, and does not publish database ports to macOS.
   `bench_user_orders` edge collection. The benchmark client uses persistent
   HTTP plus `POST /db/:col/batch_get` for relationship fetches, so it does not
   inflate TurboDB latency with one TCP/HTTP setup per document.
+- `turbodb_ffi` loads `/work/zig-out-ffi/lib/libturbodb.so` with Python `ctypes`.
+  This is an embedded/raw-engine path, not a network database path, and exists
+  to show the cost of HTTP/client transport separately from storage operations.
 - PostgreSQL 18 and MySQL use normalized `users` and `orders` tables with a
   secondary index on `orders.user_id`.
 - TigerBeetle uses accounts and transfers, so relationship lookups are modeled
@@ -55,6 +59,10 @@ python3 bench/run_apple_container_bench.py \
 Useful flags:
 
 - `--skip-turbodb`, `--skip-postgres`, `--skip-mysql`, `--skip-tigerbeetle`
+- `--skip-turbodb-ffi`
+- `--turbodb-ffi-target aarch64-linux-gnu`
+- `--turbodb-ffi-prefix zig-out-ffi`
+- `--turbodb-ffi-lib /work/zig-out-ffi/lib/libturbodb.so`
 - `--mysql-image mysql:8.4`
 - `--postgres-image postgres:18`
 - `--tigerbeetle-image ghcr.io/tigerbeetle/tigerbeetle:latest`
