@@ -8,12 +8,12 @@ run_apple_container_bench.py. It connects only to private container IPs.
 from __future__ import annotations
 
 import argparse
+import http.client
 import json
 import math
 import random
 import sys
 import time
-import urllib.request
 from dataclasses import dataclass
 from typing import Any, Callable
 
@@ -114,19 +114,30 @@ class TurboDBBench:
     name = "turbodb"
 
     def __init__(self, host: str, port: int, shape: Shape, batch_size: int):
-        self.base = f"http://{host}:{port}"
+        self.host = host
+        self.port = port
         self.shape = shape
         self.batch_size = batch_size
+        self.conn = http.client.HTTPConnection(host, port, timeout=10)
 
     def request(self, method: str, path: str, body: bytes | None = None) -> bytes:
-        req = urllib.request.Request(
-            self.base + path,
-            data=body,
-            method=method,
-            headers={"content-type": "application/json"},
-        )
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            return resp.read()
+        headers = {"content-type": "application/json"}
+        try:
+            self.conn.request(method, path, body=body, headers=headers)
+            resp = self.conn.getresponse()
+            data = resp.read()
+            if resp.status >= 400:
+                raise RuntimeError(f"{method} {path} failed: {resp.status} {data[:200]!r}")
+            return data
+        except (http.client.HTTPException, OSError):
+            self.conn.close()
+            self.conn = http.client.HTTPConnection(self.host, self.port, timeout=10)
+            self.conn.request(method, path, body=body, headers=headers)
+            resp = self.conn.getresponse()
+            data = resp.read()
+            if resp.status >= 400:
+                raise RuntimeError(f"{method} {path} failed: {resp.status} {data[:200]!r}")
+            return data
 
     def wait(self) -> None:
         deadline = time.time() + 30
@@ -190,25 +201,28 @@ class TurboDBBench:
     def get_doc(self, collection: str, key: int) -> dict[str, Any]:
         return json.loads(self.request("GET", f"/db/{collection}/{key}").decode())
 
+    def batch_get_docs(self, collection: str, keys: list[int]) -> list[dict[str, Any]]:
+        body = json.dumps({"keys": [str(key) for key in keys]}, separators=(",", ":")).encode()
+        return json.loads(self.request("POST", f"/db/{collection}/batch_get", body).decode())["docs"]
+
     def point_get(self, samples: list[int]) -> dict[str, Any]:
         return timed_loop(samples, lambda uid: self.get_doc("bench_users", uid))
 
     def order_lookup(self, samples: list[int]) -> dict[str, Any]:
         def op(uid: int) -> None:
             edge = self.get_doc("bench_user_orders", uid)["value"]
-            for oid in edge["order_ids"]:
-                self.get_doc("bench_orders", oid)
+            self.batch_get_docs("bench_orders", edge["order_ids"])
 
-        return timed_loop(samples, op, {"orders_per_lookup": self.shape.orders_per_user})
+        return timed_loop(samples, op, {"orders_per_lookup": self.shape.orders_per_user, "mode": "materialized_edge_batch_get"})
 
     def join_like(self, samples: list[int]) -> dict[str, Any]:
         def op(uid: int) -> None:
             user = self.get_doc("bench_users", uid)["value"]
             edge = self.get_doc("bench_user_orders", uid)["value"]
-            orders = [self.get_doc("bench_orders", oid)["value"] for oid in edge["order_ids"]]
+            orders = self.batch_get_docs("bench_orders", edge["order_ids"])
             _ = (user["email"], len(orders))
 
-        return timed_loop(samples, op, {"mode": "materialized_edge_point_gets"})
+        return timed_loop(samples, op, {"mode": "materialized_edge_batch_get"})
 
     def update_orders(self, samples: list[int]) -> dict[str, Any]:
         def op(oid: int) -> None:

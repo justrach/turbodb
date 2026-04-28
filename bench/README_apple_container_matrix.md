@@ -12,7 +12,9 @@ another container, and does not publish database ports to macOS.
 - `users`: keyed user records with an email and JSON profile.
 - `orders`: keyed order records with `user_id`, amount, status, and JSON payload.
 - TurboDB stores `bench_users`, `bench_orders`, and a materialized
-  `bench_user_orders` edge collection.
+  `bench_user_orders` edge collection. The benchmark client uses persistent
+  HTTP plus `POST /db/:col/batch_get` for relationship fetches, so it does not
+  inflate TurboDB latency with one TCP/HTTP setup per document.
 - PostgreSQL 18 and MySQL use normalized `users` and `orders` tables with a
   secondary index on `orders.user_id`.
 - TigerBeetle uses accounts and transfers, so relationship lookups are modeled

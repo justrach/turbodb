@@ -1,6 +1,7 @@
 /// TurboDB HTTP server — MongoDB-compatible-ish JSON REST API
 /// Routes:
 ///   POST   /db/:col              insert document
+///   POST   /db/:col/batch_get    get multiple documents by key
 ///   GET    /db/:col/:key         get document by key
 ///   PUT    /db/:col/:key         upsert document
 ///   DELETE /db/:col/:key         delete document
@@ -446,15 +447,17 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
 
     // Routes under /db/:col
     if (std.mem.startsWith(u8, path, "/db/")) {
-        if (isBasicDbWriteMethod(method) and !canWriteDb(auth_ctx_ptr))
-            return err(403, "forbidden: API key is read-only");
-
         const rest = path[4..];
         // /db/:col/:key
         if (std.mem.indexOfScalar(u8, rest, '/')) |sep| {
             const col_name = rest[0..sep];
             const key = rest[sep + 1 ..];
             const tenant_id = requestTenant(raw, query, auth_ctx_ptr);
+            // POST /db/:col/batch_get — read-only bulk point lookup.
+            if (std.mem.eql(u8, key, "batch_get") and std.mem.eql(u8, method, "POST"))
+                return handleBatchGet(srv, tenant_id, col_name, body, requestAsOf(raw, query));
+            if (isBasicDbWriteMethod(method) and !canWriteDb(auth_ctx_ptr))
+                return err(403, "forbidden: API key is read-only");
             // POST /db/:col/bulk — bulk insert
             if (std.mem.eql(u8, key, "bulk") and std.mem.eql(u8, method, "POST"))
                 return handleBulkInsert(srv, tenant_id, col_name, body, alloc);
@@ -464,6 +467,8 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
         } else {
             const col_name = rest;
             const tenant_id = requestTenant(raw, query, auth_ctx_ptr);
+            if (isBasicDbWriteMethod(method) and !canWriteDb(auth_ctx_ptr))
+                return err(403, "forbidden: API key is read-only");
             if (std.mem.eql(u8, method, "POST"))   return handleInsert(srv, tenant_id, col_name, body, alloc);
             if (std.mem.eql(u8, method, "GET"))    return handleScan(srv, tenant_id, col_name, query, requestAsOf(raw, query), alloc);
             if (std.mem.eql(u8, method, "DELETE")) return handleDrop(srv, tenant_id, col_name);
@@ -551,6 +556,69 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
         .{ inserted, errors, col_name, tenant_id }) catch {};
     return ok(getBodyBuf()[0..fbs.pos]);
 }
+
+/// POST /db/:col/batch_get — read multiple documents in one request.
+/// Body can be a JSON string array, {"keys":[...]}, or one key per line.
+fn handleBatchGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8, as_of: ?i64) usize {
+    const start_ns = compat.nanoTimestamp();
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+
+    const HEADER_RESERVE = 256;
+    var resp = getRespBuf();
+    var fbs = compat.fixedBufferStream(resp[HEADER_RESERVE..]);
+    const w = fbs.writer();
+    compat.format(w, "{{\"tenant\":\"{s}\",\"collection\":\"{s}\",\"docs\":[",
+        .{ tenant_id, col_name }) catch return err(500, "response too large");
+
+    var iter = KeyIter.init(body);
+    var found: usize = 0;
+    var missing: usize = 0;
+    var bytes_read: usize = 0;
+    var truncated = false;
+    while (iter.next()) |key| {
+        if (key.len == 0) continue;
+        const d = if (as_of) |ts_ms|
+            (col.getAsOfTimestamp(key, ts_ms) orelse {
+                missing += 1;
+                continue;
+            })
+        else
+            (col.get(key) orelse {
+                missing += 1;
+                continue;
+            });
+
+        const val = if (d.value.len > 0) d.value else "{}";
+        const is_json = isJsonValue(val);
+        const next_len = (if (found > 0) @as(usize, 1) else 0) + docJsonLen(d, val, is_json);
+        if (fbs.pos + next_len + 80 >= resp[HEADER_RESERVE..].len) {
+            truncated = true;
+            break;
+        }
+        if (found > 0) w.writeByte(',') catch return err(500, "response too large");
+        writeDocJson(w, d, val, is_json) catch return err(500, "response too large");
+        found += 1;
+        bytes_read += d.key.len + d.value.len;
+    }
+
+    compat.format(w, "],\"count\":{d},\"missing\":{d},\"truncated\":{}}}",
+        .{ found, missing, truncated }) catch return err(500, "response too large");
+    const body_len = fbs.pos;
+
+    srv.recordQueryCost(tenant_id, "batch_get", found + missing, bytes_read, start_ns);
+
+    var hdr_fbs = compat.fixedBufferStream(resp[0..HEADER_RESERVE]);
+    compat.format(hdr_fbs.writer(),
+        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: keep-alive\r\n\r\n",
+        .{body_len}) catch {};
+    const hdr_len = hdr_fbs.pos;
+    if (hdr_len < HEADER_RESERVE) {
+        std.mem.copyForwards(u8, resp[hdr_len .. hdr_len + body_len], resp[HEADER_RESERVE .. HEADER_RESERVE + body_len]);
+    }
+    return hdr_len + body_len;
+}
+
 fn handleGet(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []const u8, as_of: ?i64) usize {
         const start_ns = compat.nanoTimestamp();
         srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
@@ -1169,6 +1237,79 @@ fn extractContentLength(raw: []const u8) usize {
     return 0;
 }
 
+const KeyIter = struct {
+    body: []const u8,
+    pos: usize = 0,
+    array_mode: bool = false,
+
+    fn init(body: []const u8) KeyIter {
+        const trimmed = std.mem.trim(u8, body, " \t\r\n");
+        if (trimmed.len == 0) return .{ .body = trimmed };
+        if (trimmed[0] == '{') {
+            if (jsonValue(trimmed, "keys")) |keys| {
+                if (keys.len > 0 and keys[0] == '[') {
+                    return .{ .body = keys, .pos = 1, .array_mode = true };
+                }
+            }
+        }
+        if (trimmed[0] == '[') return .{ .body = trimmed, .pos = 1, .array_mode = true };
+        return .{ .body = trimmed };
+    }
+
+    fn next(self: *KeyIter) ?[]const u8 {
+        if (self.array_mode) return self.nextArray();
+        return self.nextLine();
+    }
+
+    fn nextLine(self: *KeyIter) ?[]const u8 {
+        while (self.pos < self.body.len) {
+            const line_end = std.mem.indexOfScalarPos(u8, self.body, self.pos, '\n') orelse self.body.len;
+            const raw_line = std.mem.trim(u8, self.body[self.pos..line_end], " \t\r");
+            self.pos = if (line_end < self.body.len) line_end + 1 else line_end;
+            if (raw_line.len == 0) continue;
+            if (raw_line[0] == '{') return jsonStr(raw_line, "key") orelse continue;
+            if (raw_line.len >= 2 and raw_line[0] == '"' and raw_line[raw_line.len - 1] == '"')
+                return raw_line[1 .. raw_line.len - 1];
+            return raw_line;
+        }
+        return null;
+    }
+
+    fn nextArray(self: *KeyIter) ?[]const u8 {
+        while (self.pos < self.body.len) {
+            while (self.pos < self.body.len and
+                (self.body[self.pos] == ' ' or self.body[self.pos] == '\t' or
+                self.body[self.pos] == '\r' or self.body[self.pos] == '\n' or
+                self.body[self.pos] == ',')) : (self.pos += 1) {}
+            if (self.pos >= self.body.len or self.body[self.pos] == ']') return null;
+
+            if (self.body[self.pos] == '"') {
+                const start = self.pos + 1;
+                var i = start;
+                while (i < self.body.len) : (i += 1) {
+                    if (self.body[i] == '\\' and i + 1 < self.body.len) {
+                        i += 1;
+                        continue;
+                    }
+                    if (self.body[i] == '"') {
+                        self.pos = i + 1;
+                        return self.body[start..i];
+                    }
+                }
+                self.pos = self.body.len;
+                return null;
+            }
+
+            const start = self.pos;
+            while (self.pos < self.body.len and self.body[self.pos] != ',' and self.body[self.pos] != ']') : (self.pos += 1) {}
+            const raw_key = std.mem.trim(u8, self.body[start..self.pos], " \t\r\n");
+            if (raw_key.len == 0) continue;
+            return raw_key;
+        }
+        return null;
+    }
+};
+
 fn jsonStr(json: []const u8, key: []const u8) ?[]const u8 {
     var kbuf: [64]u8 = undefined;
     const needle = std.fmt.bufPrint(&kbuf, "\"{s}\":", .{key}) catch return null;
@@ -1575,4 +1716,18 @@ test "read-only auth cannot write basic db methods" {
 
     ctx.perm = .read_write;
     try std.testing.expect(canWriteDb(&ctx));
+}
+
+test "KeyIter reads JSON arrays and keyed newline bodies" {
+    var array_iter = KeyIter.init("{\"keys\":[\"1\",\"2\",\"3\"]}");
+    try std.testing.expectEqualStrings("1", array_iter.next().?);
+    try std.testing.expectEqualStrings("2", array_iter.next().?);
+    try std.testing.expectEqualStrings("3", array_iter.next().?);
+    try std.testing.expect(array_iter.next() == null);
+
+    var line_iter = KeyIter.init("{\"key\":\"a\"}\nplain\n\"quoted\"\n");
+    try std.testing.expectEqualStrings("a", line_iter.next().?);
+    try std.testing.expectEqualStrings("plain", line_iter.next().?);
+    try std.testing.expectEqualStrings("quoted", line_iter.next().?);
+    try std.testing.expect(line_iter.next() == null);
 }
