@@ -124,6 +124,14 @@ pub const File = struct {
         if (c.fsync(self.handle) != 0) return error.SyncError;
     }
 
+    pub fn syncData(self: File) !void {
+        if (comptime builtin.os.tag == .linux) {
+            if (c.fdatasync(self.handle) != 0) return error.SyncError;
+        } else {
+            try self.sync();
+        }
+    }
+
     pub fn pread(self: File, buf: []u8, offset: u64) !usize {
         const n = c.pread(self.handle, buf.ptr, buf.len, @intCast(offset));
         if (n < 0) return error.ReadError;
@@ -157,6 +165,13 @@ pub fn initLinuxUring(entries: u16) ?LinuxUring {
 fn ioUringDisabledByEnv() bool {
     const value = getenv("TURBODB_DISABLE_IO_URING") orelse return false;
     return value[0] != 0 and value[0] != '0';
+}
+
+pub fn envUsize(comptime name: [:0]const u8, default_value: usize) usize {
+    const value_ptr = getenv(name.ptr) orelse return default_value;
+    const value = std.mem.sliceTo(value_ptr, 0);
+    if (value.len == 0) return default_value;
+    return std.fmt.parseInt(usize, value, 10) catch default_value;
 }
 
 pub fn deinitLinuxUring(ring: *LinuxUring) void {
@@ -714,8 +729,6 @@ pub fn format(w: anytype, comptime fmt_str: []const u8, args: anytype) !void {
     const result = std.fmt.bufPrint(&tmp, fmt_str, args) catch return error.NoSpaceLeft;
     try w.writeAll(result);
 }
-
-
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // TCP Networking — drop-in for std.net (removed in 0.16)

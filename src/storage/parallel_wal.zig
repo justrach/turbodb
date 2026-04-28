@@ -131,9 +131,9 @@ pub const WALSegment = struct {
                 compat.deinitLinuxUring(ring);
                 self.uring = null;
             };
-            if (self.uring == null) try self.fd.sync();
+            if (self.uring == null) try self.fd.syncData();
         } else {
-            try self.fd.sync();
+            try self.fd.syncData();
         }
     }
 
@@ -184,6 +184,8 @@ pub const ParallelWAL = struct {
     dirty_lens: []usize,
 
     const MAX_URING_SEGMENTS: u32 = 256;
+    const URING_QUEUE_ENTRIES: u16 = 512;
+    const SYNC_USER_DATA_BASE: u64 = MAX_URING_SEGMENTS + 1;
 
     pub fn init(alloc: Allocator, data_dir: []const u8, n_segments: u32) !*ParallelWAL {
         const segs = try alloc.alloc(*WALSegment, n_segments);
@@ -219,7 +221,7 @@ pub const ParallelWAL = struct {
             .allocator = alloc,
             .flusher_thread = null,
             .running = std.atomic.Value(u8).init(0),
-            .uring = compat.initLinuxUring(MAX_URING_SEGMENTS),
+            .uring = compat.initLinuxUring(URING_QUEUE_ENTRIES),
             .dirty_ends = dirty_ends,
             .dirty_lens = dirty_lens,
         };
@@ -291,7 +293,7 @@ pub const ParallelWAL = struct {
         const ring = if (self.uring) |*r| r else return false;
 
         @memset(self.dirty_lens, 0);
-        var writes: u32 = 0;
+        var dirty_segments: u32 = 0;
         var i: u32 = 0;
         while (i < self.n_segments) : (i += 1) {
             const seg = self.segments[i];
@@ -301,24 +303,15 @@ pub const ParallelWAL = struct {
 
             const dirty = seg.buf[seg.flushed_pos..current];
             self.dirty_lens[i] = dirty.len;
-            _ = ring.write(@as(u64, i) + 1, seg.fd.handle, dirty, seg.flushed_pos) catch return self.disableUring();
-            writes += 1;
+            const write_sqe = ring.write(writeUserData(i), seg.fd.handle, dirty, seg.flushed_pos) catch return self.disableUring();
+            write_sqe.flags |= linux.IOSQE_IO_LINK;
+            _ = ring.fsync(syncUserData(i), seg.fd.handle, linux.IORING_FSYNC_DATASYNC) catch return self.disableUring();
+            dirty_segments += 1;
         }
 
-        if (writes == 0) return true;
-        _ = ring.submit_and_wait(writes) catch return self.disableUring();
-        if (!self.collectUringWrites(writes)) return self.disableUring();
-
-        var syncs: u32 = 0;
-        i = 0;
-        while (i < self.n_segments) : (i += 1) {
-            if (self.dirty_lens[i] == 0) continue;
-            _ = ring.fsync(@as(u64, i) + 1, self.segments[i].fd.handle, linux.IORING_FSYNC_DATASYNC) catch return self.disableUring();
-            syncs += 1;
-        }
-
-        _ = ring.submit_and_wait(syncs) catch return self.disableUring();
-        if (!self.collectUringSyncs(syncs)) return self.disableUring();
+        if (dirty_segments == 0) return true;
+        _ = ring.submit_and_wait(dirty_segments * 2) catch return self.disableUring();
+        if (!self.collectLinkedUringCompletions(dirty_segments * 2)) return self.disableUring();
 
         i = 0;
         while (i < self.n_segments) : (i += 1) {
@@ -328,33 +321,46 @@ pub const ParallelWAL = struct {
         return true;
     }
 
-    fn collectUringWrites(self: *ParallelWAL, expected: u32) bool {
+    fn collectLinkedUringCompletions(self: *ParallelWAL, expected: u32) bool {
         const ring = if (self.uring) |*r| r else return false;
         var completed: u32 = 0;
         while (completed < expected) : (completed += 1) {
             const cqe = ring.copy_cqe() catch return false;
-            const idx = self.cqeSegmentIndex(cqe.user_data) orelse return false;
-            if (cqe.res < 0) return false;
-            const n: usize = @intCast(cqe.res);
-            if (n != self.dirty_lens[idx]) return false;
+            if (isSyncUserData(cqe.user_data)) {
+                _ = self.cqeSyncSegmentIndex(cqe.user_data) orelse return false;
+                if (cqe.res < 0) return false;
+            } else {
+                const idx = self.cqeWriteSegmentIndex(cqe.user_data) orelse return false;
+                if (cqe.res < 0) return false;
+                const n: usize = @intCast(cqe.res);
+                if (n != self.dirty_lens[idx]) return false;
+            }
         }
         return true;
     }
 
-    fn collectUringSyncs(self: *ParallelWAL, expected: u32) bool {
-        const ring = if (self.uring) |*r| r else return false;
-        var completed: u32 = 0;
-        while (completed < expected) : (completed += 1) {
-            const cqe = ring.copy_cqe() catch return false;
-            _ = self.cqeSegmentIndex(cqe.user_data) orelse return false;
-            if (cqe.res < 0) return false;
-        }
-        return true;
+    fn writeUserData(segment_index: u32) u64 {
+        return @as(u64, segment_index) + 1;
     }
 
-    fn cqeSegmentIndex(self: *const ParallelWAL, user_data: u64) ?usize {
-        if (user_data == 0) return null;
+    fn syncUserData(segment_index: u32) u64 {
+        return SYNC_USER_DATA_BASE + @as(u64, segment_index);
+    }
+
+    fn isSyncUserData(user_data: u64) bool {
+        return user_data >= SYNC_USER_DATA_BASE;
+    }
+
+    fn cqeWriteSegmentIndex(self: *const ParallelWAL, user_data: u64) ?usize {
+        if (user_data == 0 or isSyncUserData(user_data)) return null;
         const idx: usize = @intCast(user_data - 1);
+        if (idx >= self.n_segments) return null;
+        return idx;
+    }
+
+    fn cqeSyncSegmentIndex(self: *const ParallelWAL, user_data: u64) ?usize {
+        if (!isSyncUserData(user_data)) return null;
+        const idx: usize = @intCast(user_data - SYNC_USER_DATA_BASE);
         if (idx >= self.n_segments) return null;
         return idx;
     }

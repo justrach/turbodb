@@ -115,6 +115,7 @@ pub const WAL = struct {
     append_offset: u64,
     uring_flushes: usize,
     sync_flushes: usize,
+    uring_min_write_and_sync: usize,
     allocator: std.mem.Allocator,
 
     // Group commit state — guarded by mu
@@ -130,7 +131,7 @@ pub const WAL = struct {
 
     /// Backpressure: block writers if pending buffer exceeds this.
     const MAX_WRITE_BUF: usize = 8 * 1024 * 1024; // 8 MiB
-    const URING_MIN_WRITE_AND_SYNC: usize = 8 * 1024 * 1024;
+    const DEFAULT_URING_MIN_WRITE_AND_SYNC: usize = 32 * 1024;
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
 
@@ -150,6 +151,7 @@ pub const WAL = struct {
             .append_offset = if (end >= 0) @intCast(end) else 0,
             .uring_flushes = 0,
             .sync_flushes = 0,
+            .uring_min_write_and_sync = compat.envUsize("TURBODB_IO_URING_MIN_BYTES", DEFAULT_URING_MIN_WRITE_AND_SYNC),
             .allocator = allocator,
             .mu = .{},
             .cond = .{},
@@ -475,7 +477,7 @@ pub const WAL = struct {
     }
 
     fn writeAndSync(self: *WAL, bytes: []const u8) ?anyerror {
-        if (bytes.len >= URING_MIN_WRITE_AND_SYNC) {
+        if (bytes.len >= self.uring_min_write_and_sync) {
             if (self.uring) |*ring| {
                 compat.uringWriteAndSyncAt(ring, self.file, bytes, self.append_offset) catch {
                     compat.deinitLinuxUring(ring);
@@ -490,7 +492,7 @@ pub const WAL = struct {
         }
 
         self.file.pwriteAll(bytes, self.append_offset) catch |e| return e;
-        self.file.sync() catch |e| return e;
+        self.file.syncData() catch |e| return e;
         self.append_offset += bytes.len;
         self.sync_flushes += 1;
         return null;
