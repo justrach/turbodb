@@ -14,3 +14,5 @@ preprocessed_configs/
 optimizations/
 MCP/
 architecutre/
+LOCAL_README.md
+benchmark-results/
