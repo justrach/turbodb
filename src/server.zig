@@ -27,6 +27,13 @@ const MAX_REQ = 65536; // 64 KiB (initial read)
 const MAX_RESP = 131072; // 128 KiB
 const MAX_BODY = 65536; // 64 KiB
 const MAX_BULK = 16 * 1024 * 1024; // 16 MiB for bulk inserts
+const BULK_INSERT_CHUNK_ROWS: usize = 4096;
+const BULK_INSERT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const DEFAULT_BULK_MEMORY_LIMIT: usize = 256 * 1024 * 1024;
+const MAX_AUTO_BULK_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
+const BULK_MEMORY_AVAILABLE_FRACTION: usize = 4;
+const BULK_TENANT_MEMORY_FRACTION: usize = 2;
+const BULK_MEMORY_BASE_OVERHEAD: usize = 1024 * 1024;
 
 // Heap-allocated per-connection buffers (threadlocal pointers set in handleConn).
 // This avoids large threadlocal TLS segments that break in Release mode on macOS.
@@ -58,6 +65,25 @@ pub const Server = struct {
         cost_nanos_usd: u64,
     };
 
+    const BulkTenantUsage = struct {
+        bytes: usize = 0,
+        requests: u32 = 0,
+    };
+
+    pub const BulkMemoryReservation = struct {
+        srv: *Server,
+        tenant_id: [collection.MAX_TENANT_ID_LEN]u8,
+        tenant_id_len: u8,
+        bytes: usize,
+        active: bool = true,
+
+        pub fn release(self: *BulkMemoryReservation) void {
+            if (!self.active) return;
+            self.srv.releaseBulkMemory(self.tenant_id[0..self.tenant_id_len], self.bytes);
+            self.active = false;
+        }
+    };
+
     const MAX_CONNECTIONS: u32 = 512;
     const BILLING_LOG_CAP: usize = 1024;
 
@@ -82,6 +108,11 @@ pub const Server = struct {
     activity: activity.ActivityTracker,
     // Connection limiter — prevents unbounded thread spawning under flood.
     active_conns: std.atomic.Value(u32),
+    bulk_mu: compat.Mutex,
+    bulk_tenant_usage: std.StringHashMap(BulkTenantUsage),
+    bulk_inflight_bytes: usize,
+    bulk_inflight_requests: u32,
+    bulk_rejected: std.atomic.Value(u64),
 
     pub fn init(alloc: std.mem.Allocator, db: *Database, port: u16) Server {
         return .{
@@ -102,7 +133,103 @@ pub const Server = struct {
             .billing_mu = .{},
             .activity = activity.ActivityTracker.init(),
             .active_conns = std.atomic.Value(u32).init(0),
+            .bulk_mu = .{},
+            .bulk_tenant_usage = std.StringHashMap(BulkTenantUsage).init(alloc),
+            .bulk_inflight_bytes = 0,
+            .bulk_inflight_requests = 0,
+            .bulk_rejected = std.atomic.Value(u64).init(0),
         };
+    }
+
+    pub fn deinit(self: *Server) void {
+        self.bulk_mu.lock();
+        defer self.bulk_mu.unlock();
+        var it = self.bulk_tenant_usage.keyIterator();
+        while (it.next()) |key| self.alloc.free(key.*);
+        self.bulk_tenant_usage.deinit();
+    }
+
+    fn acquireBulkMemory(self: *Server, tenant_id: []const u8, estimated_bytes: usize) !BulkMemoryReservation {
+        const global_limit = bulkGlobalMemoryLimit();
+        const tenant_limit = bulkTenantMemoryLimit(global_limit);
+        return self.acquireBulkMemoryWithLimits(tenant_id, estimated_bytes, global_limit, tenant_limit);
+    }
+
+    fn acquireBulkMemoryWithLimits(
+        self: *Server,
+        tenant_id: []const u8,
+        estimated_bytes: usize,
+        global_limit: usize,
+        tenant_limit: usize,
+    ) !BulkMemoryReservation {
+        if (tenant_id.len == 0 or tenant_id.len > collection.MAX_TENANT_ID_LEN) return error.BulkMemoryLimitExceeded;
+        if (estimated_bytes == 0 or estimated_bytes > global_limit or estimated_bytes > tenant_limit) {
+            _ = self.bulk_rejected.fetchAdd(1, .monotonic);
+            return error.BulkMemoryLimitExceeded;
+        }
+
+        self.bulk_mu.lock();
+        defer self.bulk_mu.unlock();
+
+        const global_next = std.math.add(usize, self.bulk_inflight_bytes, estimated_bytes) catch {
+            _ = self.bulk_rejected.fetchAdd(1, .monotonic);
+            return error.BulkMemoryLimitExceeded;
+        };
+        if (global_next > global_limit) {
+            _ = self.bulk_rejected.fetchAdd(1, .monotonic);
+            return error.BulkMemoryLimitExceeded;
+        }
+
+        const current_tenant_usage = self.bulk_tenant_usage.get(tenant_id) orelse BulkTenantUsage{};
+        const tenant_next = std.math.add(usize, current_tenant_usage.bytes, estimated_bytes) catch {
+            _ = self.bulk_rejected.fetchAdd(1, .monotonic);
+            return error.BulkMemoryLimitExceeded;
+        };
+        if (tenant_next > tenant_limit) {
+            _ = self.bulk_rejected.fetchAdd(1, .monotonic);
+            return error.BulkMemoryLimitExceeded;
+        }
+
+        if (self.bulk_tenant_usage.getPtr(tenant_id)) |usage| {
+            usage.bytes = tenant_next;
+            usage.requests += 1;
+        } else {
+            const owned_key = try self.alloc.dupe(u8, tenant_id);
+            errdefer self.alloc.free(owned_key);
+            try self.bulk_tenant_usage.put(owned_key, .{
+                .bytes = tenant_next,
+                .requests = 1,
+            });
+        }
+        self.bulk_inflight_bytes = global_next;
+        self.bulk_inflight_requests += 1;
+
+        var tenant_copy = [_]u8{0} ** collection.MAX_TENANT_ID_LEN;
+        @memcpy(tenant_copy[0..tenant_id.len], tenant_id);
+        return .{
+            .srv = self,
+            .tenant_id = tenant_copy,
+            .tenant_id_len = @intCast(tenant_id.len),
+            .bytes = estimated_bytes,
+        };
+    }
+
+    fn releaseBulkMemory(self: *Server, tenant_id: []const u8, bytes: usize) void {
+        self.bulk_mu.lock();
+        defer self.bulk_mu.unlock();
+
+        self.bulk_inflight_bytes = if (self.bulk_inflight_bytes >= bytes) self.bulk_inflight_bytes - bytes else 0;
+        if (self.bulk_inflight_requests > 0) self.bulk_inflight_requests -= 1;
+
+        if (self.bulk_tenant_usage.getPtr(tenant_id)) |usage| {
+            usage.bytes = if (usage.bytes >= bytes) usage.bytes - bytes else 0;
+            if (usage.requests > 0) usage.requests -= 1;
+            if (usage.bytes == 0 and usage.requests == 0) {
+                if (self.bulk_tenant_usage.fetchRemove(tenant_id)) |kv| {
+                    self.alloc.free(kv.key);
+                }
+            }
+        }
     }
 
     pub fn run(self: *Server) !void {
@@ -225,6 +352,110 @@ pub const Server = struct {
     }
 };
 
+threadlocal var tl_bulk_reservation: ?Server.BulkMemoryReservation = null;
+
+const ParsedRequestTarget = struct {
+    method: []const u8,
+    path: []const u8,
+    query: []const u8,
+};
+
+const BulkPreflight = union(enum) {
+    not_bulk,
+    reserved: Server.BulkMemoryReservation,
+    reject: struct {
+        code: u16,
+        message: []const u8,
+    },
+};
+
+fn bulkGlobalMemoryLimit() usize {
+    const explicit = compat.envUsize("TURBODB_BULK_MEMORY_LIMIT_BYTES", 0);
+    if (explicit > 0) return explicit;
+    if (compat.availableMemoryBytes()) |available| {
+        return @min(available / BULK_MEMORY_AVAILABLE_FRACTION, MAX_AUTO_BULK_MEMORY_LIMIT);
+    }
+    return DEFAULT_BULK_MEMORY_LIMIT;
+}
+
+fn bulkTenantMemoryLimit(global_limit: usize) usize {
+    const explicit = compat.envUsize("TURBODB_BULK_TENANT_MEMORY_LIMIT_BYTES", 0);
+    if (explicit > 0) return @min(explicit, global_limit);
+    return global_limit / BULK_TENANT_MEMORY_FRACTION;
+}
+
+fn estimateBulkMemoryBytes(body_len: usize) usize {
+    const chunk_bytes = @min(body_len, BULK_INSERT_CHUNK_BYTES);
+    const row_meta = @min(body_len / 4 + 64 * 1024, 2 * 1024 * 1024);
+    var total = std.math.add(usize, body_len, BULK_MEMORY_BASE_OVERHEAD) catch return std.math.maxInt(usize);
+    total = std.math.add(usize, total, row_meta) catch return std.math.maxInt(usize);
+    total = std.math.add(usize, total, chunk_bytes) catch return std.math.maxInt(usize);
+    total = std.math.add(usize, total, chunk_bytes) catch return std.math.maxInt(usize);
+    return total;
+}
+
+fn parseRequestTarget(raw: []const u8) ?ParsedRequestTarget {
+    const nl = std.mem.indexOfScalar(u8, raw, '\n') orelse return null;
+    const req_line = std.mem.trimEnd(u8, raw[0..nl], "\r");
+    var parts = std.mem.splitScalar(u8, req_line, ' ');
+    const method = parts.next() orelse return null;
+    const full_path = parts.next() orelse return null;
+
+    var path = full_path;
+    var query: []const u8 = "";
+    if (std.mem.indexOfScalar(u8, full_path, '?')) |qi| {
+        path = full_path[0..qi];
+        query = full_path[qi + 1 ..];
+    }
+
+    return .{ .method = method, .path = path, .query = query };
+}
+
+fn isBulkInsertTarget(method: []const u8, path: []const u8) bool {
+    if (!std.mem.eql(u8, method, "POST")) return false;
+    if (!std.mem.startsWith(u8, path, "/db/")) return false;
+    const rest = path[4..];
+    const sep = std.mem.indexOfScalar(u8, rest, '/') orelse return false;
+    const key = rest[sep + 1 ..];
+    return std.mem.eql(u8, key, "bulk");
+}
+
+fn preflightBulkAdmission(srv: *Server, initial: []const u8, body_len: usize) BulkPreflight {
+    const target = parseRequestTarget(initial) orelse return .not_bulk;
+    if (!isBulkInsertTarget(target.method, target.path)) return .not_bulk;
+
+    var auth_ctx = auth.AuthContext{
+        .perm = .admin,
+        .tenant_id = [_]u8{0} ** 64,
+        .tenant_id_len = 0,
+    };
+    var auth_ctx_bound = false;
+    if (srv.db.auth.isEnabled()) {
+        const api_key = auth.AuthStore.extractHttpKey(initial) orelse
+            return .{ .reject = .{ .code = 401, .message = "unauthorized — missing X-Api-Key header" } };
+        auth_ctx = srv.db.auth.resolve(api_key) orelse
+            return .{ .reject = .{ .code = 401, .message = "unauthorized — invalid API key" } };
+        auth_ctx_bound = true;
+    }
+
+    const auth_ctx_ptr: ?*const auth.AuthContext = if (auth_ctx_bound) &auth_ctx else null;
+    if (!canWriteDb(auth_ctx_ptr)) {
+        return .{ .reject = .{ .code = 403, .message = "forbidden: API key is read-only" } };
+    }
+
+    const tenant_id = requestTenant(initial, target.query, auth_ctx_ptr);
+    const estimated_bytes = estimateBulkMemoryBytes(body_len);
+    const reservation = srv.acquireBulkMemory(tenant_id, estimated_bytes) catch {
+        return .{ .reject = .{ .code = 429, .message = "bulk memory limit exceeded" } };
+    };
+    return .{ .reserved = reservation };
+}
+
+fn releaseThreadBulkReservation() void {
+    if (tl_bulk_reservation) |*reservation| reservation.release();
+    tl_bulk_reservation = null;
+}
+
 /// Wrapper that tracks active connection count around handleConn.
 fn handleConnWrapped(srv: *Server, conn: compat.net.Server.Connection) void {
     _ = srv.active_conns.fetchAdd(1, .monotonic);
@@ -264,14 +495,25 @@ fn handleConn(srv: *Server, conn: compat.net.Server.Connection) void {
             if (total_size > MAX_BULK) {
                 const resp_len = err(413, "request too large");
                 conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
-                continue;
+                return;
+            }
+
+            switch (preflightBulkAdmission(srv, initial, content_length)) {
+                .not_bulk => {},
+                .reserved => |reservation| tl_bulk_reservation = reservation,
+                .reject => |rejection| {
+                    const resp_len = err(rejection.code, rejection.message);
+                    conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
+                    return;
+                },
             }
 
             if (total_size > bufs.req.len) {
                 const big_buf = std.heap.page_allocator.alloc(u8, total_size) catch {
-                    const resp_len = dispatch(srv, initial, std.heap.page_allocator);
+                    releaseThreadBulkReservation();
+                    const resp_len = err(500, "request allocation failed");
                     conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
-                    continue;
+                    return;
                 };
                 defer std.heap.page_allocator.free(big_buf);
                 @memcpy(big_buf[0..n], initial);
@@ -282,6 +524,7 @@ fn handleConn(srv: *Server, conn: compat.net.Server.Connection) void {
                     n += r;
                 }
                 const resp_len = dispatch(srv, big_buf[0..n], std.heap.page_allocator);
+                releaseThreadBulkReservation();
                 conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
                 continue;
             } else {
@@ -291,6 +534,7 @@ fn handleConn(srv: *Server, conn: compat.net.Server.Connection) void {
                     n += r;
                 }
                 const resp_len = dispatch(srv, bufs.req[0..n], std.heap.page_allocator);
+                releaseThreadBulkReservation();
                 conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
                 continue;
             }
@@ -329,7 +573,12 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
     // Route: /metrics
     if (std.mem.eql(u8, path, "/metrics")) {
         var fbs = compat.fixedBufferStream(getBodyBuf());
-        compat.format(fbs.writer(), "{{\"requests\":{d},\"errors\":{d},\"queries\":{d},\"rows_scanned\":{d},\"bytes_read\":{d},\"cpu_us\":{d},\"cost_nanos_usd\":{d}}}", .{
+        srv.bulk_mu.lock();
+        const bulk_inflight_bytes = srv.bulk_inflight_bytes;
+        const bulk_inflight_requests = srv.bulk_inflight_requests;
+        srv.bulk_mu.unlock();
+        const bulk_global_limit = bulkGlobalMemoryLimit();
+        compat.format(fbs.writer(), "{{\"requests\":{d},\"errors\":{d},\"queries\":{d},\"rows_scanned\":{d},\"bytes_read\":{d},\"cpu_us\":{d},\"cost_nanos_usd\":{d},\"bulk_inflight_bytes\":{d},\"bulk_inflight_requests\":{d},\"bulk_rejected\":{d},\"bulk_memory_limit_bytes\":{d},\"bulk_tenant_memory_limit_bytes\":{d}}}", .{
             srv.req_count.load(.acquire),
             srv.err_count.load(.acquire),
             srv.query_count.load(.acquire),
@@ -337,6 +586,11 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
             srv.query_bytes_read.load(.acquire),
             srv.query_cpu_us.load(.acquire),
             srv.query_cost_nanos_usd.load(.acquire),
+            bulk_inflight_bytes,
+            bulk_inflight_requests,
+            srv.bulk_rejected.load(.acquire),
+            bulk_global_limit,
+            bulkTenantMemoryLimit(bulk_global_limit),
         }) catch {};
         return ok(getBodyBuf()[0..fbs.pos]);
     }
@@ -523,8 +777,14 @@ fn doInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []co
 /// Body: NDJSON — one {"key":"...","value":"..."} per line.
 /// Response: {"inserted":N,"errors":M,"collection":"...","tenant":"..."}
 fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
-    _ = alloc;
     const start_ns = compat.nanoTimestamp();
+    var local_bulk_reservation: ?Server.BulkMemoryReservation = null;
+    if (tl_bulk_reservation == null) {
+        local_bulk_reservation = srv.acquireBulkMemory(tenant_id, estimateBulkMemoryBytes(body.len)) catch
+            return err(429, "bulk memory limit exceeded");
+    }
+    defer if (local_bulk_reservation) |*reservation| reservation.release();
+
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     srv.db.ensureTenantStorageAvailable(tenant_id, body.len) catch return err(429, "tenant storage quota exceeded");
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
@@ -532,6 +792,28 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
     var inserted: u32 = 0;
     var errors: u32 = 0;
     var total_bytes: u64 = 0;
+    var chunk_bytes: usize = 0;
+    var rows: std.ArrayList(collection.Collection.BulkInsertRow) = .empty;
+    defer rows.deinit(alloc);
+
+    const BulkFlush = struct {
+        fn run(
+            col_arg: *collection.Collection,
+            rows_arg: *std.ArrayList(collection.Collection.BulkInsertRow),
+            chunk_bytes_arg: *usize,
+            inserted_arg: *u32,
+            errors_arg: *u32,
+            bytes_arg: *u64,
+        ) !void {
+            if (rows_arg.items.len == 0) return;
+            const bulk = try col_arg.insertBulk(rows_arg.items);
+            inserted_arg.* += bulk.inserted;
+            errors_arg.* += bulk.errors;
+            bytes_arg.* += bulk.bytes;
+            rows_arg.clearRetainingCapacity();
+            chunk_bytes_arg.* = 0;
+        }
+    };
 
     // Parse NDJSON: iterate lines, each is a {"key":"...","value":...} object
     var pos: usize = 0;
@@ -544,17 +826,28 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
         if (line.len < 2) continue; // skip empty lines
 
         // Extract key from this JSON line
-        const key = jsonStr(line, "key") orelse continue;
-        // Extract value field; fall back to full line for backwards compat.
-        const value = jsonValue(line, "value") orelse line;
-
-        _ = col.insert(key, value) catch {
+        const key = jsonStr(line, "key") orelse {
             errors += 1;
             continue;
         };
-        inserted += 1;
-        total_bytes += line.len;
+        // Extract value field; fall back to full line for backwards compat.
+        const value = jsonValue(line, "value") orelse line;
+        const row_bytes = key.len + value.len + 128;
+        if (rows.items.len > 0 and chunk_bytes + row_bytes > BULK_INSERT_CHUNK_BYTES) {
+            BulkFlush.run(col, &rows, &chunk_bytes, &inserted, &errors, &total_bytes) catch
+                return err(500, "bulk insert failed");
+        }
+        rows.append(alloc, .{ .key = key, .value = value, .line_len = line.len }) catch
+            return err(500, "bulk request too large");
+        chunk_bytes += row_bytes;
+
+        if (rows.items.len >= BULK_INSERT_CHUNK_ROWS) {
+            BulkFlush.run(col, &rows, &chunk_bytes, &inserted, &errors, &total_bytes) catch
+                return err(500, "bulk insert failed");
+        }
     }
+    BulkFlush.run(col, &rows, &chunk_bytes, &inserted, &errors, &total_bytes) catch
+        return err(500, "bulk insert failed");
 
     srv.recordQueryCost(tenant_id, "bulk_insert", inserted, total_bytes, start_ns);
 
@@ -1917,6 +2210,46 @@ test "read-only auth cannot write basic db methods" {
 
     ctx.perm = .read_write;
     try std.testing.expect(canWriteDb(&ctx));
+}
+
+test "bulk memory estimate includes body and bounded chunk workspace" {
+    const small = estimateBulkMemoryBytes(1024);
+    const large = estimateBulkMemoryBytes(MAX_BULK);
+    try std.testing.expect(small > 1024);
+    try std.testing.expect(large > MAX_BULK);
+    try std.testing.expect(large < MAX_BULK + 16 * 1024 * 1024);
+}
+
+test "bulk memory admission enforces tenant and global limits" {
+    const alloc = std.testing.allocator;
+    var fake_db: Database = undefined;
+    var srv = Server.init(alloc, &fake_db, 0);
+    defer srv.deinit();
+
+    const request_bytes = estimateBulkMemoryBytes(1024 * 1024);
+    const global_limit = request_bytes * 2 + 1024;
+    const tenant_limit = request_bytes + 512;
+
+    var r1 = try srv.acquireBulkMemoryWithLimits("tenant-a", request_bytes, global_limit, tenant_limit);
+    try std.testing.expectError(
+        error.BulkMemoryLimitExceeded,
+        srv.acquireBulkMemoryWithLimits("tenant-a", request_bytes, global_limit, tenant_limit),
+    );
+
+    var r2 = try srv.acquireBulkMemoryWithLimits("tenant-b", request_bytes, global_limit, tenant_limit);
+    try std.testing.expectError(
+        error.BulkMemoryLimitExceeded,
+        srv.acquireBulkMemoryWithLimits("tenant-c", request_bytes, global_limit, tenant_limit),
+    );
+
+    r1.release();
+    var r3 = try srv.acquireBulkMemoryWithLimits("tenant-c", request_bytes, global_limit, tenant_limit);
+    r2.release();
+    r3.release();
+
+    try std.testing.expectEqual(@as(usize, 0), srv.bulk_inflight_bytes);
+    try std.testing.expectEqual(@as(u32, 0), srv.bulk_inflight_requests);
+    try std.testing.expectEqual(@as(u32, 0), srv.bulk_tenant_usage.count());
 }
 
 test "KeyIter reads JSON arrays and keyed newline bodies" {

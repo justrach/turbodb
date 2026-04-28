@@ -1,14 +1,14 @@
 /// TurboDB — Collection (MVCC document store + query engine)
 const std = @import("std");
 const compat = @import("compat");
-const doc_mod   = @import("doc.zig");
-const page_mod  = @import("page.zig");
+const doc_mod = @import("doc.zig");
+const page_mod = @import("page.zig");
 const btree_mod = @import("btree.zig");
 const codeindex = @import("codeindex.zig");
-const wal_mod   = @import("wal");
+const wal_mod = @import("wal");
 const epoch_mod = @import("epoch");
 const hot_cache = @import("hot_cache.zig");
-const mvcc_mod  = @import("mvcc.zig");
+const mvcc_mod = @import("mvcc.zig");
 const cdc_mod = @import("cdc.zig");
 const vector = @import("vector.zig");
 const branch_mod = @import("branch.zig");
@@ -26,6 +26,8 @@ const WordIndex = codeindex.WordIndex;
 pub const DEFAULT_TENANT = "default";
 pub const MAX_TENANT_ID_LEN: usize = 64;
 pub const MAX_COLLECTION_NAME_LEN: usize = 64;
+const DEFAULT_INDEX_QUEUE_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
+const INDEX_QUEUE_MEMORY_FRACTION: usize = 16;
 
 fn writeCommittedDocumentWal(wal_log: *WAL, op: wal_mod.OpCode, payload: []const u8) !void {
     const txn = wal_log.next_lsn.load(.monotonic);
@@ -34,6 +36,19 @@ fn writeCommittedDocumentWal(wal_log: *WAL, op: wal_mod.OpCode, payload: []const
     } else {
         _ = try wal_log.write(txn, op, wal_mod.DB_TAG_DOC, wal_mod.FLAG_COMMIT, payload);
     }
+}
+
+fn indexQueueMemoryLimit() usize {
+    const explicit = compat.envUsize("TURBODB_INDEX_QUEUE_MEMORY_LIMIT_BYTES", 0);
+    if (explicit > 0) return explicit;
+    if (compat.availableMemoryBytes()) |available| {
+        return @min(available / INDEX_QUEUE_MEMORY_FRACTION, DEFAULT_INDEX_QUEUE_MEMORY_LIMIT);
+    }
+    return DEFAULT_INDEX_QUEUE_MEMORY_LIMIT;
+}
+
+fn indexEntryBytes(key: []const u8, value: []const u8) usize {
+    return std.math.add(usize, key.len, value.len) catch std.math.maxInt(usize);
 }
 
 // ─── IndexQueue ──────────────────────────────────────────────────────────
@@ -107,7 +122,10 @@ fn fastParseFloat(s: []const u8) ?f32 {
     if (s.len == 0) return null;
     var i: usize = 0;
     var neg: bool = false;
-    if (s[0] == '-') { neg = true; i = 1; }
+    if (s[0] == '-') {
+        neg = true;
+        i = 1;
+    }
     var int_part: i32 = 0;
     while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
         int_part = int_part * 10 + @as(i32, s[i] - '0');
@@ -176,6 +194,28 @@ pub const Collection = struct {
     // MVCC GC: trigger version chain cleanup every GC_INTERVAL inserts.
     const GC_INTERVAL: u64 = 500;
 
+    pub const BulkInsertRow = struct {
+        key: []const u8,
+        value: []const u8,
+        line_len: usize = 0,
+    };
+
+    pub const BulkInsertResult = struct {
+        inserted: u32 = 0,
+        errors: u32 = 0,
+        bytes: u64 = 0,
+    };
+
+    const BulkPreparedDoc = struct {
+        key: []const u8,
+        value: []const u8,
+        doc_id: u64,
+        key_hash: u64,
+        enc_off: usize,
+        enc_len: usize,
+        line_len: usize,
+    };
+
     name_buf: [128]u8,
     name_len: u8,
     pf: PageFile,
@@ -197,6 +237,7 @@ pub const Collection = struct {
     /// Per-key modification epoch — tracks when each key was last written on main.
     /// Used by mergeBranch to detect conflicts (key modified after branch was created).
     key_epochs: std.AutoHashMap(u64, u64),
+    append_leaf_hint: u32,
     alloc: std.mem.Allocator,
     cache: hot_cache.HotCache,
     // MVCC version chain — append-only, vacuumed periodically via gc_counter.
@@ -210,6 +251,7 @@ pub const Collection = struct {
     index_stop: std.atomic.Value(bool),
     queue_toggle: std.atomic.Value(u32),
     indexing_count: std.atomic.Value(u32),
+    index_queue_bytes: std.atomic.Value(usize),
 
     // Vector embedding column (optional)
     vectors: ?*vector.VectorColumn = null,
@@ -258,6 +300,7 @@ pub const Collection = struct {
         col.hash_idx = std.AutoHashMap(u64, BTreeEntry).init(alloc);
         col.key_doc_ids = std.AutoHashMap(u64, u64).init(alloc);
         col.key_epochs = std.AutoHashMap(u64, u64).init(alloc);
+        col.append_leaf_hint = 0;
         col.alloc = alloc;
         col.cache = hot_cache.HotCache.init();
         col.versions = mvcc_mod.VersionChain.init(alloc);
@@ -266,6 +309,7 @@ pub const Collection = struct {
         col.index_stop = std.atomic.Value(bool).init(false);
         col.queue_toggle = std.atomic.Value(u32).init(0);
         col.indexing_count = std.atomic.Value(u32).init(0);
+        col.index_queue_bytes = std.atomic.Value(usize).init(0);
         col.vectors = null;
         col.vector_field_len = 0;
         col.vec_entries = .empty;
@@ -410,8 +454,8 @@ pub const Collection = struct {
             // Index the document.
             const entry = BTreeEntry{
                 .key_hash = hdr.key_hash,
-                .doc_id   = doc_id,
-                .page_no  = pno,
+                .doc_id = doc_id,
+                .page_no = pno,
                 .page_off = page_off,
             };
             try self.idx.insert(entry);
@@ -423,33 +467,7 @@ pub const Collection = struct {
             self.key_doc_ids.put(hdr.key_hash, doc_id) catch {};
             self.key_epochs.put(hdr.key_hash, doc_id) catch {}; // epoch = doc_id (monotonic)
 
-            // Async trigram + word indexing — push to background queue, sync fallback if full or no worker.
-            if (value.len >= 3) {
-                if (self.index_thread == null) {
-                    // No background worker — index synchronously to avoid losing data.
-                    self.tri.indexFile(key, value) catch {};
-                    self.words.indexFile(key, value) catch {};
-                } else {
-                    const owned_key = self.alloc.dupe(u8, key) catch null;
-                    const owned_val = self.alloc.dupe(u8, value) catch null;
-                    if (owned_key != null and owned_val != null) {
-                        const q = &self.index_queue;
-                        var retries: u32 = 0;
-                        while (!q.push(owned_key.?, owned_val.?)) {
-                            retries += 1;
-                            if (retries > 1000) {
-                                // Queue full — fall back to synchronous indexing.
-                                self.tri.indexFile(owned_key.?, owned_val.?) catch {};
-                                self.words.indexFile(owned_key.?, owned_val.?) catch {};
-                                self.alloc.free(owned_key.?);
-                                self.alloc.free(owned_val.?);
-                                break;
-                            }
-                            std.Thread.yield() catch {};
-                        }
-                    }
-                }
-            }
+            self.enqueueTextIndex(key, value);
 
             // Extract and store vector embedding if configured.
             // Uses stack buffer to avoid heap allocation per insert.
@@ -480,6 +498,127 @@ pub const Collection = struct {
         emitChange(self, .insert, key, value, doc_id);
 
         return doc_id;
+    }
+
+    fn bulkEncodedLen(row: BulkInsertRow) ?usize {
+        if (row.key.len == 0 or row.key.len > 1024 or row.value.len > 64 * 1024 * 1024) return null;
+        const total_size = DocHeader.size + row.key.len + row.value.len;
+        if (total_size > page_mod.PAGE_USABLE) return null;
+        return total_size;
+    }
+
+    /// Insert many documents as one durable ingestion batch. The WAL is flushed
+    /// before page/index updates are applied and before this call returns.
+    pub fn insertBulk(self: *Collection, rows: []const BulkInsertRow) !BulkInsertResult {
+        var result = BulkInsertResult{};
+        if (rows.len == 0) return result;
+
+        var encoded: std.ArrayList(u8) = .empty;
+        defer encoded.deinit(self.alloc);
+        var prepared: std.ArrayList(BulkPreparedDoc) = .empty;
+        defer prepared.deinit(self.alloc);
+        var payloads: std.ArrayList(wal_mod.BatchPayload) = .empty;
+        defer payloads.deinit(self.alloc);
+
+        var valid_rows: usize = 0;
+        var estimated_bytes: usize = 0;
+        for (rows) |row| {
+            const total_size = bulkEncodedLen(row) orelse {
+                result.errors += 1;
+                continue;
+            };
+            estimated_bytes = std.math.add(usize, estimated_bytes, total_size) catch return error.OutOfMemory;
+            valid_rows += 1;
+        }
+
+        if (valid_rows == 0) return result;
+
+        try prepared.ensureTotalCapacity(self.alloc, valid_rows);
+        try payloads.ensureTotalCapacity(self.alloc, valid_rows);
+        try encoded.ensureTotalCapacity(self.alloc, estimated_bytes);
+
+        for (rows) |row| {
+            const total_size = bulkEncodedLen(row) orelse continue;
+
+            const doc_id = self.next_doc_id.fetchAdd(1, .monotonic);
+            const hdr = doc_mod.newHeader(doc_id, row.key, row.value);
+            const d = Doc{ .header = hdr, .key = row.key, .value = row.value };
+            const enc_off = encoded.items.len;
+            try encoded.appendNTimes(self.alloc, 0, total_size);
+            const enc = encoded.items[enc_off .. enc_off + total_size];
+            _ = try d.encodeBuf(enc);
+
+            prepared.appendAssumeCapacity(.{
+                .key = row.key,
+                .value = row.value,
+                .doc_id = doc_id,
+                .key_hash = hdr.key_hash,
+                .enc_off = enc_off,
+                .enc_len = total_size,
+                .line_len = row.line_len,
+            });
+            payloads.appendAssumeCapacity(enc);
+        }
+
+        if (prepared.items.len == 0) return result;
+
+        const last_lsn = try self.wal_log.writeCommittedBatch(.doc_insert, wal_mod.DB_TAG_DOC, payloads.items);
+        try self.wal_log.flushUpTo(last_lsn);
+
+        self.meta_mu.lock();
+        {
+            defer self.meta_mu.unlock();
+            for (prepared.items) |item| {
+                const enc = encoded.items[item.enc_off .. item.enc_off + item.enc_len];
+                const pno = try self.findOrAllocLeaf(enc.len);
+                const page_off = self.pf.leafAppend(pno, enc) orelse return error.PageFull;
+                const entry = BTreeEntry{
+                    .key_hash = item.key_hash,
+                    .doc_id = item.doc_id,
+                    .page_no = pno,
+                    .page_off = page_off,
+                };
+                try self.idx.insert(entry);
+                self.hash_idx.put(item.key_hash, entry) catch {};
+
+                const epoch = self.epochs.advance();
+                self.versions.appendVersion(self.alloc, item.doc_id, pno, page_off, epoch) catch {};
+                self.key_doc_ids.put(item.key_hash, item.doc_id) catch {};
+                self.key_epochs.put(item.key_hash, item.doc_id) catch {};
+
+                if (self.vectors) |vc| {
+                    const field = self.vector_field[0..self.vector_field_len];
+                    const dims: usize = vc.dims;
+                    var embed_stack: [4096]f32 = undefined;
+                    const emb = if (dims <= 4096) embed_stack[0..dims] else blk: {
+                        break :blk self.alloc.alloc(f32, dims) catch null;
+                    };
+                    if (emb) |e| {
+                        defer if (dims > 4096) self.alloc.free(e);
+                        if (extractJsonFloatArray(item.value, field, e)) |count| {
+                            if (count == dims) {
+                                vc.append(self.alloc, e) catch {};
+                                self.vec_entries.append(self.alloc, entry) catch {};
+                            }
+                        }
+                    }
+                }
+
+                if (self.gc_counter.fetchAdd(1, .monotonic) % GC_INTERVAL == GC_INTERVAL - 1) {
+                    _ = self.versions.gc(self.alloc);
+                }
+
+                result.inserted += 1;
+                result.bytes += item.line_len;
+            }
+        }
+
+        for (prepared.items) |item| {
+            self.enqueueTextIndex(item.key, item.value);
+            emitChange(self, .insert, item.key, item.value, item.doc_id);
+        }
+
+        return result;
     }
 
     /// Insert a document with a pre-computed embedding (no JSON parsing needed).
@@ -615,8 +754,8 @@ pub const Collection = struct {
 
             const new_entry = BTreeEntry{
                 .key_hash = key_hash,
-                .doc_id   = doc_id,
-                .page_no  = pno,
+                .doc_id = doc_id,
+                .page_no = pno,
                 .page_off = page_off,
             };
             self.hash_idx.put(key_hash, new_entry) catch {};
@@ -803,7 +942,10 @@ pub const Collection = struct {
                 const nc = needle[j];
                 const hl = if (hc >= 'A' and hc <= 'Z') hc + 32 else hc;
                 const nl = if (nc >= 'A' and nc <= 'Z') nc + 32 else nc;
-                if (hl != nl) { match = false; break; }
+                if (hl != nl) {
+                    match = false;
+                    break;
+                }
             }
             if (match) return true;
         }
@@ -846,7 +988,9 @@ pub const Collection = struct {
     pub const ScanResult = struct {
         docs: []Doc,
         alloc: std.mem.Allocator,
-        pub fn deinit(self: ScanResult) void { self.alloc.free(self.docs); }
+        pub fn deinit(self: ScanResult) void {
+            self.alloc.free(self.docs);
+        }
     };
 
     /// Linear scan of all live documents, with optional limit/offset.
@@ -880,7 +1024,10 @@ pub const Collection = struct {
                 const d = decoded.doc;
                 pos += decoded.consumed;
                 if (d.header.flags & DocHeader.DELETED != 0) continue;
-                if (skipped < offset) { skipped += 1; continue; }
+                if (skipped < offset) {
+                    skipped += 1;
+                    continue;
+                }
                 try results.append(alloc, d);
                 if (results.items.len >= limit) break :outer;
             }
@@ -938,8 +1085,7 @@ pub const Collection = struct {
     }
 
     fn readEntry(self: *Collection, entry: BTreeEntry) ?Doc {
-        const raw = self.pf.leafRead(entry.page_no, entry.page_off,
-            DocHeader.size + 1024 + 65536);
+        const raw = self.pf.leafRead(entry.page_no, entry.page_off, DocHeader.size + 1024 + 65536);
         const decoded = doc_mod.decode(raw) catch return null;
         if (decoded.doc.header.flags & DocHeader.DELETED != 0) return null;
         return decoded.doc;
@@ -952,15 +1098,32 @@ pub const Collection = struct {
     }
 
     fn findOrAllocLeaf(self: *Collection, needed: usize) !u32 {
+        if (self.append_leaf_hint != 0) {
+            const ph = self.pf.pageHeader(self.append_leaf_hint);
+            if (@as(page_mod.PageType, @enumFromInt(ph.page_type)) == .leaf and
+                page_mod.PAGE_USABLE - ph.used_bytes >= needed)
+            {
+                return self.append_leaf_hint;
+            }
+        }
+
         const total = self.pf.next_alloc.load(.acquire);
         var pno = if (total > 0) total - 1 else 0;
         var checked: u32 = 0;
-        while (checked < 32 and pno > 0) : ({ pno -= 1; checked += 1; }) {
+        while (checked < 32 and pno > 0) : ({
+            pno -= 1;
+            checked += 1;
+        }) {
             const ph = self.pf.pageHeader(pno);
             if (@as(page_mod.PageType, @enumFromInt(ph.page_type)) != .leaf) continue;
-            if (page_mod.PAGE_USABLE - ph.used_bytes >= needed) return pno;
+            if (page_mod.PAGE_USABLE - ph.used_bytes >= needed) {
+                self.append_leaf_hint = pno;
+                return pno;
+            }
         }
-        return self.pf.allocPage(.leaf);
+        const allocated = try self.pf.allocPage(.leaf);
+        self.append_leaf_hint = allocated;
+        return allocated;
     }
 
     fn rebuildIndexes(self: *Collection) !void {
@@ -1004,6 +1167,71 @@ pub const Collection = struct {
             .collection_name = full_name,
         };
         self.cdc.emit(ref.tenant_id, ref.collection_name, key, value, doc_id, op);
+    }
+
+    fn enqueueTextIndex(self: *Collection, key: []const u8, value: []const u8) void {
+        if (value.len < 3) return;
+        if (self.index_thread == null and self.index_thread2 == null) {
+            self.tri.indexFile(key, value) catch {};
+            self.words.indexFile(key, value) catch {};
+            return;
+        }
+
+        const queued_bytes = indexEntryBytes(key, value);
+        if (!self.tryReserveIndexQueueBytes(queued_bytes)) {
+            self.tri.indexFile(key, value) catch {};
+            self.words.indexFile(key, value) catch {};
+            return;
+        }
+
+        const owned_key = self.alloc.dupe(u8, key) catch {
+            self.releaseIndexQueueBytes(queued_bytes);
+            return;
+        };
+        const owned_val = self.alloc.dupe(u8, value) catch {
+            self.alloc.free(owned_key);
+            self.releaseIndexQueueBytes(queued_bytes);
+            return;
+        };
+
+        const q = if (self.index_thread != null and self.index_thread2 != null)
+            if (self.queue_toggle.fetchAdd(1, .monotonic) % 2 == 0) &self.index_queue else &self.index_queue2
+        else if (self.index_thread != null)
+            &self.index_queue
+        else
+            &self.index_queue2;
+
+        var retries: u32 = 0;
+        while (!q.push(owned_key, owned_val)) {
+            retries += 1;
+            if (retries > 1000) {
+                self.releaseIndexQueueBytes(queued_bytes);
+                self.tri.indexFile(owned_key, owned_val) catch {};
+                self.words.indexFile(owned_key, owned_val) catch {};
+                self.alloc.free(owned_val);
+                self.alloc.free(owned_key);
+                return;
+            }
+            std.Thread.yield() catch {};
+        }
+    }
+
+    fn tryReserveIndexQueueBytes(self: *Collection, bytes: usize) bool {
+        const limit = indexQueueMemoryLimit();
+        while (true) {
+            const current = self.index_queue_bytes.load(.acquire);
+            const next = std.math.add(usize, current, bytes) catch return false;
+            if (next > limit) return false;
+            if (self.index_queue_bytes.cmpxchgWeak(current, next, .acq_rel, .monotonic)) |_| {
+                continue;
+            }
+            return true;
+        }
+    }
+
+    fn releaseIndexQueueBytes(self: *Collection, bytes: usize) void {
+        if (bytes == 0) return;
+        _ = self.index_queue_bytes.fetchSub(bytes, .release);
     }
 
     // ─── Vector search ────────────────────────────────────────────────────
@@ -1405,9 +1633,9 @@ pub const Collection = struct {
                     var name_end = name_start;
                     while (name_end < doc.value.len and
                         ((doc.value[name_end] >= 'a' and doc.value[name_end] <= 'z') or
-                        (doc.value[name_end] >= 'A' and doc.value[name_end] <= 'Z') or
-                        (doc.value[name_end] >= '0' and doc.value[name_end] <= '9') or
-                        doc.value[name_end] == '_'))
+                            (doc.value[name_end] >= 'A' and doc.value[name_end] <= 'Z') or
+                            (doc.value[name_end] >= '0' and doc.value[name_end] <= '9') or
+                            doc.value[name_end] == '_'))
                     {
                         name_end += 1;
                     }
@@ -1516,6 +1744,7 @@ fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
             col.words.indexFile(batch_keys[i], batch_vals[i]) catch {};
         }
         for (0..n) |i| {
+            col.releaseIndexQueueBytes(indexEntryBytes(batch_keys[i], batch_vals[i]));
             col.alloc.free(batch_vals[i]);
             col.alloc.free(batch_keys[i]);
         }
@@ -1525,6 +1754,7 @@ fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
     while (queue.pop()) |entry| {
         col.tri.indexFile(entry.key, entry.value) catch {};
         col.words.indexFile(entry.key, entry.value) catch {};
+        col.releaseIndexQueueBytes(indexEntryBytes(entry.key, entry.value));
         col.alloc.free(entry.value);
         col.alloc.free(entry.key);
     }
@@ -2002,6 +2232,33 @@ test "collection WAL replays committed document writes and full tombstone" {
     try std.testing.expectEqualStrings("u1", decoded.doc.key);
     try std.testing.expectEqualStrings("", decoded.doc.value);
     try std.testing.expectEqual(DocHeader.size + "u1".len, decoded.consumed);
+}
+
+test "collection bulk insert is durable and queryable" {
+    const alloc = std.testing.allocator;
+    const tmp_dir = "/tmp/turbodb_collection_bulk_insert";
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    try compat.cwd().makePath(tmp_dir);
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
+
+    const db = try Database.open(alloc, tmp_dir);
+    defer db.close();
+
+    const col = try db.collection("users");
+    const rows = [_]Collection.BulkInsertRow{
+        .{ .key = "u1", .value = "{\"name\":\"alice\"}", .line_len = 25 },
+        .{ .key = "u2", .value = "{\"name\":\"bob\"}", .line_len = 23 },
+        .{ .key = "u3", .value = "{\"name\":\"carol\"}", .line_len = 25 },
+    };
+
+    const result = try col.insertBulk(rows[0..]);
+    try std.testing.expectEqual(@as(u32, 3), result.inserted);
+    try std.testing.expectEqual(@as(u32, 0), result.errors);
+    try std.testing.expect(db.wal_log.synced_lsn >= 3);
+
+    try std.testing.expectEqualStrings("{\"name\":\"alice\"}", col.get("u1").?.value);
+    try std.testing.expectEqualStrings("{\"name\":\"bob\"}", col.get("u2").?.value);
+    try std.testing.expectEqualStrings("{\"name\":\"carol\"}", col.get("u3").?.value);
 }
 
 test "collection concurrent inserts keep shared indexes stable" {

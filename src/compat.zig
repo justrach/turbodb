@@ -174,6 +174,53 @@ pub fn envUsize(comptime name: [:0]const u8, default_value: usize) usize {
     return std.fmt.parseInt(usize, value, 10) catch default_value;
 }
 
+pub fn availableMemoryBytes() ?usize {
+    if (comptime builtin.os.tag != .linux) return null;
+    if (cgroupAvailableMemoryBytes()) |bytes| return bytes;
+    return procMemAvailableBytes();
+}
+
+fn cgroupAvailableMemoryBytes() ?usize {
+    var max_buf: [64]u8 = undefined;
+    const max_raw = readSmallAbsolute("/sys/fs/cgroup/memory.max", &max_buf) orelse return null;
+    const max_bytes = parseUsizePrefix(max_raw) orelse return null;
+
+    var current_buf: [64]u8 = undefined;
+    const current_raw = readSmallAbsolute("/sys/fs/cgroup/memory.current", &current_buf) orelse return null;
+    const current_bytes = parseUsizePrefix(current_raw) orelse return null;
+
+    if (current_bytes >= max_bytes) return 0;
+    return max_bytes - current_bytes;
+}
+
+fn procMemAvailableBytes() ?usize {
+    var buf: [4096]u8 = undefined;
+    const data = readSmallAbsolute("/proc/meminfo", &buf) orelse return null;
+    const labels = [_][]const u8{ "MemAvailable:", "MemFree:" };
+    for (labels) |label| {
+        const idx = std.mem.indexOf(u8, data, label) orelse continue;
+        const kb = parseUsizePrefix(data[idx + label.len ..]) orelse continue;
+        return std.math.mul(usize, kb, 1024) catch null;
+    }
+    return null;
+}
+
+fn readSmallAbsolute(path: []const u8, buf: []u8) ?[]const u8 {
+    var file = openFileAbsolute(path, .{}) catch return null;
+    defer file.close();
+    const n = file.read(buf) catch return null;
+    return buf[0..n];
+}
+
+fn parseUsizePrefix(raw: []const u8) ?usize {
+    const trimmed = std.mem.trim(u8, raw, " \t\r\n");
+    if (trimmed.len == 0 or std.mem.startsWith(u8, trimmed, "max")) return null;
+    var end: usize = 0;
+    while (end < trimmed.len and trimmed[end] >= '0' and trimmed[end] <= '9') : (end += 1) {}
+    if (end == 0) return null;
+    return std.fmt.parseInt(usize, trimmed[0..end], 10) catch null;
+}
+
 pub fn deinitLinuxUring(ring: *LinuxUring) void {
     if (comptime builtin.os.tag != .linux) return;
     ring.deinit();

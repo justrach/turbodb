@@ -86,6 +86,8 @@ pub const Entry = struct {
     payload: []const u8, // slice into caller-owned buffer
 };
 
+pub const BatchPayload = []const u8;
+
 // ── CRC-32 (IEEE polynomial) ──────────────────────────────────────────────────
 
 fn crc32(data: []const u8) u32 {
@@ -309,6 +311,112 @@ pub const WAL = struct {
         payload: []const u8,
     ) !u64 {
         return self.write(txn_id, op, db_tag, FLAG_COMMIT, payload);
+    }
+
+    /// Append many self-committed entries while holding the WAL mutex once.
+    /// Returns the last LSN appended. Call flushUpTo(last_lsn) before
+    /// acknowledging if the caller requires durable ingestion.
+    pub fn writeCommittedBatch(
+        self: *WAL,
+        op: OpCode,
+        db_tag: u8,
+        payloads: []const BatchPayload,
+    ) !u64 {
+        if (payloads.len == 0) return self.synced_lsn;
+
+        var bytes_needed: usize = 0;
+        for (payloads) |payload| {
+            if (payload.len > MAX_ENTRY_PAYLOAD) return error.WALPayloadTooLarge;
+            const raw_len = HEADER_SIZE + payload.len;
+            bytes_needed += raw_len + paddingTo8(raw_len);
+        }
+
+        self.mu.lock();
+        if (self.last_flush_error) |e| {
+            self.mu.unlock();
+            return e;
+        }
+        while (self.write_buf.items.len >= MAX_WRITE_BUF) {
+            if (self.last_flush_error) |e| {
+                self.mu.unlock();
+                return e;
+            }
+            self.cond.wait(&self.mu);
+        }
+        self.write_buf.ensureUnusedCapacity(self.allocator, bytes_needed) catch |e| {
+            self.mu.unlock();
+            return e;
+        };
+
+        const start_lsn = self.next_lsn.fetchAdd(@intCast(payloads.len), .monotonic);
+        for (payloads, 0..) |payload, i| {
+            const lsn = start_lsn + @as(u64, @intCast(i));
+            const pad = paddingTo8(HEADER_SIZE + payload.len);
+            var hdr = EntryHeader{
+                .lsn = lsn,
+                .length = @intCast(payload.len),
+                .crc32 = 0,
+                .op_code = @intFromEnum(op),
+                .db_tag = db_tag,
+                .flags = FLAG_COMMIT,
+                .txn_id = lsn,
+                .reserved = 0,
+            };
+            const hdr_bytes = std.mem.asBytes(&hdr);
+            hdr.crc32 = entryChecksum(hdr_bytes, payload);
+            self.write_buf.appendSliceAssumeCapacity(std.mem.asBytes(&hdr));
+            self.write_buf.appendSliceAssumeCapacity(payload);
+            if (pad > 0) self.write_buf.appendNTimesAssumeCapacity(0, pad);
+        }
+        self.mu.unlock();
+
+        return start_lsn + @as(u64, @intCast(payloads.len - 1));
+    }
+
+    /// Ensure every entry up to `target_lsn` is durably flushed.
+    pub fn flushUpTo(self: *WAL, target_lsn: u64) !void {
+        self.mu.lock();
+        while (self.synced_lsn < target_lsn) {
+            if (self.last_flush_error) |e| {
+                self.mu.unlock();
+                return e;
+            }
+
+            if (self.flushing) {
+                self.cond.wait(&self.mu);
+                continue;
+            }
+
+            if (self.write_buf.items.len == 0) {
+                self.mu.unlock();
+                return error.WALNotDurable;
+            }
+
+            self.flushing = true;
+            var to_write: std.ArrayList(u8) = self.write_buf;
+            const flushed_lsn = self.next_lsn.load(.monotonic) - 1;
+            self.write_buf = .empty;
+            self.mu.unlock();
+
+            const io_err = self.writeAndSync(to_write.items);
+            to_write.deinit(self.allocator);
+
+            self.mu.lock();
+            if (io_err) |e| {
+                self.last_flush_error = e;
+            } else {
+                self.synced_lsn = flushed_lsn;
+                self.last_flush_error = null;
+            }
+            self.flushing = false;
+            self.cond.broadcast();
+
+            if (io_err) |e| {
+                self.mu.unlock();
+                return e;
+            }
+        }
+        self.mu.unlock();
     }
 
     /// Mark a transaction committed.  Returns only after the entry is durable.
@@ -677,6 +785,38 @@ test "writeCommitted buffers committed entry without forcing fsync" {
         try std.testing.expectEqual(@as(u64, 40), ReplayProbe.last_txn_id);
         try std.testing.expect((ReplayProbe.last_flags & FLAG_COMMIT) != 0);
         try std.testing.expectEqualStrings("inline", ReplayProbe.payload());
+    }
+}
+
+test "writeCommittedBatch plus flushUpTo durably replays all entries" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testingWalPath(allocator, &tmp, "batch-committed.wal");
+    defer allocator.free(path);
+
+    {
+        var wal = try WAL.open(path, allocator);
+        defer wal.close();
+
+        const payloads = [_]BatchPayload{ "one", "two", "three" };
+        const last_lsn = try wal.writeCommittedBatch(.doc_insert, DB_TAG_DOC, payloads[0..]);
+        try wal.flushUpTo(last_lsn);
+        try std.testing.expect(wal.synced_lsn >= last_lsn);
+    }
+
+    {
+        var wal = try WAL.open(path, allocator);
+        defer wal.close();
+
+        ReplayProbe.reset();
+        try wal.recover(0, ReplayProbe.apply, allocator);
+        try std.testing.expectEqual(@as(usize, 3), ReplayProbe.count);
+        try std.testing.expectEqual(OpCode.doc_insert, ReplayProbe.last_op);
+        try std.testing.expectEqual(@as(u64, 3), ReplayProbe.last_txn_id);
+        try std.testing.expect((ReplayProbe.last_flags & FLAG_COMMIT) != 0);
+        try std.testing.expectEqualStrings("three", ReplayProbe.payload());
     }
 }
 

@@ -14,7 +14,8 @@ another container, and does not publish database ports to macOS.
 - `orders`: keyed order records with `user_id`, amount, status, and JSON payload.
 - TurboDB stores `bench_users`, `bench_orders`, and a materialized
   `bench_user_orders` edge collection. The benchmark client uses persistent
-  HTTP plus `POST /db/:col/batch_get?mode=count` for relationship fetches, so
+  HTTP plus durable `POST /db/:col/bulk` ingestion and
+  `POST /db/:col/batch_get?mode=count` for relationship fetches, so
   lookup-heavy workloads do not pay to serialize document bodies they do not
   consume. For the join-like, update, and delete workloads it assumes the
   faster HTTP shapes exist and uses `POST /db/:edge_col/join?mode=count`,
@@ -30,7 +31,9 @@ another container, and does not publish database ports to macOS.
 
 ## Workloads
 
-- `ingest`: create all users and orders.
+- `ingest`: create all users and orders. TurboDB HTTP uses a collection-level
+  bulk insert path that writes committed WAL entries as a batch and flushes the
+  WAL before acknowledging the bulk request.
 - `point_get`: read users by primary key.
 - `relationship_lookup`: fetch all orders/transfers for a user. TurboDB HTTP
   keeps this as a materialized edge read plus compact `batch_get`.
