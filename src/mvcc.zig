@@ -113,6 +113,26 @@ pub const VersionChain = struct {
         try self.all_versions.append(alloc, .{ .doc_id = doc_id, .ver = ver });
     }
 
+    pub fn ensureUnusedCapacity(self: *VersionChain, alloc: Allocator, additional: usize) !void {
+        try self.latest.ensureUnusedCapacity(@intCast(additional));
+        try self.history.ensureUnusedCapacity(@intCast(additional));
+        try self.all_versions.ensureUnusedCapacity(alloc, additional);
+    }
+
+    pub fn appendFreshVersionAssumeCapacity(self: *VersionChain, doc_id: u64, page_no: u32, page_off: u16, epoch: u64) void {
+        const ver = VersionPtr{
+            .page_no = page_no,
+            .page_off = page_off,
+            .epoch = epoch,
+            .prev_page_no = NO_PREV_PAGE_NO,
+            .prev_page_off = NO_PREV_PAGE_OFF,
+        };
+
+        self.latest.putAssumeCapacityNoClobber(doc_id, ver);
+        self.history.putAssumeCapacityNoClobber(chainKey(page_no, page_off), ver);
+        self.all_versions.appendAssumeCapacity(.{ .doc_id = doc_id, .ver = ver });
+    }
+
     /// Get the latest version location for a document.
     pub fn getLatest(self: *VersionChain, doc_id: u64) ?VersionPtr {
         return self.latest.get(doc_id);
@@ -219,6 +239,27 @@ test "version chain traversal" {
     // Chain link should point back.
     try testing.expectEqual(@as(u32, 10), latest.prev_page_no);
     try testing.expectEqual(@as(u16, 0), latest.prev_page_off);
+}
+
+test "bulk fresh append uses reserved capacity" {
+    const alloc = testing.allocator;
+    var chain = VersionChain.init(alloc);
+    defer chain.deinit(alloc);
+
+    try chain.ensureUnusedCapacity(alloc, 3);
+    chain.appendFreshVersionAssumeCapacity(1, 10, 20, 2);
+    chain.appendFreshVersionAssumeCapacity(2, 10, 40, 3);
+    chain.appendFreshVersionAssumeCapacity(3, 11, 0, 4);
+
+    const first = chain.getLatest(1).?;
+    try testing.expectEqual(@as(u32, 10), first.page_no);
+    try testing.expectEqual(@as(u16, 20), first.page_off);
+    try testing.expectEqual(@as(u64, 2), first.epoch);
+    try testing.expectEqual(NO_PREV_PAGE_NO, first.prev_page_no);
+    try testing.expectEqual(NO_PREV_PAGE_OFF, first.prev_page_off);
+    try testing.expect(chain.getAtEpoch(3, 3) == null);
+    try testing.expectEqual(@as(usize, 3), chain.latest.count());
+    try testing.expectEqual(@as(usize, 3), chain.all_versions.items.len);
 }
 
 test "read transaction sees correct epoch" {

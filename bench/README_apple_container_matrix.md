@@ -14,7 +14,9 @@ another container, and does not publish database ports to macOS.
 - `orders`: keyed order records with `user_id`, amount, status, and JSON payload.
 - TurboDB stores `bench_users`, `bench_orders`, and a materialized
   `bench_user_orders` edge collection. The benchmark client uses persistent
-  HTTP plus durable `POST /db/:col/bulk` ingestion and
+  HTTP plus durable `POST /db/:col/bulk` ingestion by default. Use
+  `--turbodb-bulk-mode binary` to benchmark length-prefixed
+  `POST /db/:col/bulk_binary` ingestion. It uses
   `POST /db/:col/batch_get?mode=count` for relationship fetches, so
   lookup-heavy workloads do not pay to serialize document bodies they do not
   consume. For the join-like, update, and delete workloads it assumes the
@@ -23,6 +25,9 @@ another container, and does not publish database ports to macOS.
 - `turbodb_ffi` loads `/work/zig-out-ffi/lib/libturbodb.so` with Python `ctypes`.
   This is an embedded/raw-engine path, not a network database path, and exists
   to show the cost of HTTP/client transport separately from storage operations.
+  Bulk inserts, updates, deletes, and batched reads use C ABI batch exports so
+  the benchmark does not hide storage behavior behind one Python FFI call per
+  row.
 - PostgreSQL 18 and MySQL use normalized `users` and `orders` tables with a
   secondary index on `orders.user_id`.
 - TigerBeetle uses accounts and transfers, so relationship lookups are modeled
@@ -46,6 +51,18 @@ another container, and does not publish database ports to macOS.
 TurboDB HTTP update/delete latency is reported as amortized row latency when
 the benchmark uses the batch endpoints; throughput remains row operations per
 second.
+
+TurboDB also exposes a gRPC-compatible bridge for binary bulk mutations on the
+same server:
+
+- `POST /grpc/:col/BulkInsert`
+- `POST /grpc/:col/BulkUpdate` / `BulkUpsert`
+- `POST /grpc/:col/BulkDelete`
+
+The bridge accepts one uncompressed gRPC message frame for `application/grpc`
+requests, or the raw binary payload directly. It is not a full HTTP/2/protobuf
+server yet; it is a fast route shape for clients/gateways that already speak in
+gRPC-style frames.
 
 ## Run
 
@@ -72,6 +89,9 @@ Useful flags:
 
 - `--skip-turbodb`, `--skip-postgres`, `--skip-mysql`, `--skip-tigerbeetle`
 - `--skip-turbodb-ffi`
+- `--turbodb-bulk-mode ndjson|binary`
+- `--batch-size 16384` to align with TurboDB's larger default durable bulk
+  chunk and reduce per-request/WAL-flush overhead on large ingests
 - `--turbodb-ffi-target aarch64-linux-gnu`
 - `--turbodb-ffi-prefix zig-out-ffi`
 - `--turbodb-ffi-lib /work/zig-out-ffi/lib/libturbodb.so`

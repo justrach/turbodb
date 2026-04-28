@@ -15,6 +15,7 @@ import math
 import os
 import random
 import shutil
+import struct
 import sys
 import time
 from dataclasses import dataclass
@@ -128,11 +129,12 @@ class Shape:
 class TurboDBBench:
     name = "turbodb"
 
-    def __init__(self, host: str, port: int, shape: Shape, batch_size: int):
+    def __init__(self, host: str, port: int, shape: Shape, batch_size: int, bulk_mode: str = "ndjson"):
         self.host = host
         self.port = port
         self.shape = shape
         self.batch_size = batch_size
+        self.bulk_mode = bulk_mode
         self.conn = http.client.HTTPConnection(host, port, timeout=10)
 
     def request(self, method: str, path: str, body: bytes | None = None, content_type: str = "application/json") -> bytes:
@@ -172,6 +174,19 @@ class TurboDBBench:
                 pass
 
     def bulk(self, collection: str, rows: list[tuple[str, dict[str, Any]]]) -> None:
+        if self.bulk_mode == "binary":
+            body = bytearray()
+            for key, value in rows:
+                key_b = key.encode()
+                value_b = json.dumps(value, separators=(",", ":")).encode()
+                if len(key_b) > 0xFFFF:
+                    raise ValueError("key too large for binary bulk format")
+                body += struct.pack("<HI", len(key_b), len(value_b))
+                body += key_b
+                body += value_b
+            self.request("POST", f"/db/{collection}/bulk_binary", bytes(body), "application/vnd.turbodb.bulk")
+            return
+
         lines = []
         for key, value in rows:
             lines.append(json.dumps({"key": key, "value": value}, separators=(",", ":")))
@@ -337,8 +352,18 @@ class TurboDBFFIBench:
         lib.turbodb_get_many_keys.restype = ctypes.c_int
         lib.turbodb_update.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t, ctypes.c_char_p, ctypes.c_size_t]
         lib.turbodb_update.restype = ctypes.c_int
+        lib.turbodb_update_bulk_ndjson.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32),
+        ]
+        lib.turbodb_update_bulk_ndjson.restype = ctypes.c_int
         lib.turbodb_delete.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t]
         lib.turbodb_delete.restype = ctypes.c_int
+        lib.turbodb_delete_many_keys.argtypes = [
+            ctypes.c_void_p, ctypes.c_char_p, ctypes.c_size_t,
+            ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32), ctypes.POINTER(ctypes.c_uint32),
+        ]
+        lib.turbodb_delete_many_keys.restype = ctypes.c_int
 
     def close(self) -> None:
         if getattr(self, "db", None):
@@ -454,25 +479,43 @@ class TurboDBFFIBench:
         return timed_loop(samples, op, {"mode": "embedded_c_abi_materialized_edge_batch_get"})
 
     def update_orders(self, samples: list[int]) -> dict[str, Any]:
-        def op(oid: int) -> None:
-            key_b = str(oid).encode()
-            value = order_doc(oid, ((oid - 1) // self.shape.orders_per_user) + 1)
-            value["status"] = "updated"
-            value_b = json.dumps(value, separators=(",", ":")).encode()
-            rc = self.lib.turbodb_update(self.collection("bench_orders"), key_b, len(key_b), value_b, len(value_b))
+        def op(batch: list[int]) -> None:
+            lines = []
+            for oid in batch:
+                value = order_doc(oid, ((oid - 1) // self.shape.orders_per_user) + 1)
+                value["status"] = "updated"
+                lines.append(json.dumps({"key": str(oid), "value": value}, separators=(",", ":")))
+            body = ("\n".join(lines) + "\n").encode()
+            updated = ctypes.c_uint32(0)
+            inserted = ctypes.c_uint32(0)
+            errors = ctypes.c_uint32(0)
+            rc = self.lib.turbodb_update_bulk_ndjson(
+                self.collection("bench_orders"), body, len(body),
+                ctypes.byref(updated), ctypes.byref(inserted), ctypes.byref(errors),
+            )
             if rc != 0:
-                raise RuntimeError(f"FFI update failed for order {oid}")
+                raise RuntimeError("FFI bulk update failed for orders")
+            if errors.value:
+                raise RuntimeError(f"FFI bulk update had {errors.value} row errors")
 
-        return timed_loop(samples, op, {"mode": "embedded_c_abi"})
+        return timed_batch_loop(self.batches(samples), op, {"mode": "embedded_c_abi_bulk_update", "latency_unit": "amortized_row"})
 
     def delete_orders(self, samples: list[int]) -> dict[str, Any]:
-        def op(oid: int) -> None:
-            key_b = str(oid).encode()
-            rc = self.lib.turbodb_delete(self.collection("bench_orders"), key_b, len(key_b))
+        def op(batch: list[int]) -> None:
+            body = ("\n".join(str(oid) for oid in batch) + "\n").encode()
+            deleted = ctypes.c_uint32(0)
+            missing = ctypes.c_uint32(0)
+            errors = ctypes.c_uint32(0)
+            rc = self.lib.turbodb_delete_many_keys(
+                self.collection("bench_orders"), body, len(body),
+                ctypes.byref(deleted), ctypes.byref(missing), ctypes.byref(errors),
+            )
             if rc != 0:
-                raise RuntimeError(f"FFI delete failed for order {oid}")
+                raise RuntimeError("FFI bulk delete failed for orders")
+            if errors.value:
+                raise RuntimeError(f"FFI bulk delete had {errors.value} row errors")
 
-        return timed_loop(samples, op, {"mode": "embedded_c_abi"})
+        return timed_batch_loop(self.batches(samples), op, {"mode": "embedded_c_abi_bulk_delete", "latency_unit": "amortized_row"})
 
 
 class PostgresBench:
@@ -822,6 +865,7 @@ def main() -> int:
     ap.add_argument("--output", default="/work/benchmark-results/container-shape-bench.json")
     ap.add_argument("--turbodb-host")
     ap.add_argument("--turbodb-port", type=int, default=27017)
+    ap.add_argument("--turbodb-bulk-mode", choices=("ndjson", "binary"), default="ndjson")
     ap.add_argument("--turbodb-ffi-lib")
     ap.add_argument("--turbodb-ffi-dir", default="/tmp/turbodb_ffi_shape_bench")
     ap.add_argument("--postgres-host")
@@ -843,6 +887,7 @@ def main() -> int:
             "orders_per_user": shape.orders_per_user,
             "samples": args.samples,
             "batch_size": args.batch_size,
+            "turbodb_bulk_mode": args.turbodb_bulk_mode,
         },
         "engines": {},
         "errors": {},
@@ -850,7 +895,7 @@ def main() -> int:
 
     engines: list[Any] = []
     if args.turbodb_host:
-        engines.append(TurboDBBench(args.turbodb_host, args.turbodb_port, shape, args.batch_size))
+        engines.append(TurboDBBench(args.turbodb_host, args.turbodb_port, shape, args.batch_size, args.turbodb_bulk_mode))
     if args.turbodb_ffi_lib:
         engines.append(TurboDBFFIBench(args.turbodb_ffi_lib, args.turbodb_ffi_dir, shape, args.batch_size))
     if args.postgres_host:

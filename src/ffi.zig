@@ -17,8 +17,8 @@ const Collection = collection.Collection;
 const Doc = doc_mod.Doc;
 
 const alloc = std.heap.c_allocator;
-const BULK_INSERT_CHUNK_ROWS: usize = 4096;
-const BULK_INSERT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const BULK_INSERT_CHUNK_ROWS: usize = 16384;
+const BULK_INSERT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 
 // ── Handle wrappers with magic sentinel for validation ──────────────────────
 
@@ -177,6 +177,7 @@ export fn turbodb_insert_bulk_ndjson(
     const input = body[0..body_len];
     var rows: std.ArrayList(Collection.BulkInsertRow) = .empty;
     defer rows.deinit(alloc);
+    rows.ensureTotalCapacity(alloc, @min(BULK_INSERT_CHUNK_ROWS, @max(@as(usize, 1), input.len / 96))) catch return -1;
     var chunk_bytes: usize = 0;
 
     const BulkFlush = struct {
@@ -304,6 +305,54 @@ export fn turbodb_update(
     return if (updated) 0 else -1;
 }
 
+/// Bulk upsert NDJSON lines shaped as {"key":"...","value":...}.
+/// Returns 0 if the request was processed; per-row failures are counted.
+export fn turbodb_update_bulk_ndjson(
+    col_handle: *anyopaque,
+    body: [*]const u8,
+    body_len: usize,
+    out_updated: *u32,
+    out_inserted: *u32,
+    out_errors: *u32,
+) c_int {
+    const col = validateColHandle(col_handle) orelse return -1;
+    const input = body[0..body_len];
+    var updated: u32 = 0;
+    var inserted: u32 = 0;
+    var errors: u32 = 0;
+
+    var pos: usize = 0;
+    while (pos < input.len) {
+        const line_end = std.mem.indexOfScalarPos(u8, input, pos, '\n') orelse input.len;
+        const line = std.mem.trim(u8, input[pos..line_end], " \t\r");
+        pos = if (line_end < input.len) line_end + 1 else line_end;
+        if (line.len == 0) continue;
+
+        const parsed = parseStrictBulkLine(line) orelse {
+            errors += 1;
+            continue;
+        };
+        const did_update = col.update(parsed.key, parsed.value) catch {
+            errors += 1;
+            continue;
+        };
+        if (did_update) {
+            updated += 1;
+        } else {
+            _ = col.insert(parsed.key, parsed.value) catch {
+                errors += 1;
+                continue;
+            };
+            inserted += 1;
+        }
+    }
+
+    out_updated.* = updated;
+    out_inserted.* = inserted;
+    out_errors.* = errors;
+    return 0;
+}
+
 /// Delete a document by key. Returns 0 on success, -1 if not found.
 export fn turbodb_delete(
     col_handle: *anyopaque,
@@ -313,6 +362,36 @@ export fn turbodb_delete(
     const col = validateColHandle(col_handle) orelse return -1;
     const deleted = col.delete(key[0..key_len]) catch return -1;
     return if (deleted) 0 else -1;
+}
+
+/// Delete many newline-delimited or JSON-array keys in one FFI call.
+export fn turbodb_delete_many_keys(
+    col_handle: *anyopaque,
+    keys_body: [*]const u8,
+    keys_len: usize,
+    out_deleted: *u32,
+    out_missing: *u32,
+    out_errors: *u32,
+) c_int {
+    const col = validateColHandle(col_handle) orelse return -1;
+    var iter = KeyIter.init(keys_body[0..keys_len]);
+    var deleted: u32 = 0;
+    var missing: u32 = 0;
+    var errors: u32 = 0;
+
+    while (iter.next()) |key| {
+        if (key.len == 0) continue;
+        const did_delete = col.delete(key) catch {
+            errors += 1;
+            continue;
+        };
+        if (did_delete) deleted += 1 else missing += 1;
+    }
+
+    out_deleted.* = deleted;
+    out_missing.* = missing;
+    out_errors.* = errors;
+    return 0;
 }
 
 // ── Scan ────────────────────────────────────────────────────────────────────
@@ -452,10 +531,36 @@ const BulkLine = struct {
 };
 
 fn parseBulkLine(line: []const u8) ?BulkLine {
+    if (parseBulkLineExact(line)) |parsed| return parsed;
     if (parseBulkLineFast(line)) |parsed| return parsed;
     const key = jsonStr(line, "key") orelse return null;
     const value = jsonValue(line, "value") orelse line;
     return .{ .key = key, .value = value };
+}
+
+fn parseStrictBulkLine(line: []const u8) ?BulkLine {
+    if (parseBulkLineExact(line)) |parsed| return parsed;
+    if (parseBulkLineFast(line)) |parsed| return parsed;
+    const key = jsonStr(line, "key") orelse return null;
+    const value = jsonValue(line, "value") orelse return null;
+    return .{ .key = key, .value = value };
+}
+
+fn parseBulkLineExact(line: []const u8) ?BulkLine {
+    const prefix = "{\"key\":\"";
+    const middle = "\",\"value\":";
+    if (line.len < prefix.len + middle.len + 1 or !std.mem.startsWith(u8, line, prefix)) return null;
+
+    var key_end = prefix.len;
+    while (key_end < line.len and line[key_end] != '"') : (key_end += 1) {
+        if (line[key_end] == '\\') return null;
+    }
+    if (key_end >= line.len) return null;
+    if (!std.mem.startsWith(u8, line[key_end..], middle)) return null;
+
+    const value_start = key_end + middle.len;
+    if (value_start >= line.len or line[line.len - 1] != '}') return null;
+    return .{ .key = line[prefix.len..key_end], .value = line[value_start .. line.len - 1] };
 }
 
 fn parseBulkLineFast(line: []const u8) ?BulkLine {

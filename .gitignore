@@ -1,11 +1,18 @@
 zig-out/
 zig-out-ffi/
+zig-out-*/
 .zig-cache/
 python/dist/
 *.egg-info/
 codedb.snapshot
 __pycache__/
 *.pyc
+.DS_Store
+.claude/
+.zigrep_archive
+run_status.txt
+turbodb_data/
+charts.png
 
 # ClickHouse local data
 access/

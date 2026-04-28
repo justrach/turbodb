@@ -4,6 +4,9 @@
 ///   POST   /db/:col/batch_get    get multiple documents by key
 ///   POST   /db/:col/batch_update upsert multiple documents by key
 ///   POST   /db/:col/batch_delete delete multiple documents by key
+///   POST   /grpc/:col/BulkInsert gRPC-framed binary bulk insert bridge
+///   POST   /grpc/:col/BulkUpdate gRPC-framed binary bulk update/upsert bridge
+///   POST   /grpc/:col/BulkDelete gRPC-framed binary bulk delete bridge
 ///   POST   /db/:edge_col/join    read edge keys and batch-get target docs
 ///   GET    /db/:col/:key         get document by key
 ///   PUT    /db/:col/:key         upsert document
@@ -26,9 +29,9 @@ const Database = collection.Database;
 const MAX_REQ = 65536; // 64 KiB (initial read)
 const MAX_RESP = 131072; // 128 KiB
 const MAX_BODY = 65536; // 64 KiB
-const MAX_BULK = 16 * 1024 * 1024; // 16 MiB for bulk inserts
-const BULK_INSERT_CHUNK_ROWS: usize = 4096;
-const BULK_INSERT_CHUNK_BYTES: usize = 4 * 1024 * 1024;
+const MAX_BULK = 64 * 1024 * 1024; // 64 MiB for large bulk inserts
+const BULK_INSERT_CHUNK_ROWS: usize = 16384;
+const BULK_INSERT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
 const DEFAULT_BULK_MEMORY_LIMIT: usize = 256 * 1024 * 1024;
 const MAX_AUTO_BULK_MEMORY_LIMIT: usize = 512 * 1024 * 1024;
 const BULK_MEMORY_AVAILABLE_FRACTION: usize = 4;
@@ -360,6 +363,11 @@ const ParsedRequestTarget = struct {
     query: []const u8,
 };
 
+const GrpcTarget = struct {
+    col_name: []const u8,
+    rpc: []const u8,
+};
+
 const BulkPreflight = union(enum) {
     not_bulk,
     reserved: Server.BulkMemoryReservation,
@@ -417,12 +425,36 @@ fn isBulkInsertTarget(method: []const u8, path: []const u8) bool {
     const rest = path[4..];
     const sep = std.mem.indexOfScalar(u8, rest, '/') orelse return false;
     const key = rest[sep + 1 ..];
-    return std.mem.eql(u8, key, "bulk");
+    return std.mem.eql(u8, key, "bulk") or std.mem.eql(u8, key, "bulk_binary");
+}
+
+fn parseGrpcTarget(path: []const u8) ?GrpcTarget {
+    if (!std.mem.startsWith(u8, path, "/grpc/")) return null;
+    const rest = path["/grpc/".len..];
+    const sep = std.mem.indexOfScalar(u8, rest, '/') orelse return null;
+    if (sep == 0 or sep + 1 >= rest.len) return null;
+    return .{
+        .col_name = rest[0..sep],
+        .rpc = rest[sep + 1 ..],
+    };
+}
+
+fn isGrpcBulkMutation(method: []const u8, path: []const u8) bool {
+    if (!std.mem.eql(u8, method, "POST")) return false;
+    const target = parseGrpcTarget(path) orelse return false;
+    return std.mem.eql(u8, target.rpc, "BulkInsert") or
+        std.mem.eql(u8, target.rpc, "BulkUpdate") or
+        std.mem.eql(u8, target.rpc, "BulkUpsert") or
+        std.mem.eql(u8, target.rpc, "BulkDelete");
+}
+
+fn isBulkMemoryTarget(method: []const u8, path: []const u8) bool {
+    return isBulkInsertTarget(method, path) or isGrpcBulkMutation(method, path);
 }
 
 fn preflightBulkAdmission(srv: *Server, initial: []const u8, body_len: usize) BulkPreflight {
     const target = parseRequestTarget(initial) orelse return .not_bulk;
-    if (!isBulkInsertTarget(target.method, target.path)) return .not_bulk;
+    if (!isBulkMemoryTarget(target.method, target.path)) return .not_bulk;
 
     var auth_ctx = auth.AuthContext{
         .perm = .admin,
@@ -492,7 +524,7 @@ fn handleConn(srv: *Server, conn: compat.net.Server.Connection) void {
         if (content_length > 0) {
             const header_end = if (std.mem.indexOf(u8, initial, "\r\n\r\n")) |p| p + 4 else if (std.mem.indexOf(u8, initial, "\n\n")) |p| p + 2 else n;
             const total_size = header_end + content_length;
-            if (total_size > MAX_BULK) {
+            if (content_length > MAX_BULK) {
                 const resp_len = err(413, "request too large");
                 conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
                 return;
@@ -700,6 +732,24 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
         }
     }
 
+    // Routes under /grpc/:col/:rpc.
+    // This is a bridge for gRPC-style clients on the current HTTP/1 transport:
+    // if Content-Type is application/grpc, the body must be a single uncompressed
+    // gRPC frame; otherwise the same raw binary payload is accepted directly.
+    if (parseGrpcTarget(path)) |target| {
+        if (!std.mem.eql(u8, method, "POST")) return err(404, "not found");
+        if (!canWriteDb(auth_ctx_ptr)) return err(403, "forbidden: API key is read-only");
+        const payload = grpcPayload(raw, body) orelse return err(400, "bad grpc frame");
+        const tenant_id = requestTenant(raw, query, auth_ctx_ptr);
+        if (std.mem.eql(u8, target.rpc, "BulkInsert"))
+            return handleBulkInsertBinaryWithMode(srv, tenant_id, target.col_name, payload, alloc, "grpc_bulk_insert", "grpc_bridge_binary");
+        if (std.mem.eql(u8, target.rpc, "BulkUpdate") or std.mem.eql(u8, target.rpc, "BulkUpsert"))
+            return handleBulkUpdateBinary(srv, tenant_id, target.col_name, payload, "grpc_bulk_update", "grpc_bridge_binary");
+        if (std.mem.eql(u8, target.rpc, "BulkDelete"))
+            return handleBulkDeleteBinary(srv, tenant_id, target.col_name, payload, "grpc_bulk_delete", "grpc_bridge_binary");
+        return err(404, "not found");
+    }
+
     // Routes under /db/:col
     if (std.mem.startsWith(u8, path, "/db/")) {
         const rest = path[4..];
@@ -725,6 +775,9 @@ fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
             // POST /db/:col/bulk — bulk insert
             if (std.mem.eql(u8, key, "bulk") and std.mem.eql(u8, method, "POST"))
                 return handleBulkInsert(srv, tenant_id, col_name, body, alloc);
+            // POST /db/:col/bulk_binary — length-prefixed bulk insert.
+            if (std.mem.eql(u8, key, "bulk_binary") and std.mem.eql(u8, method, "POST"))
+                return handleBulkInsertBinaryWithMode(srv, tenant_id, col_name, body, alloc, "bulk_insert_bin", "binary");
             if (std.mem.eql(u8, method, "GET")) return handleGet(srv, tenant_id, col_name, key, requestAsOf(raw, query));
             if (std.mem.eql(u8, method, "PUT")) return handleUpdate(srv, tenant_id, col_name, key, body, alloc);
             if (std.mem.eql(u8, method, "DELETE")) return handleDelete(srv, tenant_id, col_name, key);
@@ -795,6 +848,8 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
     var chunk_bytes: usize = 0;
     var rows: std.ArrayList(collection.Collection.BulkInsertRow) = .empty;
     defer rows.deinit(alloc);
+    rows.ensureTotalCapacity(alloc, @min(BULK_INSERT_CHUNK_ROWS, @max(@as(usize, 1), body.len / 96))) catch
+        return err(500, "bulk request too large");
 
     const BulkFlush = struct {
         fn run(
@@ -852,6 +907,199 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
 
     var fbs = compat.fixedBufferStream(getBodyBuf());
     compat.format(fbs.writer(), "{{\"inserted\":{d},\"errors\":{d},\"collection\":\"{s}\",\"tenant\":\"{s}\"}}", .{ inserted, errors, col_name, tenant_id }) catch {};
+    return ok(getBodyBuf()[0..fbs.pos]);
+}
+
+/// POST /db/:col/bulk_binary — insert multiple documents in one request.
+/// Body: repeated little-endian records:
+///   [key_len:u16][value_len:u32][key bytes][raw value bytes]
+fn handleBulkInsertBinaryWithMode(
+    srv: *Server,
+    tenant_id: []const u8,
+    col_name: []const u8,
+    body: []const u8,
+    alloc: std.mem.Allocator,
+    op_name: []const u8,
+    mode: []const u8,
+) usize {
+    const start_ns = compat.nanoTimestamp();
+    var local_bulk_reservation: ?Server.BulkMemoryReservation = null;
+    if (tl_bulk_reservation == null) {
+        local_bulk_reservation = srv.acquireBulkMemory(tenant_id, estimateBulkMemoryBytes(body.len)) catch
+            return err(429, "bulk memory limit exceeded");
+    }
+    defer if (local_bulk_reservation) |*reservation| reservation.release();
+
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    srv.db.ensureTenantStorageAvailable(tenant_id, body.len) catch return err(429, "tenant storage quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+
+    var inserted: u32 = 0;
+    var errors: u32 = 0;
+    var total_bytes: u64 = 0;
+    var chunk_bytes: usize = 0;
+    var rows: std.ArrayList(collection.Collection.BulkInsertRow) = .empty;
+    defer rows.deinit(alloc);
+    rows.ensureTotalCapacity(alloc, @min(BULK_INSERT_CHUNK_ROWS, @max(@as(usize, 1), body.len / 80))) catch
+        return err(500, "bulk request too large");
+
+    const BulkFlush = struct {
+        fn run(
+            col_arg: *collection.Collection,
+            rows_arg: *std.ArrayList(collection.Collection.BulkInsertRow),
+            chunk_bytes_arg: *usize,
+            inserted_arg: *u32,
+            errors_arg: *u32,
+            bytes_arg: *u64,
+        ) !void {
+            if (rows_arg.items.len == 0) return;
+            const bulk = try col_arg.insertBulk(rows_arg.items);
+            inserted_arg.* += bulk.inserted;
+            errors_arg.* += bulk.errors;
+            bytes_arg.* += bulk.bytes;
+            rows_arg.clearRetainingCapacity();
+            chunk_bytes_arg.* = 0;
+        }
+    };
+
+    var pos: usize = 0;
+    while (pos < body.len) {
+        if (pos + 6 > body.len) {
+            errors += 1;
+            break;
+        }
+        const key_len: usize = std.mem.readInt(u16, body[pos..][0..2], .little);
+        const value_len: usize = std.mem.readInt(u32, body[pos + 2 ..][0..4], .little);
+        pos += 6;
+        const end = std.math.add(usize, pos, key_len) catch {
+            errors += 1;
+            break;
+        };
+        const value_end = std.math.add(usize, end, value_len) catch {
+            errors += 1;
+            break;
+        };
+        if (key_len == 0 or end > body.len or value_end > body.len) {
+            errors += 1;
+            break;
+        }
+
+        const key = body[pos..end];
+        const value = body[end..value_end];
+        pos = value_end;
+
+        const row_bytes = key.len + value.len + 128;
+        if (rows.items.len > 0 and chunk_bytes + row_bytes > BULK_INSERT_CHUNK_BYTES) {
+            BulkFlush.run(col, &rows, &chunk_bytes, &inserted, &errors, &total_bytes) catch
+                return err(500, "bulk insert failed");
+        }
+        rows.append(alloc, .{ .key = key, .value = value, .line_len = 6 + key.len + value.len }) catch
+            return err(500, "bulk request too large");
+        chunk_bytes += row_bytes;
+
+        if (rows.items.len >= BULK_INSERT_CHUNK_ROWS) {
+            BulkFlush.run(col, &rows, &chunk_bytes, &inserted, &errors, &total_bytes) catch
+                return err(500, "bulk insert failed");
+        }
+    }
+    BulkFlush.run(col, &rows, &chunk_bytes, &inserted, &errors, &total_bytes) catch
+        return err(500, "bulk insert failed");
+
+    srv.recordQueryCost(tenant_id, op_name, inserted, total_bytes, start_ns);
+
+    var fbs = compat.fixedBufferStream(getBodyBuf());
+    compat.format(fbs.writer(), "{{\"inserted\":{d},\"errors\":{d},\"collection\":\"{s}\",\"tenant\":\"{s}\",\"mode\":\"{s}\"}}", .{ inserted, errors, col_name, tenant_id, mode }) catch {};
+    return ok(getBodyBuf()[0..fbs.pos]);
+}
+
+/// Binary bulk update/upsert used by the gRPC bridge.
+/// Body: repeated little-endian records:
+///   [key_len:u16][value_len:u32][key bytes][raw value bytes]
+fn handleBulkUpdateBinary(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8, op_name: []const u8, mode: []const u8) usize {
+    const start_ns = compat.nanoTimestamp();
+    var local_bulk_reservation: ?Server.BulkMemoryReservation = null;
+    if (tl_bulk_reservation == null) {
+        local_bulk_reservation = srv.acquireBulkMemory(tenant_id, estimateBulkMemoryBytes(body.len)) catch
+            return err(429, "bulk memory limit exceeded");
+    }
+    defer if (local_bulk_reservation) |*reservation| reservation.release();
+
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    srv.db.ensureTenantStorageAvailable(tenant_id, body.len) catch return err(429, "tenant storage quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+
+    var updated: u32 = 0;
+    var inserted: u32 = 0;
+    var errors: u32 = 0;
+    var total_bytes: u64 = 0;
+    var pos: usize = 0;
+    while (pos < body.len) {
+        const record = nextBinaryKeyValue(body, &pos) orelse {
+            errors += 1;
+            break;
+        };
+        if (!documentFitsLeaf(record.key, record.value)) {
+            errors += 1;
+            continue;
+        }
+        const did_update = col.update(record.key, record.value) catch {
+            errors += 1;
+            continue;
+        };
+        if (did_update) {
+            updated += 1;
+        } else {
+            _ = col.insert(record.key, record.value) catch {
+                errors += 1;
+                continue;
+            };
+            inserted += 1;
+        }
+        total_bytes += record.key.len + record.value.len;
+    }
+
+    srv.recordQueryCost(tenant_id, op_name, updated + inserted + errors, total_bytes, start_ns);
+
+    var fbs = compat.fixedBufferStream(getBodyBuf());
+    compat.format(fbs.writer(), "{{\"updated\":{d},\"inserted\":{d},\"errors\":{d},\"collection\":\"{s}\",\"tenant\":\"{s}\",\"mode\":\"{s}\"}}", .{ updated, inserted, errors, col_name, tenant_id, mode }) catch {};
+    return ok(getBodyBuf()[0..fbs.pos]);
+}
+
+/// Binary bulk delete used by the gRPC bridge.
+/// Body: repeated little-endian records:
+///   [key_len:u16][key bytes]
+fn handleBulkDeleteBinary(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8, op_name: []const u8, mode: []const u8) usize {
+    const start_ns = compat.nanoTimestamp();
+    var local_bulk_reservation: ?Server.BulkMemoryReservation = null;
+    if (tl_bulk_reservation == null) {
+        local_bulk_reservation = srv.acquireBulkMemory(tenant_id, estimateBulkMemoryBytes(body.len)) catch
+            return err(429, "bulk memory limit exceeded");
+    }
+    defer if (local_bulk_reservation) |*reservation| reservation.release();
+
+    srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
+    const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
+
+    var deleted: u32 = 0;
+    var missing: u32 = 0;
+    var errors: u32 = 0;
+    var pos: usize = 0;
+    while (pos < body.len) {
+        const record = nextBinaryKey(body, &pos) orelse {
+            errors += 1;
+            break;
+        };
+        const did_delete = col.delete(record.key) catch {
+            errors += 1;
+            continue;
+        };
+        if (did_delete) deleted += 1 else missing += 1;
+    }
+
+    srv.recordQueryCost(tenant_id, op_name, deleted + missing + errors, body.len, start_ns);
+
+    var fbs = compat.fixedBufferStream(getBodyBuf());
+    compat.format(fbs.writer(), "{{\"deleted\":{d},\"missing\":{d},\"errors\":{d},\"collection\":\"{s}\",\"tenant\":\"{s}\",\"mode\":\"{s}\"}}", .{ deleted, missing, errors, col_name, tenant_id, mode }) catch {};
     return ok(getBodyBuf()[0..fbs.pos]);
 }
 
@@ -1662,6 +1910,52 @@ fn extractContentLength(raw: []const u8) usize {
     return 0;
 }
 
+fn grpcPayload(raw: []const u8, body: []const u8) ?[]const u8 {
+    const requires_frame = headerContains(raw, "content-type", "application/grpc");
+    if (body.len >= 5 and body[0] == 0) {
+        const frame_len: usize = @intCast(std.mem.readInt(u32, body[1..][0..4], .big));
+        if (frame_len == body.len - 5) return body[5..];
+        if (requires_frame) return null;
+    } else if (requires_frame) {
+        return null;
+    }
+    return body;
+}
+
+const BinaryKeyValueRecord = struct {
+    key: []const u8,
+    value: []const u8,
+};
+
+fn nextBinaryKeyValue(body: []const u8, pos: *usize) ?BinaryKeyValueRecord {
+    if (pos.* + 6 > body.len) return null;
+    const key_len: usize = std.mem.readInt(u16, body[pos.*..][0..2], .little);
+    const value_len: usize = std.mem.readInt(u32, body[pos.* + 2 ..][0..4], .little);
+    pos.* += 6;
+    const key_end = std.math.add(usize, pos.*, key_len) catch return null;
+    const value_end = std.math.add(usize, key_end, value_len) catch return null;
+    if (key_len == 0 or key_end > body.len or value_end > body.len) return null;
+    const key = body[pos.*..key_end];
+    const value = body[key_end..value_end];
+    pos.* = value_end;
+    return .{ .key = key, .value = value };
+}
+
+const BinaryKeyRecord = struct {
+    key: []const u8,
+};
+
+fn nextBinaryKey(body: []const u8, pos: *usize) ?BinaryKeyRecord {
+    if (pos.* + 2 > body.len) return null;
+    const key_len: usize = std.mem.readInt(u16, body[pos.*..][0..2], .little);
+    pos.* += 2;
+    const key_end = std.math.add(usize, pos.*, key_len) catch return null;
+    if (key_len == 0 or key_end > body.len) return null;
+    const key = body[pos.*..key_end];
+    pos.* = key_end;
+    return .{ .key = key };
+}
+
 const KeyIter = struct {
     body: []const u8,
     pos: usize = 0,
@@ -1742,10 +2036,36 @@ const BulkLine = struct {
 };
 
 fn parseBulkLine(line: []const u8) ?BulkLine {
+    if (parseBulkLineExact(line)) |parsed| return parsed;
     if (parseBulkLineFast(line)) |parsed| return parsed;
     const key = jsonStr(line, "key") orelse return null;
     const value = jsonValue(line, "value") orelse line;
     return .{ .key = key, .value = value };
+}
+
+fn parseStrictBulkLine(line: []const u8) ?BulkLine {
+    if (parseBulkLineExact(line)) |parsed| return parsed;
+    if (parseBulkLineFast(line)) |parsed| return parsed;
+    const key = jsonStr(line, "key") orelse return null;
+    const value = jsonValue(line, "value") orelse return null;
+    return .{ .key = key, .value = value };
+}
+
+fn parseBulkLineExact(line: []const u8) ?BulkLine {
+    const prefix = "{\"key\":\"";
+    const middle = "\",\"value\":";
+    if (line.len < prefix.len + middle.len + 1 or !std.mem.startsWith(u8, line, prefix)) return null;
+
+    var key_end = prefix.len;
+    while (key_end < line.len and line[key_end] != '"') : (key_end += 1) {
+        if (line[key_end] == '\\') return null;
+    }
+    if (key_end >= line.len) return null;
+    if (!std.mem.startsWith(u8, line[key_end..], middle)) return null;
+
+    const value_start = key_end + middle.len;
+    if (value_start >= line.len or line[line.len - 1] != '}') return null;
+    return .{ .key = line[prefix.len..key_end], .value = line[value_start .. line.len - 1] };
 }
 
 fn parseBulkLineFast(line: []const u8) ?BulkLine {
@@ -1826,11 +2146,10 @@ const BatchUpdateIter = struct {
             self.pos = if (line_end < self.body.len) line_end + 1 else line_end;
             if (line.len == 0) continue;
 
-            const key = jsonStr(line, "key") orelse return .{ .line_len = line.len };
-            const value = jsonValue(line, "value") orelse return .{ .line_len = line.len };
+            const parsed = parseStrictBulkLine(line) orelse return .{ .line_len = line.len };
             return .{
-                .key = key,
-                .value = value,
+                .key = parsed.key,
+                .value = parsed.value,
                 .line_len = line.len,
                 .valid = true,
             };
@@ -2289,12 +2608,68 @@ test "bulk line parser fast path and generic fallback" {
     try std.testing.expectEqualStrings("{\"name\":\"bob\"}", fallback.value);
 }
 
+test "bulk insert target recognizes binary bulk endpoint" {
+    try std.testing.expect(isBulkInsertTarget("POST", "/db/users/bulk"));
+    try std.testing.expect(isBulkInsertTarget("POST", "/db/users/bulk_binary"));
+    try std.testing.expect(!isBulkInsertTarget("GET", "/db/users/bulk_binary"));
+    try std.testing.expect(!isBulkInsertTarget("POST", "/db/users/batch_update"));
+}
+
+test "grpc bridge target parser and admission detection" {
+    const target = parseGrpcTarget("/grpc/users/BulkInsert").?;
+    try std.testing.expectEqualStrings("users", target.col_name);
+    try std.testing.expectEqualStrings("BulkInsert", target.rpc);
+
+    try std.testing.expect(isGrpcBulkMutation("POST", "/grpc/users/BulkInsert"));
+    try std.testing.expect(isGrpcBulkMutation("POST", "/grpc/users/BulkUpdate"));
+    try std.testing.expect(isGrpcBulkMutation("POST", "/grpc/users/BulkUpsert"));
+    try std.testing.expect(isGrpcBulkMutation("POST", "/grpc/users/BulkDelete"));
+    try std.testing.expect(!isGrpcBulkMutation("GET", "/grpc/users/BulkInsert"));
+    try std.testing.expect(!isGrpcBulkMutation("POST", "/grpc/users/PointGet"));
+    try std.testing.expect(!isGrpcBulkMutation("POST", "/grpc/users"));
+}
+
+test "grpc payload accepts raw binary or one uncompressed grpc frame" {
+    const raw_plain = "POST /grpc/users/BulkInsert HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc";
+    try std.testing.expectEqualStrings("abc", grpcPayload(raw_plain, "abc").?);
+
+    const raw_grpc = "POST /grpc/users/BulkInsert HTTP/1.1\r\nContent-Type: application/grpc\r\nContent-Length: 8\r\n\r\n";
+    const framed = [_]u8{ 0, 0, 0, 0, 3, 'a', 'b', 'c' };
+    try std.testing.expectEqualStrings("abc", grpcPayload(raw_grpc, framed[0..]).?);
+
+    const bad_framed = [_]u8{ 0, 0, 0, 0, 4, 'a', 'b', 'c' };
+    try std.testing.expect(grpcPayload(raw_grpc, bad_framed[0..]) == null);
+    try std.testing.expect(grpcPayload(raw_grpc, "abc") == null);
+}
+
+test "binary bulk record parsers walk key value and key-only bodies" {
+    const kv = [_]u8{
+        2, 0, 7, 0, 0, 0, 'k', '1', '{', '"', 'n', '"', ':', '1', '}',
+        2, 0, 7, 0, 0, 0, 'k', '2', '{', '"', 'n', '"', ':', '2', '}',
+    };
+    var kv_pos: usize = 0;
+    const first = nextBinaryKeyValue(kv[0..], &kv_pos).?;
+    try std.testing.expectEqualStrings("k1", first.key);
+    try std.testing.expectEqualStrings("{\"n\":1}", first.value);
+    const second = nextBinaryKeyValue(kv[0..], &kv_pos).?;
+    try std.testing.expectEqualStrings("k2", second.key);
+    try std.testing.expectEqualStrings("{\"n\":2}", second.value);
+    try std.testing.expect(kv_pos == kv.len);
+    try std.testing.expect(nextBinaryKeyValue(kv[0 .. kv.len - 1], &kv_pos) == null);
+
+    const keys = [_]u8{ 2, 0, 'k', '1', 2, 0, 'k', '2' };
+    var key_pos: usize = 0;
+    try std.testing.expectEqualStrings("k1", nextBinaryKey(keys[0..], &key_pos).?.key);
+    try std.testing.expectEqualStrings("k2", nextBinaryKey(keys[0..], &key_pos).?.key);
+    try std.testing.expect(key_pos == keys.len);
+}
+
 test "bulk memory estimate includes body and bounded chunk workspace" {
     const small = estimateBulkMemoryBytes(1024);
     const large = estimateBulkMemoryBytes(MAX_BULK);
     try std.testing.expect(small > 1024);
     try std.testing.expect(large > MAX_BULK);
-    try std.testing.expect(large < MAX_BULK + 16 * 1024 * 1024);
+    try std.testing.expect(large < MAX_BULK + 40 * 1024 * 1024);
 }
 
 test "bulk memory admission enforces tenant and global limits" {

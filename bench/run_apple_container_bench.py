@@ -328,6 +328,7 @@ class BenchRun:
             "--samples", str(self.args.samples),
             "--batch-size", str(self.args.batch_size),
             "--output", f"/work/{self.output.relative_to(ROOT)}",
+            "--turbodb-bulk-mode", self.args.turbodb_bulk_mode,
         ]
 
         if (svc := services.get("turbodb")) and not svc.error:
@@ -395,6 +396,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--turbodb-ffi-prefix", default="zig-out-ffi")
     ap.add_argument("--turbodb-ffi-lib", default="/work/zig-out-ffi/lib/libturbodb.so")
     ap.add_argument("--turbodb-ffi-dir", default="/tmp/turbodb_ffi_shape_bench")
+    ap.add_argument("--turbodb-bulk-mode", choices=("ndjson", "binary"), default="ndjson")
     ap.add_argument("--python-image", default="python:3.12-slim")
     ap.add_argument("--postgres-image", default="postgres:18")
     ap.add_argument("--mysql-image", default="mysql:8.4")

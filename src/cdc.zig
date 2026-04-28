@@ -161,8 +161,12 @@ pub const CDCManager = struct {
         return sub.id;
     }
 
+    pub fn hasSubscriptions(self: *const CDCManager) bool {
+        return self.subscription_count.load(.acquire) != 0;
+    }
+
     pub fn emit(self: *CDCManager, tenant_id: []const u8, collection: []const u8, key: []const u8, value: []const u8, doc_id: u64, op: Op) void {
-        if (self.subscription_count.load(.acquire) == 0) return;
+        if (!self.hasSubscriptions()) return;
 
         var ev = std.mem.zeroes(Event);
         ev.seq = self.next_seq.fetchAdd(1, .monotonic);

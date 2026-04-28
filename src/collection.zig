@@ -558,15 +558,17 @@ pub const Collection = struct {
         try payloads.ensureTotalCapacity(self.alloc, valid_rows);
         try encoded.ensureTotalCapacity(self.alloc, estimated_bytes);
 
+        const first_doc_id = self.next_doc_id.fetchAdd(@intCast(valid_rows), .monotonic);
+        var doc_id_offset: u64 = 0;
         for (rows) |row| {
             const total_size = bulkEncodedLen(row) orelse continue;
 
-            const doc_id = self.next_doc_id.fetchAdd(1, .monotonic);
+            const doc_id = first_doc_id + doc_id_offset;
+            doc_id_offset += 1;
             const hdr = doc_mod.newHeader(doc_id, row.key, row.value);
             const d = Doc{ .header = hdr, .key = row.key, .value = row.value };
             const enc_off = encoded.items.len;
-            try encoded.appendNTimes(self.alloc, 0, total_size);
-            const enc = encoded.items[enc_off .. enc_off + total_size];
+            const enc = encoded.addManyAsSliceAssumeCapacity(total_size);
             _ = try d.encodeBuf(enc);
 
             prepared.appendAssumeCapacity(.{
@@ -586,10 +588,16 @@ pub const Collection = struct {
         const last_lsn = try self.wal_log.writeCommittedBatch(.doc_insert, wal_mod.DB_TAG_DOC, payloads.items);
         try self.wal_log.flushUpTo(last_lsn);
 
+        const first_epoch = self.epochs.advanceMany(prepared.items.len);
         self.meta_mu.lock();
         {
             defer self.meta_mu.unlock();
-            for (prepared.items) |*item| {
+            try self.hash_idx.ensureUnusedCapacity(@intCast(prepared.items.len));
+            try self.key_doc_ids.ensureUnusedCapacity(@intCast(prepared.items.len));
+            try self.key_epochs.ensureUnusedCapacity(@intCast(prepared.items.len));
+            try self.versions.ensureUnusedCapacity(self.alloc, prepared.items.len);
+
+            for (prepared.items, 0..) |*item, i| {
                 const enc = encoded.items[item.enc_off .. item.enc_off + item.enc_len];
                 const pno = try self.findOrAllocLeaf(enc.len);
                 const page_off = self.pf.leafAppend(pno, enc) orelse return error.PageFull;
@@ -600,14 +608,14 @@ pub const Collection = struct {
                     .page_off = page_off,
                 };
                 try self.idx.insert(entry);
-                self.hash_idx.put(item.key_hash, entry) catch {};
+                self.hash_idx.putAssumeCapacity(item.key_hash, entry);
                 item.page_no = pno;
                 item.page_off = page_off;
 
-                const epoch = self.epochs.advance();
-                self.versions.appendVersion(self.alloc, item.doc_id, pno, page_off, epoch) catch {};
-                self.key_doc_ids.put(item.key_hash, item.doc_id) catch {};
-                self.key_epochs.put(item.key_hash, item.doc_id) catch {};
+                const epoch = first_epoch + @as(u64, @intCast(i));
+                self.versions.appendFreshVersionAssumeCapacity(item.doc_id, pno, page_off, epoch);
+                self.key_doc_ids.putAssumeCapacity(item.key_hash, item.doc_id);
+                self.key_epochs.putAssumeCapacity(item.key_hash, item.doc_id);
 
                 if (self.vectors) |vc| {
                     const field = self.vector_field[0..self.vector_field_len];
@@ -627,15 +635,18 @@ pub const Collection = struct {
                     }
                 }
 
-                if (self.gc_counter.fetchAdd(1, .monotonic) % GC_INTERVAL == GC_INTERVAL - 1) {
-                    _ = self.versions.gc(self.alloc);
-                }
-
                 result.inserted += 1;
                 result.bytes += item.line_len;
             }
+
+            const inserted_count: u64 = @intCast(prepared.items.len);
+            const old_gc_counter = self.gc_counter.fetchAdd(inserted_count, .monotonic);
+            if (old_gc_counter / GC_INTERVAL != (old_gc_counter + inserted_count) / GC_INTERVAL) {
+                _ = self.versions.gc(self.alloc);
+            }
         }
 
+        const emit_cdc = self.cdc.hasSubscriptions();
         for (prepared.items) |item| {
             self.enqueueStoredTextIndex(
                 .{
@@ -647,7 +658,7 @@ pub const Collection = struct {
                 item.key,
                 item.value,
             );
-            emitChange(self, .insert, item.key, item.value, item.doc_id);
+            if (emit_cdc) emitChange(self, .insert, item.key, item.value, item.doc_id);
         }
 
         return result;
@@ -1193,6 +1204,7 @@ pub const Collection = struct {
     }
 
     fn emitChange(self: *Collection, op: cdc_mod.Op, key: []const u8, value: []const u8, doc_id: u64) void {
+        if (!self.cdc.hasSubscriptions()) return;
         const full_name = self.name();
         const ref: TenantCollectionRef = splitTenantCollectionKey(full_name) orelse TenantCollectionRef{
             .tenant_id = DEFAULT_TENANT,

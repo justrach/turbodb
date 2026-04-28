@@ -16,14 +16,16 @@
 const std = @import("std");
 const compat = @import("compat");
 
-pub const MAX_READERS:    usize = 1024;
-pub const EPOCH_INACTIVE: u64   = std.math.maxInt(u64);
+pub const MAX_READERS: usize = 1024;
+pub const EPOCH_INACTIVE: u64 = std.math.maxInt(u64);
 
 /// One slot per reader thread.  Padded to 64 bytes to avoid false sharing.
 const Slot = struct {
     epoch: std.atomic.Value(u64) = std.atomic.Value(u64).init(EPOCH_INACTIVE),
-    _pad:  [56]u8 = [_]u8{0} ** 56,
-    comptime { std.debug.assert(@sizeOf(@This()) == 64); }
+    _pad: [56]u8 = [_]u8{0} ** 56,
+    comptime {
+        std.debug.assert(@sizeOf(@This()) == 64);
+    }
 };
 
 pub const EpochManager = struct {
@@ -45,7 +47,7 @@ pub const EpochManager = struct {
         for (slots) |*s| s.epoch.store(EPOCH_INACTIVE, .release);
         return .{
             .global_ts = std.atomic.Value(u64).init(1),
-            .slots     = slots,
+            .slots = slots,
             .allocator = allocator,
             .timeline = .empty,
             .timeline_mu = .{},
@@ -70,6 +72,24 @@ pub const EpochManager = struct {
         defer self.timeline_mu.unlock();
         self.timeline.append(self.allocator, .{ .epoch = epoch, .ts_ms = ts_ms }) catch {};
         return epoch;
+    }
+
+    /// Reserve a contiguous epoch range for a single batched commit.
+    /// Returns the first epoch in the range. Timestamp lookups map to the
+    /// batch's final epoch so the whole batch becomes visible together.
+    pub fn advanceMany(self: *EpochManager, count: usize) u64 {
+        return self.advanceManyAt(count, compat.milliTimestamp());
+    }
+
+    pub fn advanceManyAt(self: *EpochManager, count: usize, ts_ms: i64) u64 {
+        if (count == 0) return self.now();
+        const count_u64: u64 = @intCast(count);
+        const first_epoch = self.global_ts.fetchAdd(count_u64, .acq_rel) + 1;
+        const last_epoch = first_epoch + count_u64 - 1;
+        self.timeline_mu.lock();
+        defer self.timeline_mu.unlock();
+        self.timeline.append(self.allocator, .{ .epoch = last_epoch, .ts_ms = ts_ms }) catch {};
+        return first_epoch;
     }
 
     /// Current global timestamp (snapshot for reads).
@@ -139,4 +159,16 @@ test "epoch manager maps timestamps to epochs" {
     try std.testing.expectEqual(@as(u64, 3), mgr.advanceAt(2_000));
     try std.testing.expectEqual(@as(?u64, @as(u64, 2)), mgr.epochForTimestamp(1_500));
     try std.testing.expectEqual(@as(?u64, @as(u64, 3)), mgr.epochForTimestamp(2_000));
+}
+
+test "epoch manager reserves batched epoch ranges" {
+    const alloc = std.testing.allocator;
+    var mgr = try EpochManager.init(alloc);
+    defer mgr.deinit();
+
+    try std.testing.expectEqual(@as(u64, 2), mgr.advanceManyAt(4, 1_000));
+    try std.testing.expectEqual(@as(u64, 5), mgr.now());
+    try std.testing.expectEqual(@as(?u64, @as(u64, 5)), mgr.epochForTimestamp(1_000));
+    try std.testing.expectEqual(@as(u64, 6), mgr.advanceAt(2_000));
+    try std.testing.expectEqual(@as(?u64, @as(u64, 6)), mgr.epochForTimestamp(2_000));
 }
