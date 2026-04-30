@@ -3,7 +3,11 @@
     .version = "0.1.0",
     .fingerprint = 0x2d3f19d996a45887,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{
+        .nanoapi = .{
+            .path = "../nanoapi",
+        },
+    },
     .paths = .{
         "build.zig",
         "build.zig.zon",

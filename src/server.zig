@@ -18,7 +18,9 @@
 ///   GET    /metrics              server metrics
 ///   GET    /context/:col         smart context discovery (q, limit query params)
 const std = @import("std");
+const builtin = @import("builtin");
 const compat = @import("compat");
+const nanoapi = @import("nanoapi");
 const activity = @import("activity.zig");
 const auth = @import("auth.zig");
 const collection = @import("collection.zig");
@@ -26,9 +28,15 @@ const doc_mod = @import("doc.zig");
 const page_mod = @import("page.zig");
 const Database = collection.Database;
 
+pub const HttpRuntime = enum {
+    threaded,
+    nanoapi_raw,
+};
+
 const MAX_REQ = 65536; // 64 KiB (initial read)
 const MAX_RESP = 131072; // 128 KiB
 const MAX_BODY = 65536; // 64 KiB
+const MAX_WRITE_BATCH = 65536; // 64 KiB coalesced keep-alive responses
 const MAX_BULK = 64 * 1024 * 1024; // 64 MiB for large bulk inserts
 const BULK_INSERT_CHUNK_ROWS: usize = 16384;
 const BULK_INSERT_CHUNK_BYTES: usize = 16 * 1024 * 1024;
@@ -44,6 +52,7 @@ const ConnBufs = struct {
     req: [MAX_REQ]u8,
     resp: [MAX_RESP]u8,
     body: [MAX_BODY]u8,
+    write: [MAX_WRITE_BATCH]u8,
 };
 
 const CONN_THREAD_STACK_SIZE = 1024 * 1024;
@@ -270,6 +279,37 @@ pub const Server = struct {
         }
     }
 
+    pub fn runWithRuntime(self: *Server, runtime: HttpRuntime) !void {
+        switch (runtime) {
+            .threaded => return self.run(),
+            .nanoapi_raw => return self.runNanoapiRaw(),
+        }
+    }
+
+    pub fn runNanoapiRaw(self: *Server) !void {
+        var ctx = RawDispatchContext{ .srv = self };
+        const worker_threads = compat.envUsize("TURBODB_HTTP_WORKERS", 0);
+        const io_entries = @as(u16, @intCast(@min(compat.envUsize("TURBODB_HTTP_IO_URING_ENTRIES", 1024), std.math.maxInt(u16))));
+        var raw_srv = nanoapi.raw.Server.init(&ctx, rawDispatch, self.alloc, .{
+            .host = .{ 0, 0, 0, 0 },
+            .port = self.port,
+            .backlog = 2048,
+            .read_buffer_size = MAX_REQ,
+            .response_buffer_size = MAX_RESP,
+            .write_buffer_size = MAX_WRITE_BATCH,
+            .max_request_size = MAX_BULK + MAX_REQ,
+            .runtime = if (builtin.os.tag == .linux) .io_uring else .thread_per_connection,
+            .worker_threads = worker_threads,
+            .io_uring_entries = io_entries,
+            .max_connections = MAX_CONNECTIONS,
+            .running = &self.running,
+        });
+        defer raw_srv.deinit();
+
+        std.log.info("TurboDB HTTP nanoapi.raw runtime listening on :{d}", .{self.port});
+        try raw_srv.listenAndServe();
+    }
+
     pub fn runUnix(self: *Server, path: []const u8) !void {
         // Remove any existing socket file
         // Remove existing socket
@@ -356,6 +396,11 @@ pub const Server = struct {
 };
 
 threadlocal var tl_bulk_reservation: ?Server.BulkMemoryReservation = null;
+threadlocal var tl_raw_dispatch_bufs: ?*ConnBufs = null;
+
+const RawDispatchContext = struct {
+    srv: *Server,
+};
 
 const ParsedRequestTarget = struct {
     method: []const u8,
@@ -376,6 +421,65 @@ const BulkPreflight = union(enum) {
         message: []const u8,
     },
 };
+
+const RequestInput = struct {
+    buf: []u8,
+    head: usize = 0,
+    len: usize = 0,
+
+    fn bytes(self: *const RequestInput) []const u8 {
+        return self.buf[self.head .. self.head + self.len];
+    }
+
+    fn readAppend(self: *RequestInput, stream: compat.net.Stream) !bool {
+        if (self.head + self.len == self.buf.len) {
+            if (self.head == 0) return error.RequestTooLarge;
+            if (self.len > 0) {
+                std.mem.copyForwards(u8, self.buf[0..self.len], self.buf[self.head .. self.head + self.len]);
+            }
+            self.head = 0;
+        }
+
+        const tail_start = self.head + self.len;
+        const n = try stream.read(self.buf[tail_start..]);
+        if (n == 0) return false;
+        self.len += n;
+        return true;
+    }
+
+    fn consume(self: *RequestInput, amount: usize) void {
+        if (amount >= self.len) {
+            self.head = 0;
+            self.len = 0;
+            return;
+        }
+        self.head += amount;
+        self.len -= amount;
+    }
+};
+
+const HttpFrame = struct {
+    header_end: usize,
+    total_len: usize,
+    content_length: usize,
+};
+
+fn inspectHttpFrame(raw: []const u8) !HttpFrame {
+    const header_end = if (std.mem.indexOf(u8, raw, "\r\n\r\n")) |p|
+        p + 4
+    else if (std.mem.indexOf(u8, raw, "\n\n")) |p|
+        p + 2
+    else
+        return error.IncompleteRequestHead;
+
+    const content_length = extractContentLength(raw[0..header_end]);
+    const total_len = std.math.add(usize, header_end, content_length) catch return error.RequestTooLarge;
+    return .{
+        .header_end = header_end,
+        .total_len = total_len,
+        .content_length = content_length,
+    };
+}
 
 fn bulkGlobalMemoryLimit() usize {
     const explicit = compat.envUsize("TURBODB_BULK_MEMORY_LIMIT_BYTES", 0);
@@ -495,6 +599,63 @@ fn handleConnWrapped(srv: *Server, conn: compat.net.Server.Connection) void {
     handleConn(srv, conn);
 }
 
+fn getRawDispatchBufs() ?*ConnBufs {
+    if (tl_raw_dispatch_bufs) |bufs| return bufs;
+    const bufs = std.heap.page_allocator.create(ConnBufs) catch return null;
+    tl_raw_dispatch_bufs = bufs;
+    return bufs;
+}
+
+fn rawDispatch(ctx_opaque: *anyopaque, raw: []const u8, response: []u8) usize {
+    const ctx: *RawDispatchContext = @ptrCast(@alignCast(ctx_opaque));
+    const srv = ctx.srv;
+    const bufs = getRawDispatchBufs() orelse
+        return rawResponseError(response, 500, "Internal Server Error", "request buffers unavailable");
+
+    tl_bufs = bufs;
+    defer tl_bufs = null;
+    defer releaseThreadBulkReservation();
+
+    const frame = inspectHttpFrame(raw) catch
+        return rawResponseError(response, 400, "Bad Request", "bad request");
+    const header_bytes = raw[0..frame.header_end];
+
+    if (headerContains(header_bytes, "upgrade", "websocket")) {
+        return rawResponseError(response, 426, "Upgrade Required", "websocket requires threaded runtime");
+    }
+
+    switch (preflightBulkAdmission(srv, header_bytes, frame.content_length)) {
+        .not_bulk => {},
+        .reserved => |reservation| tl_bulk_reservation = reservation,
+        .reject => |rejection| {
+            const resp_len = err(rejection.code, rejection.message);
+            return copyRawResponse(response, bufs.resp[0..resp_len]);
+        },
+    }
+
+    _ = srv.req_count.fetchAdd(1, .monotonic);
+    const resp_len = dispatch(srv, raw, std.heap.page_allocator);
+    return copyRawResponse(response, bufs.resp[0..resp_len]);
+}
+
+fn copyRawResponse(dst: []u8, src: []const u8) usize {
+    if (src.len > dst.len) {
+        return rawResponseError(dst, 500, "Internal Server Error", "response too large");
+    }
+    @memcpy(dst[0..src.len], src);
+    return src.len;
+}
+
+fn rawResponseError(out: []u8, code: u16, status: []const u8, msg: []const u8) usize {
+    const body_len = msg.len + "{\"error\":\"\"}".len;
+    const bytes = std.fmt.bufPrint(
+        out,
+        "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{{\"error\":\"{s}\"}}",
+        .{ code, status, body_len, msg },
+    ) catch return 0;
+    return bytes.len;
+}
+
 fn handleConn(srv: *Server, conn: compat.net.Server.Connection) void {
     defer conn.stream.close();
 
@@ -505,76 +666,132 @@ fn handleConn(srv: *Server, conn: compat.net.Server.Connection) void {
     tl_bufs = bufs;
     defer tl_bufs = null;
 
+    var input = RequestInput{ .buf = bufs.req[0..] };
+    var write_len: usize = 0;
+
     while (true) {
-        var n = conn.stream.read(&bufs.req) catch return;
-        if (n == 0) return;
-        _ = srv.req_count.fetchAdd(1, .monotonic);
-
-        const initial = bufs.req[0..n];
-
-        // WebSocket upgrade: switch to persistent framed mode.
-        if (headerContains(initial, "upgrade", "websocket")) {
-            handleWebSocket(srv, conn, initial) catch {};
-            return; // WS handler owns the connection until close
+        if (input.len == 0) {
+            flushResponseBatch(conn, bufs, &write_len) catch return;
+            if ((input.readAppend(conn.stream) catch return) == false) return;
         }
 
-        // Read the full body based on Content-Length. The initial read may only
-        // contain part of a large body.
-        const content_length = extractContentLength(initial);
-        if (content_length > 0) {
-            const header_end = if (std.mem.indexOf(u8, initial, "\r\n\r\n")) |p| p + 4 else if (std.mem.indexOf(u8, initial, "\n\n")) |p| p + 2 else n;
-            const total_size = header_end + content_length;
-            if (content_length > MAX_BULK) {
+        while (input.len > 0) {
+            const current = input.bytes();
+            const frame = inspectHttpFrame(current) catch |e| switch (e) {
+                error.IncompleteRequestHead => {
+                    flushResponseBatch(conn, bufs, &write_len) catch return;
+                    if ((input.readAppend(conn.stream) catch return) == false) return;
+                    continue;
+                },
+                error.RequestTooLarge => {
+                    flushResponseBatch(conn, bufs, &write_len) catch return;
+                    const resp_len = err(413, "request too large");
+                    conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
+                    return;
+                },
+            };
+
+            if (frame.content_length > MAX_BULK) {
+                flushResponseBatch(conn, bufs, &write_len) catch return;
                 const resp_len = err(413, "request too large");
                 conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
                 return;
             }
 
-            switch (preflightBulkAdmission(srv, initial, content_length)) {
+            const header_bytes = current[0..frame.header_end];
+            // WebSocket upgrade: switch to persistent framed mode.
+            if (headerContains(header_bytes, "upgrade", "websocket")) {
+                flushResponseBatch(conn, bufs, &write_len) catch return;
+                handleWebSocket(srv, conn, current[0..@min(current.len, frame.total_len)]) catch {};
+                return; // WS handler owns the connection until close
+            }
+
+            if (frame.total_len > input.buf.len) {
+                const local_preflight = preflightBulkAdmission(srv, header_bytes, frame.content_length);
+                switch (local_preflight) {
+                    .not_bulk => {},
+                    .reserved => |reservation| tl_bulk_reservation = reservation,
+                    .reject => |rejection| {
+                        flushResponseBatch(conn, bufs, &write_len) catch return;
+                        const resp_len = err(rejection.code, rejection.message);
+                        conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
+                        return;
+                    },
+                }
+
+                var n = current.len;
+                const big_buf = std.heap.page_allocator.alloc(u8, frame.total_len) catch {
+                    releaseThreadBulkReservation();
+                    flushResponseBatch(conn, bufs, &write_len) catch return;
+                    const resp_len = err(500, "request allocation failed");
+                    conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
+                    return;
+                };
+                defer std.heap.page_allocator.free(big_buf);
+                @memcpy(big_buf[0..n], current);
+                while (n < frame.total_len) {
+                    const r = conn.stream.read(big_buf[n..frame.total_len]) catch {
+                        releaseThreadBulkReservation();
+                        return;
+                    };
+                    if (r == 0) {
+                        releaseThreadBulkReservation();
+                        return;
+                    }
+                    n += r;
+                }
+                _ = srv.req_count.fetchAdd(1, .monotonic);
+                const resp_len = dispatch(srv, big_buf[0..frame.total_len], std.heap.page_allocator);
+                releaseThreadBulkReservation();
+                queueResponse(conn, bufs, &write_len, bufs.resp[0..resp_len]) catch return;
+                input.consume(input.len);
+                continue;
+            }
+
+            if (current.len < frame.total_len) {
+                flushResponseBatch(conn, bufs, &write_len) catch return;
+                if ((input.readAppend(conn.stream) catch return) == false) return;
+                continue;
+            }
+
+            const raw = current[0..frame.total_len];
+            switch (preflightBulkAdmission(srv, header_bytes, frame.content_length)) {
                 .not_bulk => {},
                 .reserved => |reservation| tl_bulk_reservation = reservation,
                 .reject => |rejection| {
+                    flushResponseBatch(conn, bufs, &write_len) catch return;
                     const resp_len = err(rejection.code, rejection.message);
                     conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
                     return;
                 },
             }
 
-            if (total_size > bufs.req.len) {
-                const big_buf = std.heap.page_allocator.alloc(u8, total_size) catch {
-                    releaseThreadBulkReservation();
-                    const resp_len = err(500, "request allocation failed");
-                    conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
-                    return;
-                };
-                defer std.heap.page_allocator.free(big_buf);
-                @memcpy(big_buf[0..n], initial);
-                // Read remaining bytes
-                while (n < total_size) {
-                    const r = conn.stream.read(big_buf[n..total_size]) catch break;
-                    if (r == 0) break;
-                    n += r;
-                }
-                const resp_len = dispatch(srv, big_buf[0..n], std.heap.page_allocator);
-                releaseThreadBulkReservation();
-                conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
-                continue;
-            } else {
-                while (n < total_size) {
-                    const r = conn.stream.read(bufs.req[n..total_size]) catch break;
-                    if (r == 0) break;
-                    n += r;
-                }
-                const resp_len = dispatch(srv, bufs.req[0..n], std.heap.page_allocator);
-                releaseThreadBulkReservation();
-                conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
-                continue;
-            }
+            _ = srv.req_count.fetchAdd(1, .monotonic);
+            const resp_len = dispatch(srv, raw, std.heap.page_allocator);
+            releaseThreadBulkReservation();
+            queueResponse(conn, bufs, &write_len, bufs.resp[0..resp_len]) catch return;
+            input.consume(frame.total_len);
         }
-
-        const resp_len = dispatch(srv, initial, std.heap.page_allocator);
-        conn.stream.writeAll(bufs.resp[0..resp_len]) catch return;
     }
+}
+
+fn flushResponseBatch(conn: compat.net.Server.Connection, bufs: *ConnBufs, write_len: *usize) !void {
+    if (write_len.* == 0) return;
+    const bytes = bufs.write[0..write_len.*];
+    write_len.* = 0;
+    try conn.stream.writeAll(bytes);
+}
+
+fn queueResponse(conn: compat.net.Server.Connection, bufs: *ConnBufs, write_len: *usize, response: []const u8) !void {
+    if (response.len > bufs.write.len) {
+        try flushResponseBatch(conn, bufs, write_len);
+        return conn.stream.writeAll(response);
+    }
+    if (write_len.* + response.len > bufs.write.len) {
+        try flushResponseBatch(conn, bufs, write_len);
+    }
+    @memcpy(bufs.write[write_len.*..][0..response.len], response);
+    write_len.* += response.len;
 }
 fn dispatch(srv: *Server, raw: []const u8, alloc: std.mem.Allocator) usize {
     // Parse request line.
@@ -2578,6 +2795,21 @@ test "respond writes bodies larger than format scratch buffer" {
     try std.testing.expect(n > body.len);
     try std.testing.expect(std.mem.indexOf(u8, bufs.resp[0..n], "\r\n\r\n") != null);
     try std.testing.expect(std.mem.endsWith(u8, bufs.resp[0..n], body[0..]));
+}
+
+test "HTTP frame parser preserves pipelined request boundary" {
+    const raw =
+        "POST /db/users HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc" ++
+        "GET /health HTTP/1.1\r\n\r\n";
+    const frame = try inspectHttpFrame(raw);
+    try std.testing.expectEqual(@as(usize, "POST /db/users HTTP/1.1\r\nContent-Length: 3\r\n\r\nabc".len), frame.total_len);
+    try std.testing.expectEqual(@as(usize, 3), frame.content_length);
+
+    var backing: [128]u8 = undefined;
+    @memcpy(backing[0..raw.len], raw);
+    var input = RequestInput{ .buf = backing[0..], .len = raw.len };
+    input.consume(frame.total_len);
+    try std.testing.expectEqualStrings("GET /health HTTP/1.1\r\n\r\n", input.bytes());
 }
 
 test "read-only auth cannot write basic db methods" {

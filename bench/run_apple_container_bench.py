@@ -208,7 +208,7 @@ class BenchRun:
         name = self.name("turbodb")
         data_volume = self.volume("turbodb-data")
         delete_container(name)
-        run([
+        cmd = [
             "container", "run", "-d",
             "--name", name,
             "--network", self.network,
@@ -219,7 +219,10 @@ class BenchRun:
             "--data", "/data",
             "--port", "27017",
             "--http",
-        ])
+        ]
+        if self.args.turbodb_http_runtime:
+            cmd.extend(["--http-runtime", self.args.turbodb_http_runtime])
+        run(cmd)
         self.containers.append(name)
         host = container_ip(name)
         wait_http(self.network, f"http://{host}:27017/health", timeout_s=60)
@@ -397,6 +400,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--turbodb-ffi-lib", default="/work/zig-out-ffi/lib/libturbodb.so")
     ap.add_argument("--turbodb-ffi-dir", default="/tmp/turbodb_ffi_shape_bench")
     ap.add_argument("--turbodb-bulk-mode", choices=("ndjson", "binary"), default="ndjson")
+    ap.add_argument("--turbodb-http-runtime", choices=("threaded", "nanoapi-raw"), default=None)
     ap.add_argument("--python-image", default="python:3.12-slim")
     ap.add_argument("--postgres-image", default="postgres:18")
     ap.add_argument("--mysql-image", default="mysql:8.4")

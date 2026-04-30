@@ -18,6 +18,7 @@ pub fn main(init: std.process.Init) !void {
     var port: u16 = 27017;
     var use_wire: bool = true; // wire protocol by default
     var use_http: bool = false;
+    var http_runtime: server.HttpRuntime = .threaded;
     var unix_path: ?[]const u8 = null;
     var auth_key: ?[]const u8 = null;
 
@@ -31,9 +32,11 @@ pub fn main(init: std.process.Init) !void {
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--data") and i + 1 < args.len) {
-            i += 1; data_dir = args[i];
+            i += 1;
+            data_dir = args[i];
         } else if (std.mem.eql(u8, args[i], "--port") and i + 1 < args.len) {
-            i += 1; port = try std.fmt.parseInt(u16, args[i], 10);
+            i += 1;
+            port = try std.fmt.parseInt(u16, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--wire")) {
             use_wire = true;
             use_http = false;
@@ -43,6 +46,18 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--both")) {
             use_wire = true;
             use_http = true;
+        } else if (std.mem.eql(u8, args[i], "--http-runtime") and i + 1 < args.len) {
+            i += 1;
+            if (std.mem.eql(u8, args[i], "threaded")) {
+                http_runtime = .threaded;
+            } else if (std.mem.eql(u8, args[i], "nanoapi-raw")) {
+                http_runtime = .nanoapi_raw;
+            } else {
+                std.log.err("unknown HTTP runtime: {s}", .{args[i]});
+                return error.InvalidArgument;
+            }
+        } else if (std.mem.eql(u8, args[i], "--http-nanoapi-raw")) {
+            http_runtime = .nanoapi_raw;
         } else if (std.mem.eql(u8, args[i], "--unix") and i + 1 < args.len) {
             i += 1;
             unix_path = args[i];
@@ -71,6 +86,8 @@ pub fn main(init: std.process.Init) !void {
                 \\  --wire             binary wire protocol (default)
                 \\  --http             HTTP REST API
                 \\  --both             run wire + HTTP (wire on port, HTTP on port+1)
+                \\  --http-runtime <r> HTTP runtime: threaded, nanoapi-raw
+                \\  --http-nanoapi-raw shortcut for --http-runtime nanoapi-raw
                 \\  --unix <path>      also listen on a Unix domain socket
                 \\  --auth-key <key>   require this API key for all requests
                 \\
@@ -164,13 +181,13 @@ pub fn main(init: std.process.Init) !void {
 
     if (use_http and use_wire) {
         // Run HTTP in a background thread, wire in foreground
-        const http_thread = try std.Thread.spawn(.{}, server.Server.run, .{&http_srv});
+        const http_thread = try std.Thread.spawn(.{}, server.Server.runWithRuntime, .{ &http_srv, http_runtime });
         _ = http_thread;
         try wire_srv.run();
     } else if (use_wire) {
         try wire_srv.run();
     } else {
-        try http_srv.run();
+        try http_srv.runWithRuntime(http_runtime);
     }
     std.log.info("TurboDB stopped.", .{});
 }

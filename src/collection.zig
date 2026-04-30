@@ -28,6 +28,7 @@ pub const MAX_TENANT_ID_LEN: usize = 64;
 pub const MAX_COLLECTION_NAME_LEN: usize = 64;
 const DEFAULT_INDEX_QUEUE_MEMORY_LIMIT: usize = 64 * 1024 * 1024;
 const INDEX_QUEUE_MEMORY_FRACTION: usize = 16;
+const DEFAULT_TEXT_INDEX_MIN_VALUE_BYTES: usize = 128;
 
 fn writeCommittedDocumentWal(wal_log: *WAL, op: wal_mod.OpCode, payload: []const u8) !void {
     const txn = wal_log.next_lsn.load(.monotonic);
@@ -49,6 +50,10 @@ fn indexQueueMemoryLimit() usize {
 
 fn indexEntryBytes(key: []const u8, value: []const u8) usize {
     return std.math.add(usize, key.len, value.len) catch std.math.maxInt(usize);
+}
+
+fn textIndexMinValueBytes() usize {
+    return compat.envUsize("TURBODB_TEXT_INDEX_MIN_VALUE_BYTES", DEFAULT_TEXT_INDEX_MIN_VALUE_BYTES);
 }
 
 // ─── IndexQueue ──────────────────────────────────────────────────────────
@@ -272,6 +277,7 @@ pub const Collection = struct {
     queue_toggle: std.atomic.Value(u32),
     indexing_count: std.atomic.Value(u32),
     index_queue_bytes: std.atomic.Value(usize),
+    text_index_min_value_bytes: usize,
 
     // Vector embedding column (optional)
     vectors: ?*vector.VectorColumn = null,
@@ -330,6 +336,7 @@ pub const Collection = struct {
         col.queue_toggle = std.atomic.Value(u32).init(0);
         col.indexing_count = std.atomic.Value(u32).init(0);
         col.index_queue_bytes = std.atomic.Value(usize).init(0);
+        col.text_index_min_value_bytes = textIndexMinValueBytes();
         col.vectors = null;
         col.vector_field_len = 0;
         col.vec_entries = .empty;
@@ -415,9 +422,11 @@ pub const Collection = struct {
         return self.name_buf[0..self.name_len];
     }
 
-    /// Return the number of live indexed documents (excludes deleted docs).
-    pub fn docCount(self: *const Collection) u64 {
-        return @intCast(self.tri.fileCount());
+    /// Return the number of live key entries (excludes deleted docs).
+    pub fn docCount(self: *Collection) u64 {
+        self.meta_mu.lock();
+        defer self.meta_mu.unlock();
+        return @intCast(self.hash_idx.count());
     }
 
     pub fn storageBytes(self: *const Collection) usize {
@@ -893,7 +902,7 @@ pub const Collection = struct {
         const terms = terms_buf[0..term_count];
 
         // For single terms or exact phrase, try trigram index on full query first.
-        if (term_count == 1) {
+        if (term_count == 1 and self.hasCompleteTextIndex()) {
             const cand_paths = self.tri.candidates(query, alloc) orelse {
                 return self.bruteForceSearch(query, limit, alloc);
             };
@@ -920,6 +929,10 @@ pub const Collection = struct {
         var longest_idx: usize = 0;
         for (terms, 0..) |t, i| {
             if (t.len > terms[longest_idx].len) longest_idx = i;
+        }
+
+        if (!self.hasCompleteTextIndex()) {
+            return self.multiTermBruteForce(terms, limit, alloc);
         }
 
         const cand_paths = self.tri.candidates(terms[longest_idx], alloc) orelse {
@@ -1140,6 +1153,17 @@ pub const Collection = struct {
         return @ptrCast(@alignCast(data[entry.page_off..].ptr));
     }
 
+    fn shouldIndexText(self: *const Collection, value: []const u8) bool {
+        return value.len >= self.text_index_min_value_bytes;
+    }
+
+    fn hasCompleteTextIndex(self: *Collection) bool {
+        self.meta_mu.lock();
+        const live_docs = self.hash_idx.count();
+        self.meta_mu.unlock();
+        return live_docs > 0 and self.tri.fileCount() >= live_docs;
+    }
+
     fn findOrAllocLeaf(self: *Collection, needed: usize) !u32 {
         if (self.append_leaf_hint != 0) {
             const ph = self.pf.pageHeader(self.append_leaf_hint);
@@ -1191,7 +1215,7 @@ pub const Collection = struct {
                 if (d.header.flags & DocHeader.DELETED == 0) {
                     self.hash_idx.put(d.header.key_hash, entry) catch {};
                     self.key_doc_ids.put(d.header.key_hash, d.header.doc_id) catch {};
-                    if (d.value.len >= 3) {
+                    if (self.shouldIndexText(d.value)) {
                         self.tri.indexFile(d.key, d.value) catch {};
                         self.words.indexFile(d.key, d.value) catch {};
                     }
@@ -1214,7 +1238,7 @@ pub const Collection = struct {
     }
 
     fn enqueueTextIndex(self: *Collection, key: []const u8, value: []const u8) void {
-        if (value.len < 3) return;
+        if (!self.shouldIndexText(value)) return;
         if (self.index_thread == null and self.index_thread2 == null) {
             self.tri.indexFile(key, value) catch {};
             self.words.indexFile(key, value) catch {};
@@ -1261,7 +1285,7 @@ pub const Collection = struct {
     }
 
     fn enqueueStoredTextIndex(self: *Collection, entry: BTreeEntry, key: []const u8, value: []const u8) void {
-        if (value.len < 3) return;
+        if (!self.shouldIndexText(value)) return;
         if (self.index_thread == null and self.index_thread2 == null) {
             self.tri.indexFile(key, value) catch {};
             self.words.indexFile(key, value) catch {};
@@ -1802,10 +1826,16 @@ fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
             const entry = queue.pop() orelse break;
             if (entry.stored) {
                 const doc = col.readEntry(entry.loc) orelse continue;
-                if (doc.value.len < 3) continue;
+                if (!col.shouldIndexText(doc.value)) continue;
                 batch_keys[n] = doc.key;
                 batch_vals[n] = doc.value;
             } else {
+                if (!col.shouldIndexText(entry.value)) {
+                    col.releaseIndexQueueBytes(entry.queued_bytes);
+                    col.alloc.free(entry.value);
+                    col.alloc.free(entry.key);
+                    continue;
+                }
                 batch_keys[n] = entry.key;
                 batch_vals[n] = entry.value;
             }
@@ -1837,12 +1867,15 @@ fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
     while (queue.pop()) |entry| {
         if (entry.stored) {
             if (col.readEntry(entry.loc)) |doc| {
+                if (!col.shouldIndexText(doc.value)) continue;
                 col.tri.indexFile(doc.key, doc.value) catch {};
                 col.words.indexFile(doc.key, doc.value) catch {};
             }
         } else {
-            col.tri.indexFile(entry.key, entry.value) catch {};
-            col.words.indexFile(entry.key, entry.value) catch {};
+            if (col.shouldIndexText(entry.value)) {
+                col.tri.indexFile(entry.key, entry.value) catch {};
+                col.words.indexFile(entry.key, entry.value) catch {};
+            }
             col.releaseIndexQueueBytes(entry.queued_bytes);
             col.alloc.free(entry.value);
             col.alloc.free(entry.key);
@@ -2522,6 +2555,29 @@ test "collection scan limit zero returns no documents" {
     var result = try col.scan(0, 0, alloc);
     defer result.deinit();
     try std.testing.expectEqual(@as(usize, 0), result.docs.len);
+}
+
+test "small structured docs skip automatic text index and search falls back" {
+    const alloc = std.testing.allocator;
+    const tmp_dir = "/tmp/turbodb_small_doc_text_index_skip";
+    compat.cwd().deleteTree(tmp_dir) catch {};
+    try compat.cwd().makePath(tmp_dir);
+    defer compat.cwd().deleteTree(tmp_dir) catch {};
+
+    const db = try Database.open(alloc, tmp_dir);
+    defer db.close();
+
+    const col = try db.collection("events");
+    _ = try col.insert("small", "{\"kind\":\"tiny\"}");
+    _ = try col.insert("large", "{\"body\":\"needle abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789\"}");
+    col.flushIndex();
+
+    try std.testing.expectEqual(@as(u32, 1), col.tri.fileCount());
+
+    const result = try col.searchText("tiny", 10, alloc);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.docs.len);
+    try std.testing.expectEqualStrings("small", result.docs[0].key);
 }
 
 test "tenant quotas apply per tenant" {

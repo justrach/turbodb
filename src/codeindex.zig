@@ -138,6 +138,12 @@ pub const WordIndex = struct {
             }
         }
 
+        if (words_set.count() == 0) {
+            words_set.deinit();
+            self.allocator.free(owned_path);
+            return;
+        }
+
         try self.file_words.put(owned_path, words_set);
     }
 
@@ -181,6 +187,24 @@ pub const WordIndex = struct {
         return result.toOwnedSlice(allocator);
     }
 };
+
+test "WordIndex skips empty per-file bookkeeping after hit cap" {
+    const alloc = std.testing.allocator;
+    var idx = WordIndex.init(alloc);
+    defer idx.deinit();
+
+    var saturated: std.ArrayList(WordHit) = .empty;
+    try saturated.ensureTotalCapacity(alloc, WordIndex.MAX_HITS_PER_WORD);
+    for (0..WordIndex.MAX_HITS_PER_WORD) |_| {
+        saturated.appendAssumeCapacity(.{ .path = "existing", .line_num = 1 });
+    }
+
+    const owned_word = try alloc.dupe(u8, "common");
+    try idx.index.put(owned_word, saturated);
+
+    try idx.indexFile("overflow", "common common common");
+    try std.testing.expectEqual(@as(usize, 0), idx.file_words.count());
+}
 
 // ── Trigram index ───────────────────────────────────────────
 // Maps 3-byte sequences → set of file paths.

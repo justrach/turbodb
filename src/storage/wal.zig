@@ -112,12 +112,15 @@ pub const WAL = struct {
     file: compat.File,
     uring: ?compat.LinuxUring,
     write_buf: std.ArrayList(u8), // pending (not yet flushed)
+    spare_buf: std.ArrayList(u8), // reusable buffer from the previous flush
     next_lsn: std.atomic.Value(u64),
     checkpoint_lsn: u64,
+    buffered_lsn: u64,
     append_offset: u64,
     uring_flushes: usize,
     sync_flushes: usize,
     uring_min_write_and_sync: usize,
+    max_write_buf: usize,
     allocator: std.mem.Allocator,
 
     // Group commit state — guarded by mu
@@ -132,7 +135,8 @@ pub const WAL = struct {
     flush_running: std.atomic.Value(bool),
 
     /// Backpressure: block writers if pending buffer exceeds this.
-    const MAX_WRITE_BUF: usize = 8 * 1024 * 1024; // 8 MiB
+    const DEFAULT_MAX_WRITE_BUF: usize = 32 * 1024 * 1024; // 32 MiB
+    const DEFAULT_INITIAL_WRITE_BUF: usize = 1024 * 1024; // 1 MiB
     const DEFAULT_URING_MIN_WRITE_AND_SYNC: usize = 32 * 1024;
 
     // ── Lifecycle ─────────────────────────────────────────────────────────────
@@ -144,16 +148,19 @@ pub const WAL = struct {
             break :blk compat.File{ .handle = fd };
         };
         const end = std.c.lseek(f.handle, 0, std.c.SEEK.END);
-        const wal = WAL{
+        var wal = WAL{
             .file = f,
             .uring = compat.initLinuxUring(8),
             .write_buf = .empty,
+            .spare_buf = .empty,
             .next_lsn = std.atomic.Value(u64).init(1),
             .checkpoint_lsn = 0,
+            .buffered_lsn = 0,
             .append_offset = if (end >= 0) @intCast(end) else 0,
             .uring_flushes = 0,
             .sync_flushes = 0,
             .uring_min_write_and_sync = compat.envUsize("TURBODB_IO_URING_MIN_BYTES", DEFAULT_URING_MIN_WRITE_AND_SYNC),
+            .max_write_buf = compat.envUsize("TURBODB_WAL_MAX_BUFFER_BYTES", DEFAULT_MAX_WRITE_BUF),
             .allocator = allocator,
             .mu = .{},
             .cond = .{},
@@ -163,6 +170,13 @@ pub const WAL = struct {
             .flush_thread = null,
             .flush_running = std.atomic.Value(bool).init(false),
         };
+        const initial_write_buf = compat.envUsize("TURBODB_WAL_INITIAL_BUFFER_BYTES", DEFAULT_INITIAL_WRITE_BUF);
+        if (initial_write_buf > 0) {
+            wal.write_buf.ensureTotalCapacity(allocator, initial_write_buf) catch |e| {
+                wal.close();
+                return e;
+            };
+        }
         return wal;
     }
 
@@ -198,15 +212,14 @@ pub const WAL = struct {
             return;
         }
         self.flushing = true;
-        var to_write = self.write_buf;
-        const target = self.next_lsn.load(.monotonic) -| 1;
-        self.write_buf = .empty;
+        const target = self.buffered_lsn;
+        var to_write = self.takeWriteBufferForFlush();
         self.mu.unlock();
 
         const io_err = self.writeAndSync(to_write.items);
-        to_write.deinit(self.allocator);
 
         self.mu.lock();
+        self.recycleFlushedBuffer(&to_write);
         if (io_err) |e| {
             self.last_flush_error = e;
         } else {
@@ -240,6 +253,7 @@ pub const WAL = struct {
         // Flush any remaining entries
         self.flushPending();
         self.write_buf.deinit(self.allocator);
+        self.spare_buf.deinit(self.allocator);
         if (self.uring) |*ring| {
             compat.deinitLinuxUring(ring);
             self.uring = null;
@@ -251,7 +265,7 @@ pub const WAL = struct {
 
     /// Encode an entry into the shared write buffer and return its LSN.
     /// Thread-safe.  Does NOT guarantee durability — call commit(txn_id, db_tag) for that.
-    /// Blocks if write buffer exceeds MAX_WRITE_BUF to apply backpressure.
+    /// Blocks if the write buffer exceeds the configured backpressure limit.
     pub fn write(
         self: *WAL,
         txn_id: u64,
@@ -262,9 +276,29 @@ pub const WAL = struct {
     ) !u64 {
         if (payload.len > MAX_ENTRY_PAYLOAD) return error.WALPayloadTooLarge;
 
-        const lsn = self.next_lsn.fetchAdd(1, .monotonic);
         const pad = paddingTo8(HEADER_SIZE + payload.len);
+        const entry_size = HEADER_SIZE + payload.len + pad;
 
+        self.mu.lock();
+        if (self.last_flush_error) |e| {
+            self.mu.unlock();
+            return e;
+        }
+        // Backpressure: wait until flusher drains the buffer below threshold.
+        // Use condition variable instead of yield-loop so the flusher can wake us.
+        while (self.write_buf.items.len >= self.maxWriteBuf()) {
+            if (self.last_flush_error) |e| {
+                self.mu.unlock();
+                return e;
+            }
+            // Release lock and wait for flusher to signal.
+            self.cond.wait(&self.mu);
+        }
+        self.write_buf.ensureUnusedCapacity(self.allocator, entry_size) catch |e| {
+            self.mu.unlock();
+            return e;
+        };
+        const lsn = self.next_lsn.fetchAdd(1, .monotonic);
         var hdr = EntryHeader{
             .lsn = lsn,
             .length = @intCast(payload.len),
@@ -277,26 +311,11 @@ pub const WAL = struct {
         };
         const hdr_bytes = std.mem.asBytes(&hdr);
         hdr.crc32 = entryChecksum(hdr_bytes, payload);
-
-        self.mu.lock();
-        if (self.last_flush_error) |e| {
-            self.mu.unlock();
-            return e;
-        }
-        // Backpressure: wait until flusher drains the buffer below threshold.
-        // Use condition variable instead of yield-loop so the flusher can wake us.
-        while (self.write_buf.items.len >= MAX_WRITE_BUF) {
-            if (self.last_flush_error) |e| {
-                self.mu.unlock();
-                return e;
-            }
-            // Release lock and wait for flusher to signal.
-            self.cond.wait(&self.mu);
-        }
         defer self.mu.unlock();
-        try self.write_buf.appendSlice(self.allocator, std.mem.asBytes(&hdr));
-        try self.write_buf.appendSlice(self.allocator, payload);
-        if (pad > 0) try self.write_buf.appendNTimes(self.allocator, 0, pad);
+        self.write_buf.appendSliceAssumeCapacity(std.mem.asBytes(&hdr));
+        self.write_buf.appendSliceAssumeCapacity(payload);
+        if (pad > 0) self.write_buf.appendNTimesAssumeCapacity(0, pad);
+        self.buffered_lsn = lsn;
         return lsn;
     }
 
@@ -336,7 +355,7 @@ pub const WAL = struct {
             self.mu.unlock();
             return e;
         }
-        while (self.write_buf.items.len >= MAX_WRITE_BUF) {
+        while (self.write_buf.items.len >= self.maxWriteBuf()) {
             if (self.last_flush_error) |e| {
                 self.mu.unlock();
                 return e;
@@ -368,6 +387,7 @@ pub const WAL = struct {
             self.write_buf.appendSliceAssumeCapacity(payload);
             if (pad > 0) self.write_buf.appendNTimesAssumeCapacity(0, pad);
         }
+        self.buffered_lsn = start_lsn + @as(u64, @intCast(payloads.len - 1));
         self.mu.unlock();
 
         return start_lsn + @as(u64, @intCast(payloads.len - 1));
@@ -393,15 +413,14 @@ pub const WAL = struct {
             }
 
             self.flushing = true;
-            var to_write: std.ArrayList(u8) = self.write_buf;
-            const flushed_lsn = self.next_lsn.load(.monotonic) - 1;
-            self.write_buf = .empty;
+            const flushed_lsn = self.buffered_lsn;
+            var to_write = self.takeWriteBufferForFlush();
             self.mu.unlock();
 
             const io_err = self.writeAndSync(to_write.items);
-            to_write.deinit(self.allocator);
 
             self.mu.lock();
+            self.recycleFlushedBuffer(&to_write);
             if (io_err) |e| {
                 self.last_flush_error = e;
             } else {
@@ -452,17 +471,16 @@ pub const WAL = struct {
             // We are the flusher
             self.flushing = true;
             // Snapshot the buffer and target LSN under the lock
-            var to_write: std.ArrayList(u8) = self.write_buf;
-            const target = self.next_lsn.load(.monotonic) - 1;
-            self.write_buf = .empty;
+            const target = self.buffered_lsn;
+            var to_write = self.takeWriteBufferForFlush();
             self.mu.unlock();
 
             // ── I/O outside lock ──────────────────────────────────────────────
             const io_err = self.writeAndSync(to_write.items);
-            to_write.deinit(self.allocator);
             // ─────────────────────────────────────────────────────────────────
 
             self.mu.lock();
+            self.recycleFlushedBuffer(&to_write);
             if (io_err) |e| {
                 self.last_flush_error = e;
             } else {
@@ -497,13 +515,12 @@ pub const WAL = struct {
             return e;
         }
         self.flushing = true;
-        var to_write = self.write_buf;
-        self.write_buf = .empty;
+        var to_write = self.takeWriteBufferForFlush();
         self.mu.unlock();
         const io_err = self.writeAndSync(to_write.items);
-        to_write.deinit(self.allocator);
         if (io_err) |e| {
             self.mu.lock();
+            self.recycleFlushedBuffer(&to_write);
             self.last_flush_error = e;
             self.flushing = false;
             self.cond.broadcast();
@@ -517,6 +534,7 @@ pub const WAL = struct {
         self.append_offset = 0;
 
         self.mu.lock();
+        self.recycleFlushedBuffer(&to_write);
         self.synced_lsn = lsn;
         self.last_flush_error = null;
         self.flushing = false;
@@ -582,6 +600,31 @@ pub const WAL = struct {
 
     inline fn paddingTo8(n: usize) usize {
         return (8 - (n % 8)) % 8;
+    }
+
+    fn maxWriteBuf(self: *const WAL) usize {
+        return @max(self.max_write_buf, HEADER_SIZE + 1);
+    }
+
+    fn takeWriteBufferForFlush(self: *WAL) std.ArrayList(u8) {
+        const to_write = self.write_buf;
+        self.write_buf = self.spare_buf;
+        self.spare_buf = .empty;
+        self.write_buf.clearRetainingCapacity();
+        self.cond.broadcast();
+        return to_write;
+    }
+
+    fn recycleFlushedBuffer(self: *WAL, flushed: *std.ArrayList(u8)) void {
+        flushed.clearRetainingCapacity();
+        if (self.write_buf.items.len == 0) {
+            self.write_buf.deinit(self.allocator);
+            self.write_buf = flushed.*;
+        } else {
+            self.spare_buf.deinit(self.allocator);
+            self.spare_buf = flushed.*;
+        }
+        flushed.* = .empty;
     }
 
     fn writeAndSync(self: *WAL, bytes: []const u8) ?anyerror {
@@ -786,6 +829,26 @@ test "writeCommitted buffers committed entry without forcing fsync" {
         try std.testing.expect((ReplayProbe.last_flags & FLAG_COMMIT) != 0);
         try std.testing.expectEqualStrings("inline", ReplayProbe.payload());
     }
+}
+
+test "flushPending only marks buffered LSNs durable" {
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testingWalPath(allocator, &tmp, "buffered-target.wal");
+    defer allocator.free(path);
+
+    var wal = try WAL.open(path, allocator);
+    const lsn = try wal.writeCommitted(41, .doc_insert, DB_TAG_DOC, "inline");
+
+    _ = wal.next_lsn.fetchAdd(5, .monotonic);
+    wal.flushPending();
+
+    try std.testing.expectEqual(lsn, wal.synced_lsn);
+    try std.testing.expectEqual(@as(usize, 0), wal.write_buf.items.len);
+
+    wal.close();
 }
 
 test "writeCommittedBatch plus flushUpTo durably replays all entries" {

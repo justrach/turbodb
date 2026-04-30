@@ -4,6 +4,12 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
+    const nanoapi_dep = b.dependency("nanoapi", .{
+        .target = target,
+        .optimize = optimize,
+    });
+    const nanoapi_mod = nanoapi_dep.module("nanoapi");
+
     // ── Compat module (Zig 0.16 compatibility layer) ─────────────────────────
     const compat_mod = b.createModule(.{
         .root_source_file = b.path("src/compat.zig"),
@@ -42,7 +48,6 @@ pub fn build(b: *std.Build) void {
     });
     wal_mod.addImport("compat", compat_mod);
 
-
     // ── Helper: wire storage imports into a module ──────────────────────────
     const wireStorage = struct {
         fn f(mod: *std.Build.Module, mmap: *std.Build.Module, wal: *std.Build.Module, epoch: *std.Build.Module, seqlock: *std.Build.Module, compat: *std.Build.Module) void {
@@ -62,6 +67,7 @@ pub fn build(b: *std.Build) void {
         .link_libc = true,
     });
     wireStorage(turbodb_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod, compat_mod);
+    turbodb_mod.addImport("nanoapi", nanoapi_mod);
 
     const turbodb = b.addExecutable(.{
         .name = "turbodb",
@@ -195,7 +201,7 @@ pub fn build(b: *std.Build) void {
     const profile_mod = b.createModule(.{
         .root_source_file = b.path("src/profile_index.zig"),
         .target = target,
-        .optimize = .ReleaseSafe,  // ALWAYS safe — catches segfaults
+        .optimize = .ReleaseSafe, // ALWAYS safe — catches segfaults
         .link_libc = true,
     });
     wireStorage(profile_mod, mmap_mod, wal_mod, epoch_mod, seqlock_mod, compat_mod);
@@ -231,6 +237,36 @@ pub fn build(b: *std.Build) void {
     bench_run.step.dependOn(b.getInstallStep());
     const bench_step = b.step("bench", "Run native Zig benchmark");
     bench_step.dependOn(&bench_run.step);
+
+    // ── NanoAPI agent proxy benchmark service ──────────────────────────────
+    const nano_proxy_mod = b.createModule(.{
+        .root_source_file = b.path("bench/nanoapi_agent_proxy.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    nano_proxy_mod.addImport("nanoapi", nanoapi_mod);
+
+    const nano_proxy_exe = b.addExecutable(.{
+        .name = "nanoapi-agent-proxy",
+        .root_module = nano_proxy_mod,
+    });
+    b.installArtifact(nano_proxy_exe);
+
+    // ── Wire2 native performance client ────────────────────────────────────
+    const wire2_perf_mod = b.createModule(.{
+        .root_source_file = b.path("bench/wire2_perf_client.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    wire2_perf_mod.addImport("compat", compat_mod);
+
+    const wire2_perf_exe = b.addExecutable(.{
+        .name = "wire2-perf-client",
+        .root_module = wire2_perf_mod,
+    });
+    b.installArtifact(wire2_perf_exe);
 
     // ── WAL microbenchmark ──────────────────────────────────────────────────
     const walbench_mod = b.createModule(.{
@@ -311,7 +347,6 @@ pub fn build(b: *std.Build) void {
     const calvin_test_step = b.step("test-calvin", "Run Calvin replication E2E test");
     calvin_test_step.dependOn(&calvin_test_run.step);
 
-
     // ── Test steps ──────────────────────────────────────────────────────────
 
     // Helper: add a test module with storage imports
@@ -327,7 +362,7 @@ pub fn build(b: *std.Build) void {
             mod.addImport("wal", wl);
             mod.addImport("epoch", ep);
             mod.addImport("seqlock", sl);
-                mod.addImport("compat", cm);
+            mod.addImport("compat", cm);
             // Extract just the filename without path for the test name.
             const basename = std.fs.path.stem(src);
             return b2.addTest(.{ .name = basename, .root_module = mod });
@@ -394,6 +429,13 @@ pub fn build(b: *std.Build) void {
     const col_test = addTestMod(b, "src/collection.zig", target, optimize, mmap_mod, wal_mod, epoch_mod, seqlock_mod, compat_mod);
     const run_col_test = b.addRunArtifact(col_test);
     test_all_step.dependOn(&run_col_test.step);
+
+    // Wire protocol tests, including wire2 envelope and binary bulk routes.
+    const wire_test = addTestMod(b, "src/wire.zig", target, optimize, mmap_mod, wal_mod, epoch_mod, seqlock_mod, compat_mod);
+    const run_wire_test = b.addRunArtifact(wire_test);
+    const wire_test_step = b.step("test-wire", "Run wire protocol tests");
+    wire_test_step.dependOn(&run_wire_test.step);
+    test_all_step.dependOn(&run_wire_test.step);
 
     // Parallel WAL test
     const pwal_test = addTestMod(b, "src/storage/parallel_wal.zig", target, optimize, mmap_mod, wal_mod, epoch_mod, seqlock_mod, compat_mod);
