@@ -823,17 +823,43 @@ pub const Collection = struct {
         return self.words.search(word);
     }
 
+    const BruteForceNeedle = union(enum) {
+        phrase: []const u8,
+        terms: []const []const u8,
+    };
+
     fn bruteForceSearch(self: *Collection, query: []const u8, limit: u32, alloc: std.mem.Allocator) !TextSearchResult {
+        return self.bruteForceSearchMatching(.{ .phrase = query }, limit, alloc);
+    }
+
+    fn bruteForceSearchMatching(self: *Collection, needle: BruteForceNeedle, limit: u32, alloc: std.mem.Allocator) !TextSearchResult {
         var results: std.ArrayList(Doc) = .empty;
         errdefer results.deinit(alloc);
 
-        const result = try self.scan(limit * 10, 0, alloc);
-        defer result.deinit();
+        if (limit > 0) {
+            const total_pages = self.pf.next_alloc.load(.acquire);
+            var pno: u32 = 0;
+            outer: while (pno < total_pages) : (pno += 1) {
+                const ph = self.pf.pageHeader(pno);
+                if (@as(page_mod.PageType, @enumFromInt(ph.page_type)) != .leaf) continue;
+                const data = self.pf.pageData(pno);
+                var pos: usize = 0;
+                while (pos + DocHeader.size <= ph.used_bytes) {
+                    const rem = data[pos..ph.used_bytes];
+                    const decoded = doc_mod.decode(rem) catch break;
+                    const d = decoded.doc;
+                    pos += decoded.consumed;
+                    if (d.header.flags & DocHeader.DELETED != 0) continue;
 
-        for (result.docs) |d| {
-            if (results.items.len >= limit) break;
-            if (containsInsensitive(d.value, query)) {
-                try results.append(alloc, d);
+                    const matched = switch (needle) {
+                        .phrase => |query| containsInsensitive(d.value, query),
+                        .terms => |terms| containsAllTerms(d.value, terms),
+                    };
+                    if (matched) {
+                        try results.append(alloc, d);
+                        if (results.items.len >= limit) break :outer;
+                    }
+                }
             }
         }
 
@@ -877,25 +903,7 @@ pub const Collection = struct {
 
     /// Brute-force multi-term search (fallback when trigram index has no candidates).
     fn multiTermBruteForce(self: *Collection, terms: []const []const u8, limit: u32, alloc: std.mem.Allocator) !TextSearchResult {
-        var results: std.ArrayList(Doc) = .empty;
-        errdefer results.deinit(alloc);
-
-        const result = try self.scan(limit * 10, 0, alloc);
-        defer result.deinit();
-
-        for (result.docs) |d| {
-            if (results.items.len >= limit) break;
-            if (containsAllTerms(d.value, terms)) {
-                try results.append(alloc, d);
-            }
-        }
-
-        return TextSearchResult{
-            .docs = try results.toOwnedSlice(alloc),
-            .candidate_paths = &.{},
-            .total_files = 0,
-            .alloc = alloc,
-        };
+        return self.bruteForceSearchMatching(.{ .terms = terms }, limit, alloc);
     }
 
     // ─── scan ────────────────────────────────────────────────────────────
