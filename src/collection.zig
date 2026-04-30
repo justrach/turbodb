@@ -1,13 +1,13 @@
 /// TurboDB — Collection (MVCC document store + query engine)
 const std = @import("std");
-const doc_mod   = @import("doc.zig");
-const page_mod  = @import("page.zig");
+const doc_mod = @import("doc.zig");
+const page_mod = @import("page.zig");
 const btree_mod = @import("btree.zig");
 const codeindex = @import("codeindex.zig");
-const wal_mod   = @import("wal");
+const wal_mod = @import("wal");
 const epoch_mod = @import("epoch");
 const hot_cache = @import("hot_cache.zig");
-const mvcc_mod  = @import("mvcc.zig");
+const mvcc_mod = @import("mvcc.zig");
 const cdc_mod = @import("cdc.zig");
 const vector = @import("vector.zig");
 const branch_mod = @import("branch.zig");
@@ -27,6 +27,18 @@ const WordIndex = codeindex.WordIndex;
 pub const DEFAULT_TENANT = "default";
 pub const MAX_TENANT_ID_LEN: usize = 64;
 pub const MAX_COLLECTION_NAME_LEN: usize = 64;
+const DEFAULT_TEXT_INDEX_MIN_VALUE_BYTES: usize = 128;
+
+fn envUsize(comptime name: [:0]const u8, default_value: usize) usize {
+    const raw_ptr = std.c.getenv(name.ptr) orelse return default_value;
+    const raw = std.mem.sliceTo(raw_ptr, 0);
+    if (raw.len == 0) return default_value;
+    return std.fmt.parseInt(usize, raw, 10) catch default_value;
+}
+
+fn textIndexMinValueBytes() usize {
+    return envUsize("TURBODB_TEXT_INDEX_MIN_VALUE_BYTES", DEFAULT_TEXT_INDEX_MIN_VALUE_BYTES);
+}
 
 // ─── IndexQueue ──────────────────────────────────────────────────────────
 // ─── IndexQueue ──────────────────────────────────────────────────────────
@@ -154,7 +166,10 @@ fn fastParseFloat(s: []const u8) ?f32 {
     if (s.len == 0) return null;
     var i: usize = 0;
     var neg: bool = false;
-    if (s[0] == '-') { neg = true; i = 1; }
+    if (s[0] == '-') {
+        neg = true;
+        i = 1;
+    }
     var int_part: i32 = 0;
     while (i < s.len and s[i] >= '0' and s[i] <= '9') : (i += 1) {
         int_part = int_part * 10 + @as(i32, s[i] - '0');
@@ -256,6 +271,7 @@ pub const Collection = struct {
     index_wake: std.atomic.Value(u32),
     queue_toggle: std.atomic.Value(u32),
     indexing_count: std.atomic.Value(u32),
+    text_index_min_value_bytes: usize,
 
     // Vector embedding column (optional)
     vectors: ?*vector.VectorColumn = null,
@@ -310,6 +326,7 @@ pub const Collection = struct {
         col.queue_toggle = std.atomic.Value(u32).init(0);
         col.indexing_count = std.atomic.Value(u32).init(0);
         col.index_wake = std.atomic.Value(u32).init(0);
+        col.text_index_min_value_bytes = textIndexMinValueBytes();
         col.vectors = null;
         col.vector_field_len = 0;
         col.vec_entries = .empty;
@@ -398,9 +415,9 @@ pub const Collection = struct {
         return self.name_buf[0..self.name_len];
     }
 
-    /// Return the number of live indexed documents (excludes deleted docs).
+    /// Return the number of live key entries (excludes deleted docs).
     pub fn docCount(self: *const Collection) u64 {
-        return @intCast(self.tri.fileCount());
+        return @intCast(self.hash_idx.count());
     }
 
     pub fn storageBytes(self: *const Collection) usize {
@@ -454,8 +471,8 @@ pub const Collection = struct {
         // Index the document.
         const entry = BTreeEntry{
             .key_hash = hdr.key_hash,
-            .doc_id   = doc_id,
-            .page_no  = pno,
+            .doc_id = doc_id,
+            .page_no = pno,
             .page_off = page_off,
         };
         try self.idx.insert(entry);
@@ -469,7 +486,7 @@ pub const Collection = struct {
         self.key_doc_ids.put(hdr.key_hash, doc_id) catch {};
 
         // Async trigram + word indexing — push to background queue, sync fallback if full or no worker.
-        if (value.len >= 3) {
+        if (self.shouldIndexText(value)) {
             if (self.index_thread == null) {
                 // No background worker — index synchronously to avoid losing data.
                 self.tri.indexFile(key, value) catch {};
@@ -521,7 +538,6 @@ pub const Collection = struct {
 
     /// Insert a document with a pre-computed embedding (no JSON parsing needed).
     /// This is the fast path — embedding is passed directly as f32 slice.
-
     /// Batch insert multiple (key, value) pairs. Each pair goes through the
     /// same single-insert path (no deeper internal batching yet — the primary
     /// win is amortizing FFI boundary crossings and syscall-style entry
@@ -660,8 +676,8 @@ pub const Collection = struct {
 
         const new_entry = BTreeEntry{
             .key_hash = key_hash,
-            .doc_id   = doc_id,
-            .page_no  = pno,
+            .doc_id = doc_id,
+            .page_no = pno,
             .page_off = page_off,
         };
         self.hash_idx.put(key_hash, new_entry) catch {};
@@ -745,7 +761,7 @@ pub const Collection = struct {
         const terms = terms_buf[0..term_count];
 
         // For single terms or exact phrase, try trigram index on full query first.
-        if (term_count == 1) {
+        if (term_count == 1 and self.hasCompleteTextIndex()) {
             const cand_paths = self.tri.candidates(query, alloc) orelse {
                 return self.bruteForceSearch(query, limit, alloc);
             };
@@ -772,6 +788,10 @@ pub const Collection = struct {
         var longest_idx: usize = 0;
         for (terms, 0..) |t, i| {
             if (t.len > terms[longest_idx].len) longest_idx = i;
+        }
+
+        if (!self.hasCompleteTextIndex()) {
+            return self.multiTermBruteForce(terms, limit, alloc);
         }
 
         const cand_paths = self.tri.candidates(terms[longest_idx], alloc) orelse {
@@ -837,7 +857,10 @@ pub const Collection = struct {
                 const nc = needle[j];
                 const hl = if (hc >= 'A' and hc <= 'Z') hc + 32 else hc;
                 const nl = if (nc >= 'A' and nc <= 'Z') nc + 32 else nc;
-                if (hl != nl) { match = false; break; }
+                if (hl != nl) {
+                    match = false;
+                    break;
+                }
             }
             if (match) return true;
         }
@@ -880,7 +903,9 @@ pub const Collection = struct {
     pub const ScanResult = struct {
         docs: []Doc,
         alloc: std.mem.Allocator,
-        pub fn deinit(self: ScanResult) void { self.alloc.free(self.docs); }
+        pub fn deinit(self: ScanResult) void {
+            self.alloc.free(self.docs);
+        }
     };
 
     /// Linear scan of all live documents, with optional limit/offset.
@@ -907,7 +932,10 @@ pub const Collection = struct {
                 const d = decoded.doc;
                 pos += decoded.consumed;
                 if (d.header.flags & DocHeader.DELETED != 0) continue;
-                if (skipped < offset) { skipped += 1; continue; }
+                if (skipped < offset) {
+                    skipped += 1;
+                    continue;
+                }
                 try results.append(alloc, d);
                 if (results.items.len >= limit) break :outer;
             }
@@ -958,8 +986,7 @@ pub const Collection = struct {
     }
 
     fn readEntry(self: *Collection, entry: BTreeEntry) ?Doc {
-        const raw = self.pf.leafRead(entry.page_no, entry.page_off,
-            DocHeader.size + 1024 + 65536);
+        const raw = self.pf.leafRead(entry.page_no, entry.page_off, DocHeader.size + 1024 + 65536);
         const decoded = doc_mod.decode(raw) catch return null;
         if (decoded.doc.header.flags & DocHeader.DELETED != 0) return null;
         return decoded.doc;
@@ -971,11 +998,23 @@ pub const Collection = struct {
         return @ptrCast(@alignCast(data[entry.page_off..].ptr));
     }
 
+    fn shouldIndexText(self: *const Collection, value: []const u8) bool {
+        return value.len >= 3 and value.len >= self.text_index_min_value_bytes;
+    }
+
+    fn hasCompleteTextIndex(self: *const Collection) bool {
+        const live_docs = self.hash_idx.count();
+        return live_docs > 0 and self.tri.fileCount() >= live_docs;
+    }
+
     fn findOrAllocLeaf(self: *Collection, needed: usize) !u32 {
         const total = self.pf.next_alloc.load(.acquire);
         var pno = if (total > 0) total - 1 else 0;
         var checked: u32 = 0;
-        while (checked < 32 and pno > 0) : ({ pno -= 1; checked += 1; }) {
+        while (checked < 32 and pno > 0) : ({
+            pno -= 1;
+            checked += 1;
+        }) {
             const ph = self.pf.pageHeader(pno);
             if (@as(page_mod.PageType, @enumFromInt(ph.page_type)) != .leaf) continue;
             if (page_mod.PAGE_USABLE - ph.used_bytes >= needed) return pno;
@@ -1005,7 +1044,7 @@ pub const Collection = struct {
                 if (d.header.flags & DocHeader.DELETED == 0) {
                     self.hash_idx.put(d.header.key_hash, entry) catch {};
                     self.key_doc_ids.put(d.header.key_hash, d.header.doc_id) catch {};
-                    if (d.value.len >= 3) {
+                    if (self.shouldIndexText(d.value)) {
                         self.tri.indexFile(d.key, d.value) catch {};
                         self.words.indexFile(d.key, d.value) catch {};
                     }
@@ -1424,9 +1463,9 @@ pub const Collection = struct {
                     var name_end = name_start;
                     while (name_end < doc.value.len and
                         ((doc.value[name_end] >= 'a' and doc.value[name_end] <= 'z') or
-                        (doc.value[name_end] >= 'A' and doc.value[name_end] <= 'Z') or
-                        (doc.value[name_end] >= '0' and doc.value[name_end] <= '9') or
-                        doc.value[name_end] == '_'))
+                            (doc.value[name_end] >= 'A' and doc.value[name_end] <= 'Z') or
+                            (doc.value[name_end] >= '0' and doc.value[name_end] <= '9') or
+                            doc.value[name_end] == '_'))
                     {
                         name_end += 1;
                     }
@@ -1520,6 +1559,11 @@ fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
         var n: usize = 0;
         while (n < BATCH) {
             const popped = queue.pop() orelse break;
+            if (!col.shouldIndexText(popped.valueSlice())) {
+                var skipped = popped;
+                skipped.deinit(col.alloc);
+                continue;
+            }
             batch[n] = popped;
             batch_keys[n] = batch[n].keySlice();
             batch_vals[n] = batch[n].valueSlice();
@@ -1543,8 +1587,10 @@ fn indexWorkerQ(col: *Collection, queue: *IndexQueue) void {
     // Final drain on shutdown.
     while (queue.pop()) |popped| {
         var e = popped;
-        col.tri.indexFile(e.keySlice(), e.valueSlice()) catch {};
-        col.words.indexFile(e.keySlice(), e.valueSlice()) catch {};
+        if (col.shouldIndexText(e.valueSlice())) {
+            col.tri.indexFile(e.keySlice(), e.valueSlice()) catch {};
+            col.words.indexFile(e.keySlice(), e.valueSlice()) catch {};
+        }
         e.deinit(col.alloc);
     }
 }
@@ -2030,6 +2076,29 @@ test "tenant collections isolate keys and listings" {
     }
     try std.testing.expectEqual(@as(usize, 1), tenant_a_cols.items.len);
     try std.testing.expectEqualStrings("users", tenant_a_cols.items[0]);
+}
+
+test "small structured docs skip automatic text index and search falls back" {
+    const alloc = std.testing.allocator;
+    const tmp_dir = "/tmp/turbodb_small_doc_text_index_skip";
+    compat.fs.cwdDeleteTree(tmp_dir) catch {};
+    try compat.fs.cwdMakePath(tmp_dir);
+    defer compat.fs.cwdDeleteTree(tmp_dir) catch {};
+
+    const db = try Database.open(alloc, tmp_dir);
+    defer db.close();
+
+    const col = try db.collection("events");
+    _ = try col.insert("small", "{\"kind\":\"tiny\"}");
+    _ = try col.insert("large", "{\"body\":\"needle abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnopqrstuvwxyz0123456789\"}");
+    col.flushIndex();
+
+    try std.testing.expectEqual(@as(u32, 1), col.tri.fileCount());
+
+    const result = try col.searchText("tiny", 10, alloc);
+    defer result.deinit();
+    try std.testing.expectEqual(@as(usize, 1), result.docs.len);
+    try std.testing.expectEqualStrings("small", result.docs[0].key);
 }
 
 test "tenant quotas apply per tenant" {

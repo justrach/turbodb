@@ -17,6 +17,10 @@ pub const WordIndex = struct {
     file_words: std.StringHashMap(std.StringHashMap(void)),
     allocator: std.mem.Allocator,
 
+    /// Cap hits per word to bound memory. Common words add little search value
+    /// after this point and otherwise grow one hit per indexed document.
+    const MAX_HITS_PER_WORD: usize = 5_000;
+
     pub fn init(allocator: std.mem.Allocator) WordIndex {
         return .{
             .index = std.StringHashMap(std.ArrayList(WordHit)).init(allocator),
@@ -76,7 +80,6 @@ pub const WordIndex = struct {
         }
     }
 
-
     /// Index a file's content — tokenizes into words and records hits.
     pub fn indexFile(self: *WordIndex, path: []const u8, content: []const u8) !void {
         // Clean up old entries first
@@ -104,6 +107,8 @@ pub const WordIndex = struct {
                     gop.value_ptr.* = .empty;
                 }
 
+                if (gop.value_ptr.items.len >= MAX_HITS_PER_WORD) continue;
+
                 if (gop.value_ptr.items.len > 0) {
                     const last = gop.value_ptr.items[gop.value_ptr.items.len - 1];
                     if (std.mem.eql(u8, last.path, owned_path) and last.line_num == line_num) {
@@ -128,6 +133,12 @@ pub const WordIndex = struct {
             }
         }
 
+        if (words_set.count() == 0) {
+            words_set.deinit();
+            self.allocator.free(owned_path);
+            return;
+        }
+
         try self.file_words.put(owned_path, words_set);
     }
 
@@ -141,34 +152,52 @@ pub const WordIndex = struct {
 
     /// Look up hits, returning results allocated by the caller.
     /// Deduplicates by (path, line_num).
-pub fn searchDeduped(self: *WordIndex, word: []const u8, allocator: std.mem.Allocator) ![]const WordHit {
-    const hits = self.search(word);
-    if (hits.len == 0) return try allocator.alloc(WordHit, 0);
-    if (hits.len == 1) {
-        var out = try allocator.alloc(WordHit, 1);
-        out[0] = hits[0];
-        return out;
-    }
-
-    const DedupKey = struct { path_ptr: usize, line_num: u32 };
-    var seen = std.AutoHashMap(DedupKey, void).init(allocator);
-    defer seen.deinit();
-    try seen.ensureTotalCapacity(@intCast(hits.len));
-
-    var result: std.ArrayList(WordHit) = .empty;
-    errdefer result.deinit(allocator);
-    try result.ensureTotalCapacity(allocator, hits.len);
-
-    for (hits) |hit| {
-        const key = DedupKey{ .path_ptr = @intFromPtr(hit.path.ptr), .line_num = hit.line_num };
-        const gop = try seen.getOrPut(key);
-        if (!gop.found_existing) {
-            result.appendAssumeCapacity(hit);
+    pub fn searchDeduped(self: *WordIndex, word: []const u8, allocator: std.mem.Allocator) ![]const WordHit {
+        const hits = self.search(word);
+        if (hits.len == 0) return try allocator.alloc(WordHit, 0);
+        if (hits.len == 1) {
+            var out = try allocator.alloc(WordHit, 1);
+            out[0] = hits[0];
+            return out;
         }
+
+        const DedupKey = struct { path_ptr: usize, line_num: u32 };
+        var seen = std.AutoHashMap(DedupKey, void).init(allocator);
+        defer seen.deinit();
+        try seen.ensureTotalCapacity(@intCast(hits.len));
+
+        var result: std.ArrayList(WordHit) = .empty;
+        errdefer result.deinit(allocator);
+        try result.ensureTotalCapacity(allocator, hits.len);
+
+        for (hits) |hit| {
+            const key = DedupKey{ .path_ptr = @intFromPtr(hit.path.ptr), .line_num = hit.line_num };
+            const gop = try seen.getOrPut(key);
+            if (!gop.found_existing) {
+                result.appendAssumeCapacity(hit);
+            }
+        }
+        return result.toOwnedSlice(allocator);
     }
-    return result.toOwnedSlice(allocator);
-}
 };
+
+test "WordIndex skips empty per-file bookkeeping after hit cap" {
+    const alloc = std.testing.allocator;
+    var idx = WordIndex.init(alloc);
+    defer idx.deinit();
+
+    var saturated: std.ArrayList(WordHit) = .empty;
+    try saturated.ensureTotalCapacity(alloc, WordIndex.MAX_HITS_PER_WORD);
+    for (0..WordIndex.MAX_HITS_PER_WORD) |_| {
+        saturated.appendAssumeCapacity(.{ .path = "existing", .line_num = 1 });
+    }
+
+    const owned_word = try alloc.dupe(u8, "common");
+    try idx.index.put(owned_word, saturated);
+
+    try idx.indexFile("overflow", "common common common");
+    try std.testing.expectEqual(@as(usize, 0), idx.file_words.count());
+}
 
 // ── Trigram index ───────────────────────────────────────────
 // Maps 3-byte sequences → set of file paths.
@@ -180,7 +209,6 @@ pub const Trigram = u24;
 pub fn packTrigram(a: u8, b: u8, c: u8) Trigram {
     return @as(Trigram, a) << 16 | @as(Trigram, b) << 8 | @as(Trigram, c);
 }
-
 
 pub const PostingMask = struct {
     next_mask: u8 = 0, // bloom filter of chars following this trigram
@@ -250,7 +278,6 @@ fn postingSortedInsert(list: *PostingList, alloc: std.mem.Allocator, entry: Post
         list.append(alloc, entry) catch {};
     };
 }
-
 
 pub const TrigramIndex = struct {
     /// trigram → dense sorted posting list
@@ -464,119 +491,118 @@ pub const TrigramIndex = struct {
             self.file_trigrams.put(file_id, tri_list) catch {};
         }
     }
-pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.Allocator) ?[]const []const u8 {
-    self.mu.lockUncancelable(runtime.io);
-    defer self.mu.unlock(runtime.io);
+    pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.Allocator) ?[]const []const u8 {
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
 
-    if (query.len < 3) return null;
-    const tri_count = query.len - 2;
+        if (query.len < 3) return null;
+        const tri_count = query.len - 2;
 
-    // Deduplicate query trigrams first so repeated trigrams don't do repeated work.
-    var unique = std.AutoHashMap(Trigram, void).init(allocator);
-    defer unique.deinit();
-    unique.ensureTotalCapacity(@intCast(tri_count)) catch return null;
-    for (0..tri_count) |i| {
-        const tri = packTrigram(
-            normalizeChar(query[i]),
-            normalizeChar(query[i + 1]),
-            normalizeChar(query[i + 2]),
-        );
-        _ = unique.getOrPut(tri) catch return null;
-    }
+        // Deduplicate query trigrams first so repeated trigrams don't do repeated work.
+        var unique = std.AutoHashMap(Trigram, void).init(allocator);
+        defer unique.deinit();
+        unique.ensureTotalCapacity(@intCast(tri_count)) catch return null;
+        for (0..tri_count) |i| {
+            const tri = packTrigram(
+                normalizeChar(query[i]),
+                normalizeChar(query[i + 1]),
+                normalizeChar(query[i + 2]),
+            );
+            _ = unique.getOrPut(tri) catch return null;
+        }
 
-    var sets: std.ArrayList(*PostingList) = .empty;
-    defer sets.deinit(allocator);
-    sets.ensureTotalCapacity(allocator, unique.count()) catch return null;
+        var sets: std.ArrayList(*PostingList) = .empty;
+        defer sets.deinit(allocator);
+        sets.ensureTotalCapacity(allocator, unique.count()) catch return null;
 
-    var tri_iter = unique.keyIterator();
-    while (tri_iter.next()) |tri_ptr| {
-        const file_set = self.index.getPtr(tri_ptr.*) orelse {
+        var tri_iter = unique.keyIterator();
+        while (tri_iter.next()) |tri_ptr| {
+            const file_set = self.index.getPtr(tri_ptr.*) orelse {
+                return allocator.alloc([]const u8, 0) catch null;
+            };
+            sets.appendAssumeCapacity(file_set);
+        }
+
+        if (sets.items.len == 0) {
             return allocator.alloc([]const u8, 0) catch null;
+        }
+
+        // Iterate the smallest set and check membership in all others.
+        var min_idx: usize = 0;
+        var min_count = sets.items[0].items.len;
+        for (sets.items[1..], 1..) |set, i| {
+            const count = set.items.len;
+            if (count < min_count) {
+                min_count = count;
+                min_idx = i;
+            }
+        }
+
+        var result: std.ArrayList([]const u8) = .empty;
+        errdefer result.deinit(allocator);
+        result.ensureTotalCapacity(allocator, min_count) catch return null;
+
+        for (sets.items[min_idx].items) |entry| {
+            const file_id = entry.file_id;
+
+            // Intersection check: candidate must be in all sets
+            var in_all = true;
+            for (sets.items, 0..) |set, i| {
+                if (i == min_idx) continue;
+                if (!postingContains(set, file_id)) {
+                    in_all = false;
+                    break;
+                }
+            }
+            if (!in_all) continue;
+
+            // Bloom-filter check for consecutive trigram pairs
+            var bloom_pass = true;
+            if (tri_count >= 2) {
+                for (0..tri_count - 1) |j| {
+                    const tri_a = packTrigram(
+                        normalizeChar(query[j]),
+                        normalizeChar(query[j + 1]),
+                        normalizeChar(query[j + 2]),
+                    );
+                    const tri_b = packTrigram(
+                        normalizeChar(query[j + 1]),
+                        normalizeChar(query[j + 2]),
+                        normalizeChar(query[j + 3]),
+                    );
+                    const set_a = self.index.getPtr(tri_a) orelse continue;
+                    const set_b = self.index.getPtr(tri_b) orelse continue;
+                    const mask_a = postingGet(set_a, file_id) orelse continue;
+                    const mask_b = postingGet(set_b, file_id) orelse continue;
+
+                    // next_mask: bit for query[j+3] must be set in tri_a's next_mask
+                    const next_bit: u8 = @as(u8, 1) << @intCast(normalizeChar(query[j + 3]) % 8);
+                    if ((mask_a.next_mask & next_bit) == 0) {
+                        bloom_pass = false;
+                        break;
+                    }
+
+                    // loc_mask adjacency: use circular shift to handle position wrap-around
+                    const rotated = (mask_a.loc_mask << 1) | (mask_a.loc_mask >> 7);
+                    if ((rotated & mask_b.loc_mask) == 0) {
+                        bloom_pass = false;
+                        break;
+                    }
+                }
+            }
+            if (!bloom_pass) continue;
+
+            // Translate file_id -> path
+            if (file_id < self.id_to_path.items.len) {
+                result.appendAssumeCapacity(self.id_to_path.items[file_id]);
+            }
+        }
+
+        return result.toOwnedSlice(allocator) catch {
+            result.deinit(allocator);
+            return null;
         };
-        sets.appendAssumeCapacity(file_set);
     }
-
-    if (sets.items.len == 0) {
-        return allocator.alloc([]const u8, 0) catch null;
-    }
-
-    // Iterate the smallest set and check membership in all others.
-    var min_idx: usize = 0;
-    var min_count = sets.items[0].items.len;
-    for (sets.items[1..], 1..) |set, i| {
-        const count = set.items.len;
-        if (count < min_count) {
-            min_count = count;
-            min_idx = i;
-        }
-    }
-
-    var result: std.ArrayList([]const u8) = .empty;
-    errdefer result.deinit(allocator);
-    result.ensureTotalCapacity(allocator, min_count) catch return null;
-
-    for (sets.items[min_idx].items) |entry| {
-        const file_id = entry.file_id;
-
-        // Intersection check: candidate must be in all sets
-        var in_all = true;
-        for (sets.items, 0..) |set, i| {
-            if (i == min_idx) continue;
-            if (!postingContains(set, file_id)) {
-                in_all = false;
-                break;
-            }
-        }
-        if (!in_all) continue;
-
-        // Bloom-filter check for consecutive trigram pairs
-        var bloom_pass = true;
-        if (tri_count >= 2) {
-            for (0..tri_count - 1) |j| {
-                const tri_a = packTrigram(
-                    normalizeChar(query[j]),
-                    normalizeChar(query[j + 1]),
-                    normalizeChar(query[j + 2]),
-                );
-                const tri_b = packTrigram(
-                    normalizeChar(query[j + 1]),
-                    normalizeChar(query[j + 2]),
-                    normalizeChar(query[j + 3]),
-                );
-                const set_a = self.index.getPtr(tri_a) orelse continue;
-                const set_b = self.index.getPtr(tri_b) orelse continue;
-                const mask_a = postingGet(set_a, file_id) orelse continue;
-                const mask_b = postingGet(set_b, file_id) orelse continue;
-
-                // next_mask: bit for query[j+3] must be set in tri_a's next_mask
-                const next_bit: u8 = @as(u8, 1) << @intCast(normalizeChar(query[j + 3]) % 8);
-                if ((mask_a.next_mask & next_bit) == 0) {
-                    bloom_pass = false;
-                    break;
-                }
-
-                // loc_mask adjacency: use circular shift to handle position wrap-around
-                const rotated = (mask_a.loc_mask << 1) | (mask_a.loc_mask >> 7);
-                if ((rotated & mask_b.loc_mask) == 0) {
-                    bloom_pass = false;
-                    break;
-                }
-            }
-        }
-        if (!bloom_pass) continue;
-
-        // Translate file_id -> path
-        if (file_id < self.id_to_path.items.len) {
-            result.appendAssumeCapacity(self.id_to_path.items[file_id]);
-        }
-    }
-
-    return result.toOwnedSlice(allocator) catch {
-        result.deinit(allocator);
-        return null;
-    };
-}
-
 
     /// Find candidate files matching a RegexQuery.
     /// Intersects AND trigrams, then for each OR group unions posting lists
@@ -938,7 +964,10 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
                 if (result.file_trigrams.getPtr(file_id)) |tri_list| {
                     var found = false;
                     for (tri_list.items) |existing| {
-                        if (existing == tri) { found = true; break; }
+                        if (existing == tri) {
+                            found = true;
+                            break;
+                        }
                     }
                     if (!found) try tri_list.append(allocator, tri);
                 }
@@ -1006,9 +1035,7 @@ pub fn candidates(self: *TrigramIndex, query: []const u8, allocator: std.mem.All
         const header = try readDiskHeader(dir_path, allocator) orelse return null;
         return header.git_head;
     }
-
 };
-
 
 // ── Regex decomposition ─────────────────────────────────────
 
@@ -1046,11 +1073,30 @@ pub fn decomposeRegex(pattern: []const u8, allocator: std.mem.Allocator) !RegexQ
                 i += 2;
                 continue;
             }
-            if (c == '[') { in_bracket = true; i += 1; continue; }
-            if (c == ']') { in_bracket = false; i += 1; continue; }
-            if (in_bracket) { i += 1; continue; }
-            if (c == '(') { depth += 1; i += 1; continue; }
-            if (c == ')') { if (depth > 0) depth -= 1; i += 1; continue; }
+            if (c == '[') {
+                in_bracket = true;
+                i += 1;
+                continue;
+            }
+            if (c == ']') {
+                in_bracket = false;
+                i += 1;
+                continue;
+            }
+            if (in_bracket) {
+                i += 1;
+                continue;
+            }
+            if (c == '(') {
+                depth += 1;
+                i += 1;
+                continue;
+            }
+            if (c == ')') {
+                if (depth > 0) depth -= 1;
+                i += 1;
+                continue;
+            }
             if (c == '|' and depth == 0) {
                 try top_pipes.append(allocator, i);
             }
@@ -1243,7 +1289,6 @@ fn flushLiterals(
     literals.clearRetainingCapacity();
 }
 
-
 // ── Tokenizer ───────────────────────────────────────────────
 
 pub const WordTokenizer = struct {
@@ -1283,42 +1328,70 @@ pub const MAX_NGRAM_LEN: usize = 16;
 /// Rare pairs   → HIGH weight (they become n-gram boundaries).
 /// All unspecified pairs default to 0xFE00 (rare = high weight).
 pub const default_pair_freq: [256][256]u16 = blk: {
-
     var table: [256][256]u16 = .{.{0xFE00} ** 256} ** 256;
     // English bigrams (lowercase) — common in identifiers and prose
-    table['t']['h'] = 0x1000; table['h']['e'] = 0x1000;
-    table['i']['n'] = 0x1000; table['e']['r'] = 0x1000;
-    table['a']['n'] = 0x1000; table['r']['e'] = 0x1000;
-    table['o']['n'] = 0x1000; table['e']['n'] = 0x1000;
-    table['s']['t'] = 0x1000; table['e']['s'] = 0x1000;
-    table['a']['t'] = 0x1000; table['i']['o'] = 0x1000;
-    table['t']['e'] = 0x1000; table['o']['r'] = 0x1000;
-    table['t']['i'] = 0x1000; table['a']['r'] = 0x1000;
-    table['a']['l'] = 0x1000; table['l']['e'] = 0x1000;
-    table['n']['t'] = 0x1000; table['e']['d'] = 0x1000;
-    table['n']['d'] = 0x1000; table['o']['u'] = 0x1000;
-    table['e']['a'] = 0x1000; table['f']['o'] = 0x1000;
+    table['t']['h'] = 0x1000;
+    table['h']['e'] = 0x1000;
+    table['i']['n'] = 0x1000;
+    table['e']['r'] = 0x1000;
+    table['a']['n'] = 0x1000;
+    table['r']['e'] = 0x1000;
+    table['o']['n'] = 0x1000;
+    table['e']['n'] = 0x1000;
+    table['s']['t'] = 0x1000;
+    table['e']['s'] = 0x1000;
+    table['a']['t'] = 0x1000;
+    table['i']['o'] = 0x1000;
+    table['t']['e'] = 0x1000;
+    table['o']['r'] = 0x1000;
+    table['t']['i'] = 0x1000;
+    table['a']['r'] = 0x1000;
+    table['a']['l'] = 0x1000;
+    table['l']['e'] = 0x1000;
+    table['n']['t'] = 0x1000;
+    table['e']['d'] = 0x1000;
+    table['n']['d'] = 0x1000;
+    table['o']['u'] = 0x1000;
+    table['e']['a'] = 0x1000;
+    table['f']['o'] = 0x1000;
     // Common code keyword fragments
-    table['f']['n'] = 0x1000; table['i']['f'] = 0x1000;
-    table['r']['n'] = 0x1000; table['t']['u'] = 0x1000;
-    table['p']['u'] = 0x1000; table['b']['l'] = 0x1000;
-    table['c']['o'] = 0x1000; table['n']['s'] = 0x1000;
-    table['t']['r'] = 0x1000; table['u']['e'] = 0x1000;
+    table['f']['n'] = 0x1000;
+    table['i']['f'] = 0x1000;
+    table['r']['n'] = 0x1000;
+    table['t']['u'] = 0x1000;
+    table['p']['u'] = 0x1000;
+    table['b']['l'] = 0x1000;
+    table['c']['o'] = 0x1000;
+    table['n']['s'] = 0x1000;
+    table['t']['r'] = 0x1000;
+    table['u']['e'] = 0x1000;
     // Common operator / punctuation pairs
-    table['('][')'] = 0x0800; table['{']['}'] = 0x0800;
-    table['['][']'] = 0x0800; table['/']['/'] = 0x0800;
-    table['-']['>'] = 0x0800; table['=']['>'] = 0x0800;
-    table[':'][':'] = 0x0800; table['!']['='] = 0x0800;
-    table['=']['='] = 0x0800; table['<']['='] = 0x0800;
-    table['>']['='] = 0x0800; table['&']['&'] = 0x0800;
+    table['('][')'] = 0x0800;
+    table['{']['}'] = 0x0800;
+    table['['][']'] = 0x0800;
+    table['/']['/'] = 0x0800;
+    table['-']['>'] = 0x0800;
+    table['=']['>'] = 0x0800;
+    table[':'][':'] = 0x0800;
+    table['!']['='] = 0x0800;
+    table['=']['='] = 0x0800;
+    table['<']['='] = 0x0800;
+    table['>']['='] = 0x0800;
+    table['&']['&'] = 0x0800;
     table['|']['|'] = 0x0800;
     // Whitespace / structural pairs
-    table[' '][' '] = 0x0800; table['\t'][' '] = 0x0800;
-    table[' ']['('] = 0x0800; table[' ']['{'] = 0x0800;
-    table[';'][' '] = 0x0800; table[':'][' '] = 0x0800;
-    table['='][' '] = 0x0800; table[' ']['='] = 0x0800;
-    table[','][' '] = 0x0800; table['.']['.'] = 0x0800;
-    table['\n'][' '] = 0x0800; table['\n']['\t'] = 0x0800;
+    table[' '][' '] = 0x0800;
+    table['\t'][' '] = 0x0800;
+    table[' ']['('] = 0x0800;
+    table[' ']['{'] = 0x0800;
+    table[';'][' '] = 0x0800;
+    table[':'][' '] = 0x0800;
+    table['='][' '] = 0x0800;
+    table[' ']['='] = 0x0800;
+    table[','][' '] = 0x0800;
+    table['.']['.'] = 0x0800;
+    table['\n'][' '] = 0x0800;
+    table['\n']['\t'] = 0x0800;
     break :blk table;
 };
 
@@ -1326,7 +1399,6 @@ pub const default_pair_freq: [256][256]u16 = blk: {
 /// per-project table.  Swap only before indexing starts (not thread-safe).
 pub var active_pair_freq: *const [256][256]u16 = &default_pair_freq;
 var loaded_freq_table: [256][256]u16 = undefined;
-
 
 /// Deterministic weight for a character pair, used to place content-defined
 /// boundaries between n-grams.  Frequency-weighted: common source-code pairs
@@ -1464,7 +1536,7 @@ pub fn readFrequencyTable(dir_path: []const u8, allocator: std.mem.Allocator) !?
 
 /// A single sparse n-gram extracted from a string.
 pub const SparseNgram = struct {
-    hash: u64,  // Wyhash of the normalized (lowercased) n-gram bytes
+    hash: u64, // Wyhash of the normalized (lowercased) n-gram bytes
     pos: usize, // byte offset in the source string
     len: usize, // byte length of the n-gram
 };
@@ -1548,7 +1620,6 @@ pub fn extractSparseNgrams(content: []const u8, allocator: std.mem.Allocator) ![
                 // every byte in the span is covered.
                 try result.append(allocator, makeNgram(content, ngram_end - MIN_LEN, MIN_LEN));
             }
-
         }
     }
 
