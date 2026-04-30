@@ -72,9 +72,16 @@ pub const WireServer = struct {
     port: u16,
     running: std.atomic.Value(bool),
     activity: activity.ActivityTracker,
+    op_mu: compat.RwLock,
 
     pub fn init(db: *Database, port: u16) WireServer {
-        return .{ .db = db, .port = port, .running = std.atomic.Value(bool).init(false), .activity = activity.ActivityTracker.init() };
+        return .{
+            .db = db,
+            .port = port,
+            .running = std.atomic.Value(bool).init(false),
+            .activity = activity.ActivityTracker.init(),
+            .op_mu = .{},
+        };
     }
 
     pub fn run(self: *WireServer) !void {
@@ -212,6 +219,8 @@ fn processFrame(
     // ── FAST PATH: inline GET with zero-copy ──
     if (op == OP_GET) {
         srv.activity.recordQuery();
+        srv.op_mu.lockShared();
+        defer srv.op_mu.unlockShared();
         return fastGet(srv, payload, w, cached_col, cached_name, cached_len);
     }
 
@@ -220,7 +229,24 @@ fn processFrame(
         cached_col.* = null;
     }
     srv.activity.recordQuery();
+    const lock_mutation = wireOpMutates(op);
+    if (lock_mutation) {
+        srv.op_mu.lock();
+    } else if (wireOpReadsStorage(op)) {
+        srv.op_mu.lockShared();
+    }
+    defer {
+        if (lock_mutation) srv.op_mu.unlock() else if (wireOpReadsStorage(op)) srv.op_mu.unlockShared();
+    }
     return dispatch(srv, op, payload, w);
+}
+
+fn wireOpMutates(op: u8) bool {
+    return op == OP_INSERT or op == OP_UPDATE or op == OP_DELETE or op == OP_BATCH;
+}
+
+fn wireOpReadsStorage(op: u8) bool {
+    return op == OP_SCAN;
 }
 
 /// Inlined GET: collection lookup is cached, response writes mmap'd bytes directly.
@@ -377,6 +403,8 @@ const BatchEnvelope = struct { count: u16 };
 fn doBatch(srv: *WireServer, p: []const u8, w: *[WR_BUF]u8) usize {
     const env = validateBatchEnvelope(p) orelse return errResp(w, OP_BATCH, STATUS_ERROR);
 
+    if (doInsertOnlyBatch(srv, p, env, w)) |written| return written;
+
     var req_pos: usize = BATCH_REQ_HDR;
     var resp_pos: usize = BATCH_RESP_HDR;
     w[4] = OP_BATCH;
@@ -404,6 +432,76 @@ fn doBatch(srv: *WireServer, p: []const u8, w: *[WR_BUF]u8) usize {
         req_pos += BATCH_ITEM_HDR + payload_len;
     }
 
+    wrU32BE(w, @intCast(resp_pos));
+    return resp_pos;
+}
+
+fn doInsertOnlyBatch(srv: *WireServer, p: []const u8, env: BatchEnvelope, w: *[WR_BUF]u8) ?usize {
+    if (env.count == 0) return null;
+
+    var rows: std.ArrayList(Collection.BulkInsertRow) = .empty;
+    defer rows.deinit(srv.db.alloc);
+    rows.ensureTotalCapacity(srv.db.alloc, env.count) catch return null;
+
+    var req_pos: usize = BATCH_REQ_HDR;
+    var batch_col: []const u8 = "";
+    var total_value_bytes: usize = 0;
+    for (0..env.count) |idx| {
+        const op = p[req_pos];
+        if (op != OP_INSERT) return null;
+        const payload_len: usize = rdU32LE(p[req_pos + 1 ..][0..4]);
+        const payload = p[req_pos + BATCH_ITEM_HDR ..][0..payload_len];
+        const kv = parseKV(payload) orelse return null;
+
+        if (idx == 0) {
+            batch_col = kv.col;
+        } else if (!std.mem.eql(u8, batch_col, kv.col)) {
+            return null;
+        }
+
+        if (kv.key.len == 0 or kv.key.len > 1024 or kv.val.len > 64 * 1024 * 1024) return null;
+        total_value_bytes = std.math.add(usize, total_value_bytes, kv.val.len) catch return null;
+        rows.appendAssumeCapacity(.{
+            .key = kv.key,
+            .value = kv.val,
+            .line_len = kv.key.len + kv.val.len,
+        });
+        req_pos += BATCH_ITEM_HDR + payload_len;
+    }
+
+    const ref = resolveCollectionRef(batch_col);
+    srv.db.recordTenantOperation(ref.tenant_id) catch return allBatchItemsError(w, env.count);
+    srv.db.ensureTenantStorageAvailable(ref.tenant_id, total_value_bytes) catch return allBatchItemsError(w, env.count);
+    const col = srv.db.collectionForTenant(ref.tenant_id, ref.collection_name) catch return allBatchItemsError(w, env.count);
+    const result = col.insertBulk(rows.items) catch return allBatchItemsError(w, env.count);
+    if (result.errors != 0 or result.inserted != env.count) return allBatchItemsError(w, env.count);
+
+    w[4] = OP_BATCH;
+    w[5] = STATUS_OK;
+    wrU16LE(w[6..8], env.count);
+    var resp_pos: usize = BATCH_RESP_HDR;
+    for (0..env.count) |i| {
+        w[resp_pos] = OP_INSERT;
+        w[resp_pos + 1] = STATUS_OK;
+        wrU32LE(w[resp_pos + 2 ..][0..4], 8);
+        wrU64LE(w[resp_pos + BATCH_ITEM_RESP_HDR ..][0..8], result.first_doc_id + @as(u64, @intCast(i)));
+        resp_pos += BATCH_ITEM_RESP_HDR + 8;
+    }
+    wrU32BE(w, @intCast(resp_pos));
+    return resp_pos;
+}
+
+fn allBatchItemsError(w: *[WR_BUF]u8, count: u16) usize {
+    w[4] = OP_BATCH;
+    w[5] = STATUS_OK;
+    wrU16LE(w[6..8], count);
+    var resp_pos: usize = BATCH_RESP_HDR;
+    for (0..count) |_| {
+        w[resp_pos] = OP_INSERT;
+        w[resp_pos + 1] = STATUS_ERROR;
+        wrU32LE(w[resp_pos + 2 ..][0..4], 0);
+        resp_pos += BATCH_ITEM_RESP_HDR;
+    }
     wrU32BE(w, @intCast(resp_pos));
     return resp_pos;
 }
@@ -534,6 +632,15 @@ fn dispatchWire2(srv: *WireServer, state: *WireConnState, p: []const u8, w: *[WR
     }
 
     const out = wire2BodyOut(w);
+    const lock_mutation = wire2OpMutates(req.op);
+    if (lock_mutation) {
+        srv.op_mu.lock();
+    } else if (wire2OpReadsStorage(req.op)) {
+        srv.op_mu.lockShared();
+    }
+    defer {
+        if (lock_mutation) srv.op_mu.unlock() else if (wire2OpReadsStorage(req.op)) srv.op_mu.unlockShared();
+    }
     const result = switch (req.op) {
         WIRE2_OP_PING => Wire2Result{ .status = STATUS_OK },
         WIRE2_OP_GET => doWire2Get(srv, state, req.body, out),
@@ -547,6 +654,23 @@ fn dispatchWire2(srv: *WireServer, state: *WireConnState, p: []const u8, w: *[WR
         else => Wire2Result{ .status = STATUS_ERROR },
     };
     return writeWire2Response(w, req, result.status, result.payload_len);
+}
+
+fn wire2OpMutates(op: u8) bool {
+    return switch (op) {
+        WIRE2_OP_PUT,
+        WIRE2_OP_INSERT,
+        WIRE2_OP_DELETE,
+        WIRE2_OP_BULK_INSERT,
+        WIRE2_OP_BULK_UPSERT,
+        WIRE2_OP_BULK_DELETE,
+        => true,
+        else => false,
+    };
+}
+
+fn wire2OpReadsStorage(op: u8) bool {
+    return op == WIRE2_OP_GET or op == WIRE2_OP_BATCH_GET;
 }
 
 fn parseWire2Request(p: []const u8) ?Wire2Request {

@@ -227,6 +227,7 @@ pub const Collection = struct {
         inserted: u32 = 0,
         errors: u32 = 0,
         bytes: u64 = 0,
+        first_doc_id: u64 = 0,
     };
 
     const BulkPreparedDoc = struct {
@@ -568,6 +569,7 @@ pub const Collection = struct {
         try encoded.ensureTotalCapacity(self.alloc, estimated_bytes);
 
         const first_doc_id = self.next_doc_id.fetchAdd(@intCast(valid_rows), .monotonic);
+        result.first_doc_id = first_doc_id;
         var doc_id_offset: u64 = 0;
         for (rows) |row| {
             const total_size = bulkEncodedLen(row) orelse continue;
