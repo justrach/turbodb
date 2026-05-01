@@ -73,6 +73,20 @@ pub const BTree = struct {
         self.mu.lockUncancelable(runtime.io);
         defer self.mu.unlock(runtime.io);
 
+        try self.insertLocked(entry);
+    }
+
+    /// Insert or update many entries while holding the B-tree mutex once.
+    pub fn insertMany(self: *BTree, entries: []const BTreeEntry) !void {
+        if (entries.len == 0) return;
+
+        self.mu.lockUncancelable(runtime.io);
+        defer self.mu.unlock(runtime.io);
+
+        for (entries) |entry| try self.insertLocked(entry);
+    }
+
+    fn insertLocked(self: *BTree, entry: BTreeEntry) !void {
         if (self.root == 0) {
             // Create first root leaf (btree_leaf, NOT document leaf).
             self.root = try self.pf.allocPage(.btree_leaf);

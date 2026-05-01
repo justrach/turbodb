@@ -550,19 +550,151 @@ pub const Collection = struct {
         key: []const u8,
         value: []const u8,
     };
+
+    const BatchPreparedDoc = struct {
+        key: []const u8,
+        value: []const u8,
+        key_hash: u64,
+        doc_id: u64 = 0,
+        enc_off: usize,
+        enc_len: usize,
+        page_no: u32 = 0,
+        page_off: u16 = 0,
+    };
+
     pub fn insertBatch(
         self: *Collection,
         items: []const BatchItem,
         /// Optional output. If non-null, must have length >= items.len.
         out_doc_ids: ?[]u64,
     ) !usize {
-        var inserted: usize = 0;
-        for (items) |item| {
-            const id = try self.insert(item.key, item.value);
-            if (out_doc_ids) |ids| ids[inserted] = id;
-            inserted += 1;
+        if (items.len == 0) return 0;
+        if (out_doc_ids) |ids| {
+            if (ids.len < items.len) return error.OutputTooSmall;
         }
-        return inserted;
+
+        var prepared: std.ArrayList(BatchPreparedDoc) = .empty;
+        defer prepared.deinit(self.alloc);
+        var encoded: std.ArrayList(u8) = .empty;
+        defer encoded.deinit(self.alloc);
+        var btree_entries: std.ArrayList(BTreeEntry) = .empty;
+        defer btree_entries.deinit(self.alloc);
+
+        try prepared.ensureTotalCapacity(self.alloc, items.len);
+        try btree_entries.ensureTotalCapacity(self.alloc, items.len);
+
+        var estimated_bytes: usize = 0;
+        for (items) |item| {
+            const key_value_size = try std.math.add(usize, item.key.len, item.value.len);
+            const total_size = try std.math.add(usize, DocHeader.size, key_value_size);
+            if (total_size > page_mod.PAGE_USABLE) return error.PageFull;
+            estimated_bytes = try std.math.add(usize, estimated_bytes, total_size);
+            prepared.appendAssumeCapacity(.{
+                .key = item.key,
+                .value = item.value,
+                .key_hash = doc_mod.fnv1a(item.key),
+                .enc_off = 0,
+                .enc_len = total_size,
+            });
+        }
+        try encoded.ensureTotalCapacity(self.alloc, estimated_bytes);
+
+        var locked_stripes = [_]bool{false} ** STRIPE_COUNT;
+        for (prepared.items) |item| {
+            locked_stripes[stripeIndex(item.key_hash)] = true;
+        }
+        for (locked_stripes, 0..) |locked, stripe| {
+            if (locked) self.stripe_locks[stripe].lockUncancelable(runtime.io);
+        }
+        defer {
+            var stripe = locked_stripes.len;
+            while (stripe > 0) {
+                stripe -= 1;
+                if (locked_stripes[stripe]) self.stripe_locks[stripe].unlock(runtime.io);
+            }
+        }
+
+        const first_doc_id = self.next_doc_id.fetchAdd(@intCast(prepared.items.len), .monotonic);
+        for (prepared.items, 0..) |*item, i| {
+            const doc_id = first_doc_id + @as(u64, @intCast(i));
+            item.doc_id = doc_id;
+
+            const hdr = doc_mod.newHeader(doc_id, item.key, item.value);
+            const d = Doc{ .header = hdr, .key = item.key, .value = item.value };
+            item.enc_off = encoded.items.len;
+            const enc = encoded.addManyAsSliceAssumeCapacity(item.enc_len);
+            _ = try d.encodeBuf(enc);
+
+            const txn = self.wal_log.next_lsn.load(.monotonic);
+            _ = try self.wal_log.write(txn, .doc_insert, 0, 0, enc);
+
+            const pno = try self.findOrAllocLeaf(enc.len);
+            const page_off = self.pf.leafAppend(pno, enc) orelse return error.PageFull;
+            item.page_no = pno;
+            item.page_off = page_off;
+
+            btree_entries.appendAssumeCapacity(.{
+                .key_hash = item.key_hash,
+                .doc_id = doc_id,
+                .page_no = pno,
+                .page_off = page_off,
+            });
+        }
+
+        try self.idx.insertMany(btree_entries.items);
+
+        for (prepared.items, btree_entries.items, 0..) |item, entry, i| {
+            self.hash_idx.put(item.key_hash, entry) catch {};
+
+            const epoch = self.epochs.advance();
+            self.versions.appendVersion(self.alloc, item.doc_id, entry.page_no, entry.page_off, epoch) catch {};
+            self.key_doc_ids.put(item.key_hash, item.doc_id) catch {};
+            if (out_doc_ids) |ids| ids[i] = item.doc_id;
+
+            if (self.shouldIndexText(item.value)) {
+                if (self.index_thread == null) {
+                    self.tri.indexFile(item.key, item.value) catch {};
+                    self.words.indexFile(item.key, item.value) catch {};
+                } else {
+                    const q = &self.index_queue;
+                    if (!q.push(item.key, item.value)) {
+                        self.tri.indexFile(item.key, item.value) catch {};
+                        self.words.indexFile(item.key, item.value) catch {};
+                    } else {
+                        _ = self.index_wake.fetchAdd(1, .release);
+                        runtime.io.futexWake(u32, &self.index_wake.raw, 1);
+                    }
+                }
+            }
+
+            if (self.vectors) |vc| {
+                const field = self.vector_field[0..self.vector_field_len];
+                const dims: usize = vc.dims;
+                var embed_stack: [4096]f32 = undefined;
+                const emb = if (dims <= 4096) embed_stack[0..dims] else blk: {
+                    break :blk self.alloc.alloc(f32, dims) catch null;
+                };
+                if (emb) |e| {
+                    defer if (dims > 4096) self.alloc.free(e);
+                    if (extractJsonFloatArray(item.value, field, e)) |count| {
+                        if (count == dims) {
+                            vc.append(self.alloc, e) catch {};
+                            self.vec_entries.append(self.alloc, entry) catch {};
+                        }
+                    }
+                }
+            }
+
+            emitChange(self, .insert, item.key, item.value, item.doc_id);
+        }
+
+        const inserted_count: u64 = @intCast(prepared.items.len);
+        const old_gc_counter = self.gc_counter.fetchAdd(inserted_count, .monotonic);
+        if (old_gc_counter / GC_INTERVAL != (old_gc_counter + inserted_count) / GC_INTERVAL) {
+            _ = self.gcVersions();
+        }
+
+        return prepared.items.len;
     }
     pub fn insertWithEmbedding(self: *Collection, key: []const u8, value: []const u8, embedding: []const f32) !u64 {
         const doc_id = self.insert(key, value) catch |e| return e;
