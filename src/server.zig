@@ -430,7 +430,6 @@ fn doInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, key: []co
 /// Body: NDJSON — one {"key":"...","value":"..."} per line.
 /// Response: {"inserted":N,"errors":M,"collection":"...","tenant":"..."}
 fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, body: []const u8, alloc: std.mem.Allocator) usize {
-    _ = alloc;
     const start_ns = compat.nanoTimestamp();
     srv.db.recordTenantOperation(tenant_id) catch return err(429, "tenant ops quota exceeded");
     const col = srv.db.collectionForTenant(tenant_id, col_name) catch return err(500, "open collection failed");
@@ -438,6 +437,8 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
     var inserted: u32 = 0;
     var errors: u32 = 0;
     var total_bytes: u64 = 0;
+    var items: std.ArrayList(collection.Collection.BatchItem) = .empty;
+    defer items.deinit(alloc);
 
     // Parse NDJSON: iterate lines, each is a {"key":"...","value":...} object
     var pos: usize = 0;
@@ -454,13 +455,15 @@ fn handleBulkInsert(srv: *Server, tenant_id: []const u8, col_name: []const u8, b
         // Extract value field; fall back to full line for backwards compat.
         const value = jsonValue(line, "value") orelse line;
 
-        _ = col.insert(key, value) catch {
+        items.append(alloc, .{ .key = key, .value = value }) catch {
             errors += 1;
             continue;
         };
-        inserted += 1;
         total_bytes += line.len;
     }
+
+    const inserted_count = col.insertBatch(items.items, null) catch return err(500, "bulk insert failed");
+    inserted = @intCast(inserted_count);
 
     srv.recordQueryCost(tenant_id, "bulk_insert", inserted, total_bytes, start_ns);
 
