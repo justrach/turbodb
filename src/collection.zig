@@ -548,6 +548,8 @@ pub const Collection = struct {
         defer encoded.deinit(self.alloc);
         var prepared: std.ArrayList(BulkPreparedDoc) = .empty;
         defer prepared.deinit(self.alloc);
+        var btree_entries: std.ArrayList(BTreeEntry) = .empty;
+        defer btree_entries.deinit(self.alloc);
         var payloads: std.ArrayList(wal_mod.BatchPayload) = .empty;
         defer payloads.deinit(self.alloc);
 
@@ -565,6 +567,7 @@ pub const Collection = struct {
         if (valid_rows == 0) return result;
 
         try prepared.ensureTotalCapacity(self.alloc, valid_rows);
+        try btree_entries.ensureTotalCapacity(self.alloc, valid_rows);
         try payloads.ensureTotalCapacity(self.alloc, valid_rows);
         try encoded.ensureTotalCapacity(self.alloc, estimated_bytes);
 
@@ -599,7 +602,6 @@ pub const Collection = struct {
         const last_lsn = try self.wal_log.writeCommittedBatch(.doc_insert, wal_mod.DB_TAG_DOC, payloads.items);
         try self.wal_log.flushUpTo(last_lsn);
 
-        const first_epoch = self.epochs.advanceMany(prepared.items.len);
         self.meta_mu.lock();
         {
             defer self.meta_mu.unlock();
@@ -608,7 +610,7 @@ pub const Collection = struct {
             try self.key_epochs.ensureUnusedCapacity(@intCast(prepared.items.len));
             try self.versions.ensureUnusedCapacity(self.alloc, prepared.items.len);
 
-            for (prepared.items, 0..) |*item, i| {
+            for (prepared.items) |*item| {
                 const enc = encoded.items[item.enc_off .. item.enc_off + item.enc_len];
                 const pno = try self.findOrAllocLeaf(enc.len);
                 const page_off = self.pf.leafAppend(pno, enc) orelse return error.PageFull;
@@ -618,13 +620,17 @@ pub const Collection = struct {
                     .page_no = pno,
                     .page_off = page_off,
                 };
-                try self.idx.insert(entry);
-                self.hash_idx.putAssumeCapacity(item.key_hash, entry);
+                btree_entries.appendAssumeCapacity(entry);
                 item.page_no = pno;
                 item.page_off = page_off;
+            }
+            try self.idx.insertMany(btree_entries.items);
 
+            const first_epoch = self.epochs.advanceMany(prepared.items.len);
+            for (prepared.items, btree_entries.items, 0..) |*item, entry, i| {
+                self.hash_idx.putAssumeCapacity(item.key_hash, entry);
                 const epoch = first_epoch + @as(u64, @intCast(i));
-                self.versions.appendFreshVersionAssumeCapacity(item.doc_id, pno, page_off, epoch);
+                self.versions.appendFreshVersionAssumeCapacity(item.doc_id, entry.page_no, entry.page_off, epoch);
                 self.key_doc_ids.putAssumeCapacity(item.key_hash, item.doc_id);
                 self.key_epochs.putAssumeCapacity(item.key_hash, item.doc_id);
 

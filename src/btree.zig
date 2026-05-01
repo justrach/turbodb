@@ -20,12 +20,14 @@ const PAGE_USABLE = page_mod.PAGE_USABLE;
 
 pub const BTreeEntry = extern struct {
     key_hash: u64 align(8), // 0
-    doc_id:   u64,           // 8
-    page_no:  u32,           // 16
-    page_off: u16,           // 20
+    doc_id: u64, // 8
+    page_no: u32, // 16
+    page_off: u16, // 20
     // total: 24 (extern struct padded to align(8))
     pub const size = @sizeOf(BTreeEntry);
-    comptime { std.debug.assert(size == 24); }
+    comptime {
+        std.debug.assert(size == 24);
+    }
 };
 
 const MAX_ENTRIES_PER_LEAF: usize = (PAGE_USABLE - 2) / BTreeEntry.size;
@@ -37,7 +39,7 @@ const MIN_KEYS: usize = MAX_KEYS_PER_INTERNAL / 2;
 
 pub const BTree = struct {
     pf: *PageFile,
-    root: u32,   // root page number (0 = not yet created)
+    root: u32, // root page number (0 = not yet created)
     mu: compat.RwLock,
 
     pub fn init(pf: *PageFile, root_page: u32) BTree {
@@ -73,6 +75,19 @@ pub const BTree = struct {
         self.mu.lock();
         defer self.mu.unlock();
 
+        try self.insertLocked(entry);
+    }
+
+    pub fn insertMany(self: *BTree, entries: []const BTreeEntry) !void {
+        if (entries.len == 0) return;
+
+        self.mu.lock();
+        defer self.mu.unlock();
+
+        for (entries) |entry| try self.insertLocked(entry);
+    }
+
+    fn insertLocked(self: *BTree, entry: BTreeEntry) !void {
         if (self.root == 0) {
             // Create first root leaf (btree_leaf, NOT document leaf).
             self.root = try self.pf.allocPage(.btree_leaf);
@@ -115,8 +130,7 @@ pub const BTree = struct {
         var hi: usize = n;
         while (lo < hi) {
             const mid = lo + (hi - lo) / 2;
-            if (entries[mid].key_hash < entry.key_hash) lo = mid + 1
-            else hi = mid;
+            if (entries[mid].key_hash < entry.key_hash) lo = mid + 1 else hi = mid;
         }
         if (lo < n and entries[lo].key_hash == entry.key_hash) {
             // Overwrite.
@@ -222,8 +236,7 @@ fn searchLeaf(data: []const u8, key_hash: u64) ?BTreeEntry {
     var hi: usize = n;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        if (entries[mid].key_hash < key_hash) lo = mid + 1
-        else hi = mid;
+        if (entries[mid].key_hash < key_hash) lo = mid + 1 else hi = mid;
     }
     if (lo < n and entries[lo].key_hash == key_hash) return entries[lo];
     return null;
@@ -236,8 +249,7 @@ fn leafDelete(data: []u8, key_hash: u64) bool {
     var hi: usize = n;
     while (lo < hi) {
         const mid = lo + (hi - lo) / 2;
-        if (entries[mid].key_hash < key_hash) lo = mid + 1
-        else hi = mid;
+        if (entries[mid].key_hash < key_hash) lo = mid + 1 else hi = mid;
     }
     if (lo >= n or entries[lo].key_hash != key_hash) return false;
     var i = lo;
@@ -260,8 +272,12 @@ fn internalSetKeyCount(data: []u8, n: usize) void {
 }
 
 /// Offset of child[i] within data (after the 2-byte count + 2-byte pad).
-fn childOff(i: usize) usize { return 4 + i * 12; }
-fn keyOff(i: usize) usize { return 4 + i * 12 + 4; }
+fn childOff(i: usize) usize {
+    return 4 + i * 12;
+}
+fn keyOff(i: usize) usize {
+    return 4 + i * 12 + 4;
+}
 
 fn internalGetChild(data: []const u8, i: usize) u32 {
     const off = childOff(i);
@@ -350,8 +366,12 @@ fn internalSplit(
             tc += 1;
             inserted = true;
         }
-        if (i < n) { tmp_keys[tk] = internalGetKey(ldata, i); tk += 1; }
-        tmp_children[tc] = internalGetChild(ldata, i); tc += 1;
+        if (i < n) {
+            tmp_keys[tk] = internalGetKey(ldata, i);
+            tk += 1;
+        }
+        tmp_children[tc] = internalGetChild(ldata, i);
+        tc += 1;
     }
     if (!inserted) {
         tmp_keys[tk] = median;
@@ -366,13 +386,19 @@ fn internalSplit(
 
     // Left: keys 0..mid-1, children 0..mid
     internalSetKeyCount(ldata, mid);
-    for (0..mid) |j| { internalSetKey(ldata, j, tmp_keys[j]); internalSetChild(ldata, j, tmp_children[j]); }
+    for (0..mid) |j| {
+        internalSetKey(ldata, j, tmp_keys[j]);
+        internalSetChild(ldata, j, tmp_children[j]);
+    }
     internalSetChild(ldata, mid, tmp_children[mid]);
 
     // Right: keys mid+1..total_keys-1, children mid+1..total_keys
     const right_n = total_keys - mid - 1;
     internalSetKeyCount(rdata, right_n);
-    for (0..right_n) |j| { internalSetKey(rdata, j, tmp_keys[mid + 1 + j]); internalSetChild(rdata, j, tmp_children[mid + 1 + j]); }
+    for (0..right_n) |j| {
+        internalSetKey(rdata, j, tmp_keys[mid + 1 + j]);
+        internalSetChild(rdata, j, tmp_children[mid + 1 + j]);
+    }
     internalSetChild(rdata, right_n, tmp_children[total_keys]);
 
     return split_median;
@@ -386,7 +412,7 @@ test "btree leaf insert/search" {
     leafSetCount(&data, 0);
 
     const e1 = BTreeEntry{ .key_hash = 100, .doc_id = 1, .page_no = 0, .page_off = 0 };
-    const e2 = BTreeEntry{ .key_hash = 50,  .doc_id = 2, .page_no = 0, .page_off = 0 };
+    const e2 = BTreeEntry{ .key_hash = 50, .doc_id = 2, .page_no = 0, .page_off = 0 };
     const e3 = BTreeEntry{ .key_hash = 200, .doc_id = 3, .page_no = 0, .page_off = 0 };
 
     // Insert e1
@@ -407,7 +433,7 @@ test "btree leaf insert/search" {
     leafSetCount(&data, 3);
 
     try std.testing.expect(searchLeaf(&data, 100) != null);
-    try std.testing.expect(searchLeaf(&data, 50)  != null);
+    try std.testing.expect(searchLeaf(&data, 50) != null);
     try std.testing.expect(searchLeaf(&data, 200) != null);
     try std.testing.expect(searchLeaf(&data, 999) == null);
     try std.testing.expectEqual(@as(u64, 1), searchLeaf(&data, 100).?.doc_id);
