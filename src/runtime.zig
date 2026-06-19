@@ -29,6 +29,9 @@ pub var io: std.Io = undefined;
 /// (which is published with a release store by the winner).
 const State = enum(u8) { uninit = 0, initing = 1, ready = 2 };
 var state: std.atomic.Value(u8) = std.atomic.Value(u8).init(@intFromEnum(State.uninit));
+/// True iff `init()` constructed `threaded` — `setIo()` and `ensureForTest()`
+/// publish externally-owned Io and must NOT tear down `threaded`.
+var owns_threaded: bool = false;
 
 /// Returns true if the caller won the CAS and should perform init; false if
 /// it lost or init already finished (in which case it has already spin-waited
@@ -54,6 +57,7 @@ pub fn init(gpa: std.mem.Allocator) void {
     if (!claimOrWait()) return;
     threaded = std.Io.Threaded.init(gpa, .{});
     io = threaded.io();
+    owns_threaded = true;
     state.store(@intFromEnum(State.ready), .release);
 }
 
@@ -64,12 +68,14 @@ pub fn init(gpa: std.mem.Allocator) void {
 pub fn setIo(external: std.Io) void {
     if (!claimOrWait()) return;
     io = external;
+    owns_threaded = false;
     state.store(@intFromEnum(State.ready), .release);
 }
 
 pub fn deinit() void {
     if (state.load(.acquire) != @intFromEnum(State.ready)) return;
-    threaded.deinit();
+    if (owns_threaded) threaded.deinit();
+    owns_threaded = false;
     state.store(@intFromEnum(State.uninit), .release);
 }
 
@@ -79,5 +85,6 @@ pub fn deinit() void {
 pub fn ensureForTest() void {
     if (!claimOrWait()) return;
     io = std.Io.Threaded.global_single_threaded.io();
+    owns_threaded = false;
     state.store(@intFromEnum(State.ready), .release);
 }
